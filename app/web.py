@@ -241,10 +241,21 @@ async function refreshQueue(){
   hint+=` About ${dur(q.seconds_per_job)} each lately, so roughly ${dur(q.eta_seconds)} to clear.`;
  $('queuehint').textContent=hint;
 }
-// Delegated so a file name can never end up inside a JavaScript string literal.
+// Every action is delegated off a data attribute holding only an id, so no
+// server-supplied text - a file name, an arr name, or an error message an arr
+// itself chose - is ever interpolated into a JavaScript string literal or an
+// inline handler. esc() escapes HTML, not JS string context, and the two are
+// not the same escape.
 document.addEventListener('click',e=>{
- const id=e.target&&e.target.dataset&&e.target.dataset.cancel;
- if(id) cancelJob(id);
+ const d=e.target&&e.target.dataset;
+ if(!d) return;
+ if(d.cancel) cancelJob(d.cancel);
+ if(d.editarr){const a=ARRS.find(x=>x.id===d.editarr); if(a) editArr(a);}
+ if(d.delarr){const a=ARRS.find(x=>x.id===d.delarr); if(a) deleteArr(a.id,a.name);}
+ if(d.revoke){const t=KEYS.find(x=>x.id===d.revoke); if(t) revokeKey(t.id,t.name);}
+ if(d.browse!==undefined) browse(d.browse);
+ if(d.addwatch) addBrowsed();
+ if(d.dropwatch!==undefined) dropWatch(Number(d.dropwatch));
 });
 
 // ---- status + history ----------------------------------------------------
@@ -307,7 +318,7 @@ async function saveSettings(box,msg){
 function renderWatch(){
  const roots=SET.watch_roots||[];
  $('watchpills').innerHTML=roots.length?roots.map((p,i)=>
-   `<span class="pill">${esc(p)}<button onclick="dropWatch(${i})" title="Remove">&times;</button></span>`).join('')
+   `<span class="pill">${esc(p)}<button data-dropwatch="${i}" title="Remove">&times;</button></span>`).join('')
   :'<p class="hint">None set - every media root is watched.</p>';
 }
 async function putWatch(roots){
@@ -326,8 +337,8 @@ async function browse(path){
   const d=await api('/api/fs?path='+encodeURIComponent(path||''));
   CURRENT=d.path;$('browsepath').textContent=d.path;
   $('browser').innerHTML=(d.entries.length?d.entries:[]).map(e=>
-    `<div onclick="browse('${esc(e.path).replace(/'/g,"\\'")}')">${esc(e.name)}/</div>`).join('')
-   +`<div onclick="addBrowsed()" style="color:var(--accent)">+ watch ${esc(d.path)}</div>`;
+    `<div data-browse="${esc(e.path)}">${esc(e.name)}/</div>`).join('')
+   +`<div data-addwatch="1" style="color:var(--accent)">+ watch ${esc(d.path)}</div>`;
  }catch(e){say('locmsg',e.message,true);}
 }
 function addBrowsed(){putWatch([...new Set([...(SET.watch_roots||[]),CURRENT])]);}
@@ -354,18 +365,20 @@ function resetArrForm(){editingArr=null;$('arrformtitle').textContent='Add a con
 function arrBody(){return{name:$('a_name').value,kind:$('a_kind').value,base_url:$('a_url').value,
  api_key:$('a_key').value,arr_path:$('a_arrpath').value,worker_path:$('a_workerpath').value,
  enabled:$('a_enabled').checked};}
+let ARRS=[];
 async function loadArrs(){
  const d=await api('/api/arrs');
+ ARRS=d.arrs;
  $('arrtable').innerHTML='<tr><th>Name</th><th>Kind</th><th>URL</th><th>Path mapping</th><th>Last result</th><th></th></tr>'+
   (d.arrs.length?d.arrs.map(a=>`<tr><td>${esc(a.name)}${a.enabled?'':' <span class="tag">off</span>'}</td>
    <td>${esc(a.kind)}</td><td><code>${esc(a.base_url)}</code></td>
    <td><code>${esc(a.arr_path||'?')} &rarr; ${esc(a.worker_path||'?')}</code></td>
    <td><code class="${a.last_error?'failed':''}">${esc(a.last_error||'ok')}</code></td>
-   <td><button class="ghost" onclick='editArr(${JSON.stringify(JSON.stringify(a))})'>Edit</button>
-    <button class="ghost danger" onclick="deleteArr('${a.id}','${esc(a.name)}')">Delete</button></td></tr>`).join('')
+   <td><button class="ghost" data-editarr="${esc(a.id)}">Edit</button>
+    <button class="ghost danger" data-delarr="${esc(a.id)}">Delete</button></td></tr>`).join('')
    :'<tr><td colspan="6">No connections yet.</td></tr>');
 }
-function editArr(json){const a=JSON.parse(json);editingArr=a.id;
+function editArr(json){const a=typeof json==='string'?JSON.parse(json):json;editingArr=a.id;
  $('arrformtitle').textContent='Edit '+a.name;$('arrform').innerHTML=arrFormHtml(a);
  document.querySelector('nav button[data-tab=connections]').click();window.scrollTo(0,document.body.scrollHeight);}
 async function saveArr(){
@@ -390,9 +403,11 @@ async function loadKeys(){
   (d.tokens.length?d.tokens.map(t=>`<tr><td>${esc(t.name)}</td><td><code>${esc(t.prefix)}...</code></td>
    <td>${new Date(t.created*1000).toLocaleDateString()}</td>
    <td>${t.last_used?new Date(t.last_used*1000).toLocaleString():'never'}</td>
-   <td><button class="ghost danger" onclick="revokeKey('${t.id}','${esc(t.name)}')">Revoke</button></td></tr>`).join('')
+   <td><button class="ghost danger" data-revoke="${esc(t.id)}">Revoke</button></td></tr>`).join('')
    :'<tr><td colspan="5">No keys minted. The container environment token is in use.</td></tr>');
+ KEYS=d.tokens;
 }
+let KEYS=[];
 async function mintKey(){
  const name=$('keyname').value.trim()||'unnamed';
  try{const r=await api('/api/tokens',{method:'POST',body:JSON.stringify({name})});

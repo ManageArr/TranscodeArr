@@ -25,14 +25,26 @@ import secrets
 import sqlite3
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from hashlib import sha256
-from typing import Any, Callable
+from typing import Any
+
+import core
 
 # ---------------------------------------------------------------------------
 # Setting specs - one table describing every knob, so the API is self-describing
 # and the GUI renders itself without a second hand-maintained list.
 # ---------------------------------------------------------------------------
+
+
+def is_within_any(path: str, roots: list[str]) -> bool:
+    """Is `path` inside one of `roots`?
+
+    Delegates to core.is_within rather than keeping a second copy of the rule -
+    a containment check that exists twice is one that will disagree with itself
+    eventually. Resolved first, so a symlink cannot point out of the roots.
+    """
+    return core.is_within(os.path.realpath(path), [os.path.realpath(r) for r in roots])
 
 
 @dataclass
@@ -64,8 +76,9 @@ SPECS: list[Spec] = [
          "re-encoded - the way to protect Remux copies you would rather keep whole.", "Rules"),
     Spec("quality", "QUALITY", "int", 24, "Quality (CQ/CRF)",
          "Lower is better looking and bigger. 24 is a sane default; 18-20 is near-transparent.", "Rules"),
-    Spec("verify_duration_tolerance", "VERIFY_DURATION_TOLERANCE", "text", "0.015", "Duration tolerance",
-         "How far the output length may drift from the source before the result is rejected. 0.015 is 1.5%.", "Rules"),
+    Spec("verify_duration_tolerance", "VERIFY_DURATION_TOLERANCE", "fraction", 0.015, "Duration tolerance",
+         "How far the output length may drift from the source before the result is rejected, as a fraction: "
+         "0.015 is 1.5%. Capped at 0.5 - a tolerance loose enough to accept half a film is not a tolerance.", "Rules"),
     Spec("force_encoder", "FORCE_ENCODER", "text", "", "Force encoder",
          "Leave empty to probe at boot (NVENC, then QSV, then libx264). Set to pin one.", "Rules"),
     Spec("trash_keep_days", "TRASH_KEEP_DAYS", "int", 7, "Keep replaced sources (days)",
@@ -76,11 +89,24 @@ SPECS: list[Spec] = [
 SPEC_BY_KEY = {s.key: s for s in SPECS}
 
 
-def parse_value(spec: Spec, raw: Any) -> Any:
+def parse_value(spec: Spec, raw: Any, roots: list[str] | None = None) -> Any:
     """Coerce a value from env text or JSON into the shape the daemon expects.
 
     Raises ValueError with a message meant for a person - it is shown in the UI.
     """
+    if spec.kind == "fraction":
+        # Bounded here rather than at the caller, because the caller is the
+        # verification step: a tolerance of "15" (meaning 15%, a very easy
+        # thing to type) accepted a three-second file in place of a
+        # sixteen-minute one, which is the exact failure this project exists
+        # to prevent. inf and nan fail the range test too.
+        try:
+            v = float(str(raw).strip())
+        except (TypeError, ValueError):
+            raise ValueError(f"{spec.label} must be a number, e.g. 0.015 for 1.5%")
+        if not 0 < v <= 0.5:
+            raise ValueError(f"{spec.label} must be greater than 0 and at most 0.5 (50%)")
+        return v
     if spec.kind == "int":
         try:
             n = int(str(raw).strip())
@@ -107,11 +133,17 @@ def parse_value(spec: Spec, raw: Any) -> Any:
             for p in parts:
                 if not p.startswith("/"):
                     raise ValueError(f"{p} is not an absolute path")
+                # Containment belongs here, not only at the point a file is
+                # queued: a watch root outside the mounts cannot produce a job
+                # (validate_path still refuses it) but it would still send the
+                # scanner walking the host filesystem every few minutes.
+                if roots and not is_within_any(p, roots):
+                    raise ValueError(f"{p} is outside the media roots")
         return parts
     return "" if raw is None else str(raw).strip()
 
 
-def effective(rows: dict[str, str], env: dict[str, str]) -> dict[str, Any]:
+def effective(rows: dict[str, str], env: dict[str, str], roots: list[str] | None = None) -> dict[str, Any]:
     """Resolve every setting: stored value, else env, else the built-in default.
 
     Pure - takes the stored rows and the environment as plain dicts so the
@@ -119,29 +151,36 @@ def effective(rows: dict[str, str], env: dict[str, str]) -> dict[str, Any]:
     """
     out: dict[str, Any] = {}
     for spec in SPECS:
-        if spec.key in rows:
-            try:
-                out[spec.key] = parse_value(spec, json.loads(rows[spec.key]))
-                continue
-            except (ValueError, json.JSONDecodeError):
-                pass  # a corrupt row must not take the daemon down; fall through
-        raw = env.get(spec.env)
-        if raw not in (None, ""):
-            try:
-                out[spec.key] = parse_value(spec, raw)
-                continue
-            except ValueError:
-                pass
-        out[spec.key] = spec.default
+        out[spec.key] = _resolve(spec, rows, env, roots)[0]
     return out
 
 
-def sources(rows: dict[str, str], env: dict[str, str]) -> dict[str, str]:
-    """Where each effective value actually came from, for the UI to show."""
-    return {
-        s.key: "stored" if s.key in rows else ("env" if env.get(s.env) not in (None, "") else "default")
-        for s in SPECS
-    }
+def _resolve(spec: Spec, rows: dict[str, str], env: dict[str, str], roots: list[str] | None):
+    """(value, where-it-came-from) for one spec. One function so the value and
+    the label the UI shows can never disagree about which source won."""
+    if spec.key in rows:
+        try:
+            return parse_value(spec, json.loads(rows[spec.key]), roots), "stored"
+        except (ValueError, json.JSONDecodeError):
+            pass  # a corrupt or now-invalid row must not take the daemon down
+    raw = env.get(spec.env)
+    if raw not in (None, ""):
+        try:
+            return parse_value(spec, raw, roots), "env"
+        except ValueError:
+            pass
+    return spec.default, "default"
+
+
+def sources(rows: dict[str, str], env: dict[str, str], roots: list[str] | None = None) -> dict[str, str]:
+    """Where each effective value actually came from, for the UI to show.
+
+    Shares _resolve with effective() rather than re-deriving: a stored row that
+    no longer parses is ignored by the value, and saying "stored" next to a
+    value that came from somewhere else is how someone spends an hour editing
+    a field that is doing nothing.
+    """
+    return {s.key: _resolve(s, rows, env, roots)[1] for s in SPECS}
 
 
 # ---------------------------------------------------------------------------
@@ -181,14 +220,21 @@ def read_settings(conn: sqlite3.Connection) -> dict[str, str]:
     return {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings").fetchall()}
 
 
-def save_settings(conn: sqlite3.Connection, updates: dict[str, Any]) -> list[str]:
-    """Validate and store. Returns the keys written; raises ValueError on the first bad one."""
-    written = []
+def save_settings(conn: sqlite3.Connection, updates: dict[str, Any], roots: list[str] | None = None) -> list[str]:
+    """Validate and store. Returns the keys written; raises ValueError on the first bad one.
+
+    Everything is validated before anything is written, so a bad third field
+    cannot leave the first two applied and the form half-saved.
+    """
+    checked = []
     for key, raw in updates.items():
         spec = SPEC_BY_KEY.get(key)
         if not spec:
             raise ValueError(f"{key} is not a setting")
-        value = parse_value(spec, raw)
+        checked.append((key, parse_value(spec, raw, roots)))
+
+    written = []
+    for key, value in checked:
         conn.execute(
             "INSERT INTO settings (key, value, updated) VALUES (?,?,?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated=excluded.updated",
@@ -211,7 +257,7 @@ def reset_setting(conn: sqlite3.Connection, key: str) -> None:
 
 
 def hash_token(raw: str) -> str:
-    return sha256(raw.encode()).hexdigest()
+    return sha256(raw.encode("utf-8", "surrogateescape")).hexdigest()
 
 
 def mint_token(conn: sqlite3.Connection, name: str) -> tuple[str, dict]:
@@ -242,13 +288,26 @@ def verify_token(conn: sqlite3.Connection, raw: str, env_token: str) -> bool:
     """
     if not raw:
         return False
-    if env_token and hmac.compare_digest(raw, env_token):
+    # Compared as BYTES: compare_digest raises TypeError on a non-ASCII str,
+    # and headers arrive latin-1 decoded, so any high byte in an Authorization
+    # header would kill the request with no response at all.
+    if env_token and hmac.compare_digest(raw.encode("utf-8", "surrogateescape"),
+                                         env_token.encode("utf-8", "surrogateescape")):
         return True
     presented = hash_token(raw)
-    for row in conn.execute("SELECT id, hash FROM tokens").fetchall():
+    now = time.time()
+    for row in conn.execute("SELECT id, hash, last_used FROM tokens").fetchall():
         if hmac.compare_digest(presented, row["hash"]):
-            conn.execute("UPDATE tokens SET last_used=? WHERE id=?", (time.time(), row["id"]))
-            conn.commit()
+            # Stamped at most once a minute. The UI polls every few seconds, and
+            # a write per request turns every page view into lock contention
+            # with the watcher and the worker for a field nobody reads to the
+            # second.
+            if not row["last_used"] or now - row["last_used"] > 60:
+                try:
+                    conn.execute("UPDATE tokens SET last_used=? WHERE id=?", (now, row["id"]))
+                    conn.commit()
+                except sqlite3.OperationalError:
+                    pass  # a busy database must not cost someone their session
             return True
     return False
 

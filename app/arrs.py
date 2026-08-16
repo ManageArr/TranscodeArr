@@ -28,6 +28,22 @@ TIMEOUT = 20
 USER_AGENT = "TranscodeArr"
 
 
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects instead of following them.
+
+    urllib replays the request - including X-Api-Key - at whatever Location it
+    is handed, so one 302 turns a connection test into delivering the arr's API
+    key to a third party. An arr never legitimately redirects these two
+    endpoints, so refusing is free.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirects)
+
+
 def _request(method: str, url: str, api_key: str, body: dict | None = None) -> tuple[Any, str | None]:
     req = urllib.request.Request(url, method=method)
     req.add_header("X-Api-Key", api_key)
@@ -37,7 +53,7 @@ def _request(method: str, url: str, api_key: str, body: dict | None = None) -> t
         data = json.dumps(body).encode()
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, data=data, timeout=TIMEOUT) as res:
+        with _opener.open(req, data=data, timeout=TIMEOUT) as res:
             raw = res.read()
             return (json.loads(raw) if raw else None), None
     except urllib.error.HTTPError as e:

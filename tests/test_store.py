@@ -82,6 +82,53 @@ class Parsing(unittest.TestCase):
         self.assertEqual(store.effective(store.read_settings(conn), {"QUALITY": "20"})["quality"], 20)
 
 
+class ToleranceIsBounded(unittest.TestCase):
+    """The field that can switch verification off by accident."""
+
+    def spec(self):
+        return store.SPEC_BY_KEY["verify_duration_tolerance"]
+
+    def test_a_sane_fraction_is_accepted(self):
+        self.assertAlmostEqual(store.parse_value(self.spec(), "0.015"), 0.015)
+
+    def test_fifteen_meaning_fifteen_percent_is_refused(self):
+        # The realistic mistake: the label says "tolerance" and the help says
+        # "0.015 is 1.5%", so someone types 15. At 15.0 a three-second file
+        # passes as a two-hour film - the exact incident this repo exists for.
+        with self.assertRaises(ValueError):
+            store.parse_value(self.spec(), "15")
+
+    def test_infinity_and_nan_are_refused(self):
+        for bad in ("inf", "nan", "-1", "0"):
+            with self.assertRaises(ValueError):
+                store.parse_value(self.spec(), bad)
+
+    def test_a_bad_stored_value_falls_back_rather_than_disabling_verification(self):
+        values = store.effective({"verify_duration_tolerance": '"15"'}, {})
+        self.assertEqual(values["verify_duration_tolerance"], 0.015)
+
+    def test_the_ui_does_not_claim_a_rejected_row_is_in_force(self):
+        # Saying "saved here" beside a value that came from somewhere else is
+        # how someone spends an hour editing a field that does nothing.
+        rows = {"verify_duration_tolerance": '"15"'}
+        self.assertEqual(store.sources(rows, {})["verify_duration_tolerance"], "default")
+
+
+class WatchRootContainment(unittest.TestCase):
+    def test_a_root_outside_the_media_mounts_is_refused(self):
+        spec = store.SPEC_BY_KEY["watch_roots"]
+        with self.assertRaises(ValueError):
+            store.parse_value(spec, ["/etc"], roots=["/media"])
+
+    def test_a_sibling_sharing_a_prefix_is_not_inside(self):
+        # /media must not match /mediafoo.
+        self.assertFalse(store.is_within_any("/mediafoo", ["/media"]))
+
+    def test_roots_inside_the_mounts_are_accepted(self):
+        spec = store.SPEC_BY_KEY["watch_roots"]
+        self.assertEqual(store.parse_value(spec, ["/media/TV"], roots=["/media"]), ["/media/TV"])
+
+
 class Tokens(unittest.TestCase):
     def test_a_minted_key_authenticates_and_is_not_stored_raw(self):
         conn = memdb()
@@ -102,6 +149,20 @@ class Tokens(unittest.TestCase):
     def test_the_container_env_token_still_works_as_a_bootstrap_key(self):
         # Otherwise upgrading locks out ManageArr, which holds the env token.
         self.assertTrue(store.verify_token(memdb(), "envtoken", "envtoken"))
+
+    def test_a_non_ascii_token_is_refused_rather_than_raising(self):
+        # Headers are decoded latin-1, and compare_digest raises TypeError on a
+        # non-ASCII str - which killed the request with no response at all.
+        conn = memdb()
+        self.assertFalse(store.verify_token(conn, "tokén", "envtoken"))
+        self.assertFalse(store.verify_token(conn, "\udcff", "envtoken"))
+
+    def test_nothing_is_written_when_any_field_is_invalid(self):
+        # A bad third field must not leave the first two applied.
+        conn = memdb()
+        with self.assertRaises(ValueError):
+            store.save_settings(conn, {"quality": 20, "scan_interval_seconds": "-1"})
+        self.assertEqual(store.read_settings(conn), {})
 
     def test_a_revoked_key_stops_working_immediately(self):
         conn = memdb()

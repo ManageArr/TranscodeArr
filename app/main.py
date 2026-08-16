@@ -55,11 +55,11 @@ def cfg() -> dict:
     read is one indexed query against a local SQLite file - cheaper than the
     class of bug where a saved setting quietly does nothing until reboot.
     """
-    return store.effective(store.read_settings(db()), dict(os.environ))
+    return store.effective(store.read_settings(db()), dict(os.environ), MEDIA_ROOTS)
 
 # Bump this with the image tag. /healthz reporting a version that is not the
 # running build makes the one field whose job is "what is deployed" a liar.
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -71,7 +71,9 @@ _local = threading.local()
 
 def db() -> sqlite3.Connection:
     if not hasattr(_local, "conn"):
-        conn = sqlite3.connect(DB_PATH)
+        # The watcher, the worker and every HTTP thread write to this file. The
+        # 5-second default gave up while a library walk was mid-transaction.
+        conn = sqlite3.connect(DB_PATH, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         _local.conn = conn
@@ -102,6 +104,10 @@ def init_db() -> None:
           log_tail TEXT
         );
         CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state);
+        -- One pending job per file, enforced by the database rather than by a
+        -- SELECT two threads can both pass.
+        CREATE UNIQUE INDEX IF NOT EXISTS jobs_pending ON jobs(path)
+          WHERE state IN ('queued','running');
         -- Watcher memory: last observed size per path, for size-stability.
         CREATE TABLE IF NOT EXISTS seen (
           path TEXT PRIMARY KEY,
@@ -149,11 +155,16 @@ def enqueue(path: str, kind: str) -> dict | None:
     if dup:
         return None
     job_id = str(uuid.uuid4())
-    conn.execute(
-        "INSERT INTO jobs (id, path, state, kind, created) VALUES (?,?,?,?,?)",
-        (job_id, path, "queued", kind, time.time()),
-    )
-    conn.commit()
+    try:
+        conn.execute(
+            "INSERT INTO jobs (id, path, state, kind, created) VALUES (?,?,?,?,?)",
+            (job_id, path, "queued", kind, time.time()),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # The unique index caught what the SELECT above raced past - the
+        # watcher thread and an API call can reach here for the same file.
+        return None
     log.info("queued %s (%s)", path, kind)
     return job_dict(conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
 
@@ -283,10 +294,22 @@ def trash(source: str) -> str:
     dest = os.path.join(TRASH_DIR, rel)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     shutil.move(source, dest)
+    # Stamp it NOW. shutil.move preserves the original mtime, and imported
+    # media carries the release's own timestamp - a median of twelve years old
+    # in a real library. Pruning by that inherited date deleted every source
+    # older than the retention window on the very next sweep, minutes after a
+    # job reported "source preserved". Retention has to measure how long the
+    # file has been in the trash, not how old the release is.
+    try:
+        os.utime(dest, None)
+    except OSError:
+        pass
     return dest
 
 
 def prune_trash() -> None:
+    # Retention is measured from when a file was TRASHED, and trash() restamps
+    # it for exactly that reason - see the note there.
     cutoff = time.time() - cfg()["trash_keep_days"] * 86400
     for dirpath, _dirs, files in os.walk(TRASH_DIR, topdown=False):
         for f in files:
@@ -301,6 +324,23 @@ def prune_trash() -> None:
                 os.rmdir(dirpath)
         except OSError:
             pass
+
+
+# One client per connection, kept between jobs so the library list is actually
+# cached. Rebuilt when the row changes - a fresh client per job made
+# ArrClient.CACHE_SECONDS dead code and re-downloaded the whole library for
+# every single finished file.
+_arr_clients: dict[str, tuple[tuple, arr_client.ArrClient]] = {}
+
+
+def _client_for(row: dict) -> arr_client.ArrClient:
+    ident = (row["base_url"], row["api_key"], row["arr_path"], row["worker_path"], row["kind"])
+    cached = _arr_clients.get(row["id"])
+    if cached and cached[0] == ident:
+        return cached[1]
+    client = arr_client.ArrClient(row)
+    _arr_clients[row["id"]] = (ident, client)
+    return client
 
 
 def notify_arrs(visible_path: str) -> str | None:
@@ -318,20 +358,41 @@ def notify_arrs(visible_path: str) -> str | None:
         if not row["enabled"]:
             continue
         try:
-            handled, message = arr_client.ArrClient(row).rescan_for(visible_path)
+            handled, message = _client_for(row).rescan_for(visible_path)
         except Exception as e:  # noqa: BLE001 - an arr must never take a job down
             handled, message = True, f"{row['name']}: {e}"
         if handled:
             notes.append(message)
             store.note_arr_error(conn, row["id"], None if "rescanning" in message else message)
+        elif message and "not under" not in message and "no " not in message:
+            # An unreachable arr or a rotated key returns "not handled" too, and
+            # staying silent there left the UI showing a healthy connection that
+            # had not worked for days.
+            store.note_arr_error(conn, row["id"], message)
     return "; ".join(notes) if notes else None
+
+
+def rescan_after(job_id: str, visible_path: str) -> None:
+    """Notify the arrs once the job is already recorded as done."""
+    try:
+        rescan = notify_arrs(visible_path)
+    except Exception as e:  # noqa: BLE001
+        rescan = f"rescan failed: {e}"
+        log.exception("rescan after %s failed", job_id[:8])
+    if rescan:
+        try:
+            conn = db()
+            conn.execute("UPDATE jobs SET rescan=? WHERE id=?", (rescan, job_id))
+            conn.commit()
+        except sqlite3.Error:
+            log.warning("could not record rescan result for %s", job_id[:8])
 
 
 def process(job: dict) -> None:
     conn = db()
     job_id, source = job["id"], job["path"]
-    conn.execute("UPDATE jobs SET state='running', started=?, encoder=? WHERE id=?", (time.time(), ENCODER, job_id))
-    conn.commit()
+    # worker_loop already claimed this row as 'running' - conditionally, so the
+    # claim and a concurrent cancel cannot both win.
 
     def finish(state: str, **fields) -> None:
         sets = ", ".join(f"{k}=?" for k in fields)
@@ -349,9 +410,18 @@ def process(job: dict) -> None:
         # .mp4 would rename a skipped .mkv to .mp4 without converting it -
         # a file whose extension lies about its contents.
         source_ext = os.path.splitext(source)[1].lower()
-        names = core.plan_names(source, source_ext if job["kind"] == "reveal" else ".mp4")
+        # Re-check the skip rules now, not only at enqueue. A rule added while
+        # hundreds of files are already queued would otherwise protect none of
+        # them - every pending row keeps the 'kind' it was born with.
+        protected = job["kind"] == "reveal" or core.matches_skip(os.path.basename(source), cfg()["skip_patterns"])
+        names = core.plan_names(source, source_ext if protected else ".mp4")
         if os.path.exists(names.visible) and names.visible != source:
             return finish("failed", error=f"target already exists: {names.visible} - not overwriting")
+        # hidden_final is written with os.replace, which silently destroys
+        # whatever is there. For a reveal it IS the source, which is fine; any
+        # other existing file is somebody's media and must stop the job.
+        if names.hidden_final != source and os.path.exists(names.hidden_final):
+            return finish("failed", error=f"staging name is taken: {names.hidden_final} - not overwriting")
 
         src_probe = ffprobe(source)
         if src_probe is None or src_probe.video_streams < 1:
@@ -360,11 +430,11 @@ def process(job: dict) -> None:
 
         # Already the right container, or deliberately protected by a skip rule:
         # verify it is whole, then just reveal it.
-        if job["kind"] == "reveal" or core.should_skip_transcode(src_probe, source_ext):
+        if protected or core.should_skip_transcode(src_probe, source_ext):
             if names.hidden:
                 os.replace(source, names.visible)
-                notify_arrs(names.visible)
-                return finish("done", output=names.visible, src_bytes=src_bytes, out_bytes=src_bytes, progress=100)
+                finish("done", output=names.visible, src_bytes=src_bytes, out_bytes=src_bytes, progress=100)
+                return rescan_after(job_id, names.visible)
             return finish("done", output=source, warning="nothing to do", progress=100)
 
         ok, warning, error = run_encode(job_id, source, names, src_probe)
@@ -403,32 +473,56 @@ def process(job: dict) -> None:
         os.replace(names.part, names.hidden_final)      # hidden, complete, atomic
         trashed = trash(source)                          # source survives, in trash
         os.replace(names.hidden_final, names.visible)    # the reveal
-        rescan = notify_arrs(names.visible)
+        # Marked done BEFORE talking to any arr. The media is already correct on
+        # disk at this point; letting an unreachable arr throw into the handler
+        # below would stamp 'failed' on a conversion that completely succeeded,
+        # and re-running it would then trip the "target already exists" guard.
         finish(
             "done",
             output=names.visible,
             warning=warning or None,
-            rescan=rescan,
             src_bytes=src_bytes,
             out_bytes=out_bytes,
             progress=100,
             log_tail=f"source preserved at {trashed}",
         )
+        rescan_after(job_id, names.visible)
     except Exception as e:  # noqa: BLE001
         log.exception("job %s crashed", job_id[:8])
         finish("failed", error=f"internal: {e}")
 
 
 def worker_loop() -> None:
+    # Guarded like watch_loop is. Without this, one OperationalError - from a
+    # write that lost a race for the database - ends the only worker thread.
+    # The process keeps running, /healthz keeps saying ok, and the queue simply
+    # never moves again, which is the worst way for this to fail.
     while True:
-        row = db().execute("SELECT * FROM jobs WHERE state='queued' ORDER BY created LIMIT 1").fetchone()
-        if row is None:
-            time.sleep(2)
-            continue
-        _cancel.clear()
-        _current_job["id"] = row["id"]
-        process(job_dict(row))
-        _current_job.clear()
+        try:
+            conn = db()
+            row = conn.execute("SELECT * FROM jobs WHERE state='queued' ORDER BY created LIMIT 1").fetchone()
+            if row is None:
+                time.sleep(2)
+                continue
+            # Claim it conditionally: the cancel route may have taken this row
+            # between the read and here, and an unconditional write would stamp
+            # 'running' over 'cancelled' and encode it anyway.
+            claimed = conn.execute(
+                "UPDATE jobs SET state='running', started=?, encoder=? WHERE id=? AND state='queued'",
+                (time.time(), ENCODER, row["id"]),
+            )
+            conn.commit()
+            if claimed.rowcount == 0:
+                continue
+            _cancel.clear()
+            _current_job["id"] = row["id"]
+            try:
+                process(job_dict(row))
+            finally:
+                _current_job.clear()
+        except Exception:  # noqa: BLE001
+            log.exception("worker loop error")
+            time.sleep(5)
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +572,11 @@ def scan_once() -> None:
                         protected = core.matches_skip(name, skip_patterns)
                         kind = "reveal" if (hidden and ext == ".mp4") or protected else "transcode"
                         enqueue(resolved, kind)
+            # Commit per directory. sqlite3 opens a transaction on the first
+            # write and holds the WAL write lock until commit - across a whole
+            # library walk that is minutes, during which every other writer
+            # (the worker finishing a job, a settings save) times out.
+            conn.commit()
     conn.execute("DELETE FROM seen WHERE at < ?", (now - 7 * 86400,))
     conn.commit()
 
@@ -563,6 +662,10 @@ def _browse(raw: str) -> tuple[int, dict]:
 
 class Handler(BaseHTTPRequestHandler):
     server_version = f"TranscodeArr/{VERSION}"
+    # Without this a client that connects and then says nothing parks a thread
+    # in readline() forever, holding a socket and a file descriptor, with no
+    # authentication needed to do it.
+    timeout = 30
 
     def _send(self, code: int, payload: dict | str, content_type: str = "application/json") -> None:
         body = (payload if isinstance(payload, str) else json.dumps(payload)).encode()
@@ -598,14 +701,14 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed():
             return self._send(401, {"error": "missing or wrong bearer token"})
         if self.path == "/api/settings":
-            rows, env = store.read_settings(db()), dict(os.environ)
+            rows, env, roots = store.read_settings(db()), dict(os.environ), MEDIA_ROOTS
             return self._send(200, {
                 "specs": [
                     {"key": s.key, "kind": s.kind, "label": s.label, "help": s.help, "group": s.group, "env": s.env}
                     for s in store.SPECS
                 ],
-                "values": store.effective(rows, env),
-                "sources": store.sources(rows, env),
+                "values": store.effective(rows, env, roots),
+                "sources": store.sources(rows, env, roots),
                 "media_roots": MEDIA_ROOTS,
             })
         if self.path == "/api/tokens":
@@ -626,8 +729,11 @@ class Handler(BaseHTTPRequestHandler):
             row = db().execute("SELECT * FROM jobs WHERE id=?", (m.group(1),)).fetchone()
             return self._send(200, job_dict(row)) if row else self._send(404, {"error": "no such job"})
         if self.path.startswith("/jobs"):
-            q = dict(p.split("=", 1) for p in self.path.partition("?")[2].split("&") if "=" in p)
-            limit = min(int(q.get("limit", "50")), 200)
+            q = _query(self.path)
+            try:
+                limit = min(max(int(q.get("limit", "50")), 1), 200)
+            except ValueError:
+                limit = 50
             state = q.get("state")
             rows = db().execute(
                 f"SELECT * FROM jobs {'WHERE state=?' if state else ''} ORDER BY created DESC LIMIT ?",
@@ -637,8 +743,14 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     def _body(self) -> dict:
-        raw = self.rfile.read(int(self.headers.get("Content-Length", "0") or 0)) or b"{}"
-        return json.loads(raw)
+        # A malformed Content-Length raises ValueError, which the callers'
+        # `except json.JSONDecodeError` does not catch - the connection closed
+        # with no response at all rather than a 400.
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            raise json.JSONDecodeError("bad Content-Length", "", 0)
+        return json.loads(self.rfile.read(max(0, length)) or b"{}")
 
     def do_PUT(self) -> None:  # noqa: N802
         if not self._authed():
@@ -649,7 +761,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "invalid JSON"})
         if self.path == "/api/settings":
             try:
-                written = store.save_settings(db(), body)
+                written = store.save_settings(db(), body, MEDIA_ROOTS)
             except ValueError as e:
                 return self._send(400, {"error": str(e)})
             log.info("settings changed: %s", ", ".join(written))
@@ -683,15 +795,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"error": str(e)})
             return self._send(201, {"arr": {**row, "api_key": "********"}})
         if self.path == "/api/arrs/test":
-            # An edit form never receives the stored key, so a test with a blank
-            # key means "test the one you already have".
             key = str(body.get("api_key", "")).strip()
-            if not key and body.get("id"):
-                existing = store.get_arr(db(), str(body["id"]))
-                key = existing["api_key"] if existing else ""
             base = str(body.get("base_url", "")).strip().rstrip("/")
+            if not key and body.get("id"):
+                # An edit form never receives the stored key, so a blank key
+                # means "test the one you already have" - and then the URL must
+                # come from that same stored row too. Pairing a stored secret
+                # with a caller-supplied address is a way to make this service
+                # post your Radarr key to any host on request.
+                existing = store.get_arr(db(), str(body["id"]))
+                if not existing:
+                    return self._send(404, {"error": "no such connection"})
+                key, base = existing["api_key"], existing["base_url"]
             if not base or not key:
                 return self._send(400, {"error": "base_url and api_key are required to test"})
+            if not re.match(r"^https?://", base):
+                return self._send(400, {"error": "base_url must start with http:// or https://"})
             ok, detail = arr_client.test(base, key)
             return self._send(200, {"ok": ok, "detail": detail})
 
@@ -726,9 +845,17 @@ class Handler(BaseHTTPRequestHandler):
         if not row:
             return self._send(404, {"error": "no such job"})
         if row["state"] == "queued":
-            conn.execute("UPDATE jobs SET state='cancelled', finished=? WHERE id=?", (time.time(), row["id"]))
+            # Conditional: the worker may have claimed this row since the read,
+            # and stamping 'cancelled' over 'running' would report a cancel that
+            # never happened while the encode ran to completion.
+            cur = conn.execute(
+                "UPDATE jobs SET state='cancelled', finished=? WHERE id=? AND state='queued'",
+                (time.time(), row["id"]),
+            )
             conn.commit()
-            return self._send(200, {"cancelled": row["id"]})
+            if cur.rowcount:
+                return self._send(200, {"cancelled": row["id"]})
+            row = conn.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
         if row["state"] == "running" and _current_job.get("id") == row["id"]:
             _cancel.set()
             return self._send(202, {"cancelling": row["id"]})

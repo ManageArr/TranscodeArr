@@ -106,5 +106,48 @@ class Throughput(unittest.TestCase):
         self.assertEqual(view["eta_seconds"], 500)
 
 
+class Trash(unittest.TestCase):
+    """The promise the whole project rests on: a replaced source outlives its
+    replacement. It did not - and no test covered trash() at all."""
+
+    def setUp(self):
+        main.init_db()
+        self.media = os.path.join(_TMP, "media")
+        os.makedirs(os.path.join(self.media, "TV"), exist_ok=True)
+        main.MEDIA_ROOTS = [self.media]
+
+    def make_old_file(self, name, years=12):
+        path = os.path.join(self.media, "TV", name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("x")
+        old = time.time() - years * 365 * 86400
+        os.utime(path, (old, old))
+        return path
+
+    def test_a_trashed_source_is_stamped_with_when_it_was_trashed(self):
+        # shutil.move preserves mtime, and imported media carries the release's
+        # own timestamp - a median of twelve years old. Pruning on that date
+        # deleted every source minutes after the job said "source preserved".
+        dest = main.trash(self.make_old_file("Old Release.mkv"))
+        self.assertTrue(os.path.exists(dest))
+        self.assertLess(time.time() - os.path.getmtime(dest), 60,
+                        "trashed file still carries the release's own timestamp")
+
+    def test_prune_keeps_a_source_trashed_inside_the_retention_window(self):
+        dest = main.trash(self.make_old_file("Keep Me.mkv"))
+        main.store.save_settings(main.db(), {"trash_keep_days": 7})
+        main.prune_trash()
+        self.assertTrue(os.path.exists(dest), "a source was deleted inside its retention window")
+
+    def test_prune_still_removes_what_is_genuinely_old(self):
+        # The pruning has to keep working, or the trash eats the disk.
+        dest = main.trash(self.make_old_file("Expired.mkv"))
+        long_ago = time.time() - 30 * 86400
+        os.utime(dest, (long_ago, long_ago))
+        main.store.save_settings(main.db(), {"trash_keep_days": 7})
+        main.prune_trash()
+        self.assertFalse(os.path.exists(dest))
+
+
 if __name__ == "__main__":
     unittest.main()
