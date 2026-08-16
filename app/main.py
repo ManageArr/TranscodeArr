@@ -59,7 +59,7 @@ def cfg() -> dict:
 
 # Bump this with the image tag. /healthz reporting a version that is not the
 # running build makes the one field whose job is "what is deployed" a liar.
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -496,6 +496,40 @@ def watch_loop() -> None:
 # HTTP
 # ---------------------------------------------------------------------------
 
+def _queue_view(limit: int) -> dict:
+    """What is converting now, and what is next - in the order it will happen.
+
+    The order is not a display choice: worker_loop takes
+    `WHERE state='queued' ORDER BY created LIMIT 1`, so oldest-first IS the
+    running order. Listing newest-first (which the job history does, correctly,
+    as history) would show the queue backwards.
+    """
+    conn = db()
+    running = [job_dict(r) for r in
+               conn.execute("SELECT * FROM jobs WHERE state='running' ORDER BY started").fetchall()]
+    queued = [job_dict(r) for r in
+              conn.execute("SELECT * FROM jobs WHERE state='queued' ORDER BY created LIMIT ?", (limit,)).fetchall()]
+    total = conn.execute("SELECT COUNT(*) FROM jobs WHERE state='queued'").fetchone()[0]
+
+    # Throughput measured from real completions, transcodes only: a reveal is a
+    # rename that finishes in milliseconds, and averaging those in would promise
+    # that a queue drains in minutes when it actually takes days.
+    rows = conn.execute(
+        "SELECT started, finished FROM jobs WHERE state='done' AND kind='transcode' "
+        "AND started IS NOT NULL AND finished IS NOT NULL ORDER BY finished DESC LIMIT 20"
+    ).fetchall()
+    spans = [r["finished"] - r["started"] for r in rows if r["finished"] and r["started"] and r["finished"] > r["started"]]
+    per_job = sum(spans) / len(spans) if spans else None
+    return {
+        "running": running,
+        "queued": queued,
+        "queued_total": total,
+        "seconds_per_job": round(per_job) if per_job else None,
+        "eta_seconds": round(per_job * total) if per_job else None,
+        "sampled": len(spans),
+    }
+
+
 def _query(path: str) -> dict[str, str]:
     return {k: v[0] for k, v in urllib.parse.parse_qs(urllib.parse.urlparse(path).query).items()}
 
@@ -581,6 +615,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/fs"):
             q = _query(self.path)
             return self._send(*_browse(q.get("path", "")))
+        if self.path.startswith("/queue"):
+            try:
+                limit = min(max(int(_query(self.path).get("limit", "100")), 1), 500)
+            except ValueError:
+                limit = 100
+            return self._send(200, _queue_view(limit))
         m = re.fullmatch(r"/jobs/([0-9a-f-]{36})", self.path)
         if m:
             row = db().execute("SELECT * FROM jobs WHERE id=?", (m.group(1),)).fetchone()

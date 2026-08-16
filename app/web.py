@@ -63,17 +63,37 @@ PAGE = r"""<!doctype html><meta charset="utf-8"><title>TranscodeArr</title>
  .keyout{background:#052e23;border:1px solid #14532d;border-radius:6px;padding:.7rem;margin-bottom:.9rem;
          font-size:.82rem;display:none}
  .keyout code{color:var(--ok);font-size:.85rem;user-select:all}
+ .now{background:linear-gradient(180deg,#12243c,#111c30);border:1px solid #164e63}
+ .now .file{font-size:1rem;color:var(--ink);word-break:break-word;margin:.1rem 0 .1rem}
+ .now .where{color:var(--dim);font-size:.78rem;word-break:break-all;margin-bottom:.7rem}
+ .bar{height:8px;background:#0a1122;border-radius:999px;overflow:hidden;border:1px solid var(--line)}
+ .bar i{display:block;height:100%;background:linear-gradient(90deg,#0891b2,var(--accent));transition:width .8s linear}
+ .facts{display:flex;gap:1.4rem;flex-wrap:wrap;color:var(--dim);font-size:.8rem;margin-top:.6rem}
+ .facts b{color:var(--ink);font-weight:600}
+ .idle{color:var(--dim);font-size:.9rem;padding:.4rem 0}
+ td.pos{color:var(--dim);width:2.5rem;text-align:right;font-variant-numeric:tabular-nums}
+ tr.next td{color:var(--accent)}
 </style>
 <header><h1>TranscodeArr</h1><div id="summary">connecting...</div></header>
 <nav>
- <button data-tab="jobs" class="on">Jobs</button>
+ <button data-tab="queue" class="on">Queue</button>
+ <button data-tab="jobs">History</button>
  <button data-tab="locations">Locations</button>
  <button data-tab="rules">Rules</button>
  <button data-tab="connections">Connections</button>
  <button data-tab="keys">API Keys</button>
 </nav>
 
-<section id="jobs" class="on">
+<section id="queue" class="on">
+ <div class="card now" id="nowcard"><h2>Converting now</h2><div id="now"></div></div>
+ <div class="card">
+  <h2>Up next</h2>
+  <p class="hint" id="queuehint">In the order they will run - one at a time, oldest first.</p>
+  <table id="queuetable"></table>
+ </div>
+</section>
+
+<section id="jobs">
  <div class="row" style="margin-bottom:.8rem">
   <select id="statefilter" style="width:auto">
    <option value="">All states</option><option value="queued">Queued</option>
@@ -165,9 +185,69 @@ function say(el,text,bad){const n=$(el);n.className='msg '+(bad?'err':'ok');n.te
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
  document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('on',x===b));
  document.querySelectorAll('section').forEach(s=>s.classList.toggle('on',s.id===b.dataset.tab));
+ // Refresh on arrival rather than showing whatever the last poll left behind.
+ if(b.dataset.tab==='queue') refreshQueue().catch(()=>{});
+ if(b.dataset.tab==='jobs') refreshJobs().catch(()=>{});
 });
 
-// ---- status + jobs -------------------------------------------------------
+// ---- the queue: what is running, and what is next in running order -------
+const fileOf=p=>String(p||'').split('/').pop();
+const folderOf=p=>String(p||'').split('/').slice(0,-1).join('/');
+function dur(s){
+ if(s==null||!isFinite(s)) return '';
+ s=Math.max(0,Math.round(s));
+ const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
+ if(d) return `${d}d ${h}h`;
+ if(h) return `${h}h ${m}m`;
+ if(m) return `${m}m ${s%60}s`;
+ return `${s}s`;
+}
+async function refreshQueue(){
+ const q=await api('/queue?limit=200');
+ const r=(q.running||[])[0];
+ if(r){
+  const pct=Math.max(0,Math.min(100,r.progress||0));
+  const elapsed=r.started?(Date.now()/1000-r.started):null;
+  // Remaining is extrapolated from THIS file's own progress, not the fleet
+  // average - a 20-minute episode behind a 2-hour film would otherwise read
+  // as an hour out.
+  const left=(pct>2&&elapsed)?elapsed*(100-pct)/pct:null;
+  $('now').innerHTML=
+   `<div class="file">${esc(fileOf(r.path))}</div>
+    <div class="where">${esc(folderOf(r.path))}</div>
+    <div class="bar"><i style="width:${pct}%"></i></div>
+    <div class="facts"><span><b>${pct}%</b></span>
+     <span>encoder <b>${esc(r.encoder||'?')}</b></span>
+     ${elapsed?`<span>running <b>${dur(elapsed)}</b></span>`:''}
+     ${left?`<span>about <b>${dur(left)}</b> left</span>`:''}
+     <span><button class="ghost" data-cancel="${esc(r.id)}">Cancel</button></span></div>`;
+ } else {
+  $('now').innerHTML='<div class="idle">Nothing converting right now.</div>';
+ }
+
+ const rows=q.queued||[];
+ $('queuetable').innerHTML='<tr><th class="pos">#</th><th>File</th><th>Folder</th><th>Type</th><th></th></tr>'+
+  (rows.length?rows.map((x,i)=>
+    `<tr class="${i===0?'next':''}"><td class="pos">${i+1}</td><td>${esc(fileOf(x.path))}</td>`+
+    `<td><code>${esc(folderOf(x.path))}</code></td>`+
+    `<td>${x.kind==='reveal'?'<span class="tag">reveal only</span>':'transcode'}</td>`+
+    `<td><button class="ghost" data-cancel="${esc(x.id)}">Cancel</button></td></tr>`).join('')
+   :'<tr><td colspan="5">Queue is empty.</td></tr>');
+
+ const shown=rows.length,total=q.queued_total||0;
+ let hint=total?`${total} waiting${shown<total?` (showing the next ${shown})`:''} - one at a time, oldest first.`
+              :'Nothing waiting.';
+ if(q.seconds_per_job&&total)
+  hint+=` About ${dur(q.seconds_per_job)} each lately, so roughly ${dur(q.eta_seconds)} to clear.`;
+ $('queuehint').textContent=hint;
+}
+// Delegated so a file name can never end up inside a JavaScript string literal.
+document.addEventListener('click',e=>{
+ const id=e.target&&e.target.dataset&&e.target.dataset.cancel;
+ if(id) cancelJob(id);
+});
+
+// ---- status + history ----------------------------------------------------
 async function refreshHealth(){
  const z=await (await fetch('/healthz')).json();
  $('summary').innerHTML=`encoder <b style="color:${z.encoder==='libx264'?'var(--warn)':'var(--ok)'}">`+
@@ -187,7 +267,10 @@ async function refreshJobs(){
     `<td><code>${esc(x.error||x.warning||x.rescan||x.output||'')}</code></td><td>${stop}</td></tr>`;
   }).join(''):'<tr><td colspan="6">Nothing here yet.</td></tr>');
 }
-async function cancelJob(id){try{await api('/jobs/'+id,{method:'DELETE'});refreshJobs();}catch(e){alert(e.message);}}
+async function cancelJob(id){
+ try{await api('/jobs/'+id,{method:'DELETE'});await refreshQueue();await refreshJobs();}
+ catch(e){alert(e.message);}
+}
 
 // ---- settings ------------------------------------------------------------
 function field(spec){
@@ -326,10 +409,19 @@ async function revokeKey(id,name){
 }
 
 // ---- boot ----------------------------------------------------------------
-async function tick(){try{await refreshHealth();await refreshJobs();}catch(e){}}
+async function tick(){
+ try{
+  await refreshHealth();
+  // Only refresh the visible tab: polling the history and the queue together
+  // every few seconds is two queries nobody is looking at.
+  if($('queue').classList.contains('on')) await refreshQueue();
+  else if($('jobs').classList.contains('on')) await refreshJobs();
+ }catch(e){}
+}
 (async function(){
  resetArrForm();
- try{await refreshHealth();await loadSettings();await loadArrs();await loadKeys();await refreshJobs();
+ try{await refreshHealth();await loadSettings();await loadArrs();await loadKeys();
+  await refreshQueue();await refreshJobs();
   browse((SET.watch_roots||[])[0]||'');
   timer=setInterval(tick,4000);
  }catch(e){if(String(e.message)!=='unauthorised')$('summary').textContent=e.message;}
