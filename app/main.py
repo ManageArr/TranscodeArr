@@ -59,7 +59,7 @@ def cfg() -> dict:
 
 # Bump this with the image tag. /healthz reporting a version that is not the
 # running build makes the one field whose job is "what is deployed" a liar.
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -121,9 +121,13 @@ def init_db() -> None:
     # nothing to a table that already exists, so a live database - the only kind
     # that matters here - would never gain them without this.
     have = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()}
-    for column, decl in (("rescan", "TEXT"),):
+    for column, decl in (("rescan", "TEXT"), ("priority", "INTEGER NOT NULL DEFAULT 0")):
         if column not in have:
             conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {decl}")
+    # Existing rows predate priorities. A reveal is a rename that finishes in
+    # milliseconds, so leaving hundreds of them behind a two-day transcode
+    # backlog keeps files invisible for days that could be visible now.
+    conn.execute(f"UPDATE jobs SET priority={REVEAL_PRIORITY} WHERE kind='reveal' AND state='queued' AND priority=0")
 
     # Boot rule: anything left running died with the previous process. Its
     # .part is deleted; the SOURCE was never touched, so nothing is lost and
@@ -146,6 +150,12 @@ def job_dict(row: sqlite3.Row) -> dict:
     return {k: row[k] for k in row.keys()}
 
 
+# Work is taken in (priority, created) order. A reveal costs milliseconds - it
+# is a rename, not an encode - so making it wait behind hours of transcoding
+# keeps a file invisible for no reason at all.
+REVEAL_PRIORITY = -10
+
+
 def enqueue(path: str, kind: str) -> dict | None:
     """Queue a path unless it is already pending - idempotent per file."""
     conn = db()
@@ -157,8 +167,8 @@ def enqueue(path: str, kind: str) -> dict | None:
     job_id = str(uuid.uuid4())
     try:
         conn.execute(
-            "INSERT INTO jobs (id, path, state, kind, created) VALUES (?,?,?,?,?)",
-            (job_id, path, "queued", kind, time.time()),
+            "INSERT INTO jobs (id, path, state, kind, created, priority) VALUES (?,?,?,?,?,?)",
+            (job_id, path, "queued", kind, time.time(), REVEAL_PRIORITY if kind == "reveal" else 0),
         )
         conn.commit()
     except sqlite3.IntegrityError:
@@ -187,47 +197,121 @@ def ffprobe(path: str) -> core.Probe | None:
         return None
 
 
-def probe_encoders() -> tuple[str, str]:
-    """(encoder, reason). Tried in order with a real one-second encode.
+def try_encoder(enc: str) -> tuple[bool, str]:
+    """One real one-second encode. A LISTED encoder is not a working one.
 
-    A listed encoder is not a working one - h264_nvenc appears in every ffmpeg
-    build's list and then fails at runtime without the driver libraries. Only
-    an actual encode proves the path works, and the reason is kept so /healthz
-    can say WHY the box is on CPU when it is.
+    ffmpeg lists every encoder it was built with, so av1_nvenc appears on a
+    card that cannot do AV1 and h264_nvenc appears with no driver libraries at
+    all - both fail only when a real file is already halfway through. Actually
+    encoding one second is the only honest test.
     """
+    if enc not in core.DEFAULT_TEMPLATES:
+        return False, "no template for this encoder"
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "testsrc2=duration=1:size=320x240:rate=30",
+             "-c:v", enc, "-f", "null", "-"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if r.returncode == 0:
+            return True, "verified with a real encode"
+        last = (r.stderr or "").strip().splitlines()
+        return False, (last[-1][:200] if last else "failed with no output")
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)
+
+
+def gpu_name() -> str | None:
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip().splitlines()[0].strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def probe_all() -> list[dict]:
+    """Every candidate encoder, each actually tried, with what it is good for."""
+    out = []
+    for enc in core.ENCODER_ORDER:
+        ok, reason = try_encoder(enc)
+        info = core.ENCODER_INFO.get(enc, {})
+        out.append({
+            "name": enc, "available": ok, "reason": reason,
+            "codec": info.get("codec"), "hardware": info.get("hardware", False),
+            "recommended_quality": info.get("recommended"), "sane_range": info.get("sane"),
+            "summary": info.get("summary"), "detail": info.get("detail"),
+        })
+    return out
+
+
+def choose_encoder() -> tuple[str, str, list[dict]]:
+    """(encoder, why, full probe results). A forced choice is honoured if it
+    works and refused loudly if it does not - silently ignoring it would leave
+    someone convinced they were on the GPU."""
+    probes = probe_all()
+    by_name = {p["name"]: p for p in probes}
     forced = cfg()["force_encoder"]
-    order = [forced] if forced else ["h264_nvenc", "h264_qsv", "libx264"]
-    reasons = []
-    for enc in order:
-        if enc not in core.DEFAULT_TEMPLATES:
-            reasons.append(f"{enc}: no template")
-            continue
-        try:
-            r = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "testsrc2=duration=1:size=320x240:rate=30",
-                 "-c:v", enc, "-f", "null", "-"],
-                capture_output=True, text=True, timeout=60,
-            )
-            if r.returncode == 0:
-                return enc, "; ".join(reasons) if reasons else "first choice worked"
-            reasons.append(f"{enc}: {(r.stderr or '').strip().splitlines()[-1][:160] if r.stderr else 'failed'}")
-        except Exception as e:  # noqa: BLE001
-            reasons.append(f"{enc}: {e}")
-    return "libx264", "; ".join(reasons)
+    if forced:
+        p = by_name.get(forced)
+        if p and p["available"]:
+            return forced, "forced in settings", probes
+        why = p["reason"] if p else "not a known encoder"
+        log.warning("forced encoder %s is unusable (%s) - falling back", forced, why)
+    for enc in core.ENCODER_ORDER:
+        if by_name[enc]["available"]:
+            skipped = [f"{p['name']}: {p['reason']}" for p in probes
+                       if p["name"] != enc and not p["available"] and core.ENCODER_ORDER.index(p["name"]) < core.ENCODER_ORDER.index(enc)]
+            return enc, ("; ".join(skipped) if skipped else "first choice worked"), probes
+    return "libx264", "nothing probed successfully - falling back to software", probes
 
 
 ENCODER = "libx264"
 ENCODER_REASON = "not probed yet"
+ENCODER_PROBES: list[dict] = []
+GPU = None
 
 
 # ---------------------------------------------------------------------------
-# The worker - one at a time, deliberately
+# The workers
 # ---------------------------------------------------------------------------
-# One 1GbE-attached spindle set and one NVENC session budget do not benefit
-# from concurrency; two encodes interleave into two slow encodes.
+# One at a time by default: a NAS is usually one set of spindles behind one
+# network link, and two encodes there interleave into two slow encodes rather
+# than finishing any sooner. It is a default rather than a law because that
+# stops being true on an SSD-backed pool with a professional card - NVIDIA's
+# Quadro line has no encode-session cap, unlike GeForce - so the ceiling is
+# raised in settings by whoever can measure their own disk.
 
-_cancel = threading.Event()
-_current_job: dict = {}
+_jobs_lock = threading.Lock()
+# job_id -> {"proc": Popen | None, "cancel": bool}. Replaces a single global
+# cancel flag, which with more than one worker would stop whichever job
+# happened to be running rather than the one that was asked for.
+_running: dict[str, dict] = {}
+
+
+def cancel_running(job_id: str) -> bool:
+    with _jobs_lock:
+        entry = _running.get(job_id)
+        if entry is None:
+            return False
+        entry["cancel"] = True
+        proc = entry.get("proc")
+    if proc is not None:
+        # Ask the encode to stop directly. Waiting for the progress loop to
+        # notice does not work when ffmpeg is blocked reading a stalled share.
+        try:
+            proc.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+    return True
+
+
+def _cancelled(job_id: str) -> bool:
+    with _jobs_lock:
+        entry = _running.get(job_id)
+        return bool(entry and entry["cancel"])
 
 
 def run_encode(job_id: str, source: str, names: core.JobNames, src_probe: core.Probe) -> tuple[bool, str, str]:
@@ -243,7 +327,10 @@ def run_encode(job_id: str, source: str, names: core.JobNames, src_probe: core.P
         conn.execute("UPDATE jobs SET log_tail=? WHERE id=?", (" ".join(args), job_id))
         conn.commit()
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        _current_job["proc"] = proc
+        with _jobs_lock:
+            _running.setdefault(job_id, {"cancel": False})["proc"] = proc
+        if _cancelled(job_id):
+            proc.terminate()  # cancelled between the claim and the spawn
         stderr_tail: list[str] = []
 
         def drain_stderr() -> None:
@@ -258,13 +345,22 @@ def run_encode(job_id: str, source: str, names: core.JobNames, src_probe: core.P
             if pct is not None:
                 conn.execute("UPDATE jobs SET progress=? WHERE id=?", (pct, job_id))
                 conn.commit()
-            if _cancel.is_set():
+            if _cancelled(job_id):
                 proc.terminate()
-        proc.wait()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            # terminate is a request. An ffmpeg wedged on a stalled share will
+            # ignore it, and waiting forever would hold this worker permanently.
+            log.warning("job %s did not exit on terminate - killing", job_id[:8])
+            proc.kill()
+            proc.wait(timeout=10)
         t.join(timeout=5)
-        _current_job.pop("proc", None)
+        with _jobs_lock:
+            if job_id in _running:
+                _running[job_id]["proc"] = None
 
-        if _cancel.is_set():
+        if _cancelled(job_id):
             return False, "", "cancelled"
         if proc.returncode == 0:
             return True, warning, ""
@@ -500,26 +596,37 @@ def worker_loop() -> None:
     while True:
         try:
             conn = db()
-            row = conn.execute("SELECT * FROM jobs WHERE state='queued' ORDER BY created LIMIT 1").fetchone()
+            row = None
+            # Claim under the lock so the concurrency limit is honoured: without
+            # it two idle workers both see room for one more and both take work.
+            with _jobs_lock:
+                if len(_running) >= max(1, cfg()["max_concurrent"]):
+                    row = None
+                else:
+                    # (priority, created): reveals first, then oldest first.
+                    candidate = conn.execute(
+                        "SELECT * FROM jobs WHERE state='queued' ORDER BY priority, created LIMIT 1"
+                    ).fetchone()
+                    if candidate is not None:
+                        # Conditional: a cancel may have taken this row since the
+                        # read, and an unconditional write would stamp 'running'
+                        # over 'cancelled' and encode it anyway.
+                        claimed = conn.execute(
+                            "UPDATE jobs SET state='running', started=?, encoder=? WHERE id=? AND state='queued'",
+                            (time.time(), ENCODER, candidate["id"]),
+                        )
+                        conn.commit()
+                        if claimed.rowcount:
+                            row = candidate
+                            _running[row["id"]] = {"cancel": False, "proc": None}
             if row is None:
                 time.sleep(2)
                 continue
-            # Claim it conditionally: the cancel route may have taken this row
-            # between the read and here, and an unconditional write would stamp
-            # 'running' over 'cancelled' and encode it anyway.
-            claimed = conn.execute(
-                "UPDATE jobs SET state='running', started=?, encoder=? WHERE id=? AND state='queued'",
-                (time.time(), ENCODER, row["id"]),
-            )
-            conn.commit()
-            if claimed.rowcount == 0:
-                continue
-            _cancel.clear()
-            _current_job["id"] = row["id"]
             try:
                 process(job_dict(row))
             finally:
-                _current_job.clear()
+                with _jobs_lock:
+                    _running.pop(row["id"], None)
         except Exception:  # noqa: BLE001
             log.exception("worker loop error")
             time.sleep(5)
@@ -607,8 +714,11 @@ def _queue_view(limit: int) -> dict:
     running = [job_dict(r) for r in
                conn.execute("SELECT * FROM jobs WHERE state='running' ORDER BY started").fetchall()]
     queued = [job_dict(r) for r in
-              conn.execute("SELECT * FROM jobs WHERE state='queued' ORDER BY created LIMIT ?", (limit,)).fetchall()]
+              conn.execute("SELECT * FROM jobs WHERE state='queued' ORDER BY priority, created LIMIT ?",
+                           (limit,)).fetchall()]
     total = conn.execute("SELECT COUNT(*) FROM jobs WHERE state='queued'").fetchone()[0]
+    transcodes = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE state='queued' AND kind='transcode'").fetchone()[0]
 
     # Throughput measured from real completions, transcodes only: a reveal is a
     # rename that finishes in milliseconds, and averaging those in would promise
@@ -617,15 +727,19 @@ def _queue_view(limit: int) -> dict:
         "SELECT started, finished FROM jobs WHERE state='done' AND kind='transcode' "
         "AND started IS NOT NULL AND finished IS NOT NULL ORDER BY finished DESC LIMIT 20"
     ).fetchall()
-    spans = [r["finished"] - r["started"] for r in rows if r["finished"] and r["started"] and r["finished"] > r["started"]]
+    spans = [r["finished"] - r["started"] for r in rows
+             if r["started"] is not None and r["finished"] is not None and r["finished"] > r["started"]]
     per_job = sum(spans) / len(spans) if spans else None
     return {
         "running": running,
         "queued": queued,
         "queued_total": total,
         "seconds_per_job": round(per_job) if per_job else None,
-        "eta_seconds": round(per_job * total) if per_job else None,
+        # Reveals are excluded from the estimate AND from what it has to cover:
+        # they are renames, and they run first anyway.
+        "eta_seconds": round(per_job * transcodes / max(1, cfg()["max_concurrent"])) if per_job else None,
         "sampled": len(spans),
+        "max_concurrent": cfg()["max_concurrent"],
     }
 
 
@@ -711,6 +825,15 @@ class Handler(BaseHTTPRequestHandler):
                 "sources": store.sources(rows, env, roots),
                 "media_roots": MEDIA_ROOTS,
             })
+        if self.path == "/api/encoders":
+            return self._send(200, {
+                "gpu": GPU,
+                "in_use": ENCODER,
+                "why": ENCODER_REASON,
+                "quality": cfg()["quality"],
+                "recommended_for_current": core.recommended_quality(ENCODER),
+                "encoders": ENCODER_PROBES,
+            })
         if self.path == "/api/tokens":
             return self._send(200, {"tokens": store.list_tokens(db())})
         if self.path == "/api/arrs":
@@ -783,6 +906,16 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return self._send(400, {"error": "invalid JSON"})
 
+        if self.path == "/api/encoders/probe":
+            # Re-probe on demand: hardware changes under a container more often
+            # than the container restarts - a driver reload, a GPU freed by
+            # another process, the memory-fragmentation fix in the README.
+            global ENCODER, ENCODER_REASON, ENCODER_PROBES, GPU  # noqa: PLW0603
+            GPU = gpu_name()
+            ENCODER, ENCODER_REASON, ENCODER_PROBES = choose_encoder()
+            log.info("re-probed encoders: %s (%s)", ENCODER, ENCODER_REASON)
+            return self._send(200, {"gpu": GPU, "in_use": ENCODER, "why": ENCODER_REASON,
+                                    "encoders": ENCODER_PROBES})
         if self.path == "/api/tokens":
             raw, row = store.mint_token(db(), str(body.get("name", "")))
             log.info("api key minted: %s", row["name"])
@@ -856,23 +989,34 @@ class Handler(BaseHTTPRequestHandler):
             if cur.rowcount:
                 return self._send(200, {"cancelled": row["id"]})
             row = conn.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
-        if row["state"] == "running" and _current_job.get("id") == row["id"]:
-            _cancel.set()
+        if row["state"] == "running" and cancel_running(row["id"]):
             return self._send(202, {"cancelling": row["id"]})
         self._send(409, {"error": f"job is {row['state']}"})
 
 
+# The pool is sized to the maximum the setting allows, and each worker checks
+# the CURRENT limit before claiming - so raising or lowering "convert at once"
+# takes effect on the next job rather than needing a restart. Idle threads cost
+# a sleep loop and nothing else.
+WORKER_POOL = 8
+
+
 def main() -> None:
-    global ENCODER, ENCODER_REASON  # noqa: PLW0603
+    global ENCODER, ENCODER_REASON, ENCODER_PROBES, GPU  # noqa: PLW0603
     init_db()
     if not TOKEN and not store.list_tokens(db()):
         log.warning("No API key: set TRANSCODEARR_TOKEN to get in the first time, then mint keys in the UI")
-    ENCODER, ENCODER_REASON = probe_encoders()
+    GPU = gpu_name()
+    ENCODER, ENCODER_REASON, ENCODER_PROBES = choose_encoder()
     c = cfg()
+    log.info("gpu: %s", GPU or "none detected")
     log.info("encoder: %s (%s)", ENCODER, ENCODER_REASON)
-    log.info("media roots: %s | watch roots: %s | unhidden: %s",
-             MEDIA_ROOTS, c["watch_roots"] or MEDIA_ROOTS, c["process_unhidden"])
-    threading.Thread(target=worker_loop, daemon=True).start()
+    for p in ENCODER_PROBES:
+        log.info("  %-12s %-13s %s", p["name"], "available" if p["available"] else "unavailable", p["reason"])
+    log.info("media roots: %s | watch roots: %s | unhidden: %s | at once: %s",
+             MEDIA_ROOTS, c["watch_roots"] or MEDIA_ROOTS, c["process_unhidden"], c["max_concurrent"])
+    for _ in range(WORKER_POOL):
+        threading.Thread(target=worker_loop, daemon=True).start()
     threading.Thread(target=watch_loop, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 

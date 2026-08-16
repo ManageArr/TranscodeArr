@@ -229,7 +229,71 @@ DEFAULT_TEMPLATES: dict[str, str] = {
         "-c:v libx264 -preset medium -profile:v main -crf {quality} "
         "-c:a aac -b:a 192k -ac 2 -movflags +faststart"
     ),
+    # HEVC roughly halves the file at the same visual quality. The -tag:v hvc1
+    # is not optional: without it Apple devices and Safari refuse to play HEVC
+    # in MP4 at all, and the failure looks like a corrupt file rather than an
+    # unsupported one.
+    "hevc_nvenc": (
+        "-map 0:v:0 -map 0:a? {subs} "
+        "-c:v hevc_nvenc -preset p4 -tag:v hvc1 -rc vbr -cq {quality} -b:v 0 "
+        "-c:a aac -b:a 192k -ac 2 -movflags +faststart"
+    ),
+    "libx265": (
+        "-map 0:v:0 -map 0:a? {subs} "
+        "-c:v libx265 -preset medium -tag:v hvc1 -crf {quality} "
+        "-c:a aac -b:a 192k -ac 2 -movflags +faststart"
+    ),
 }
+
+# What each encoder is for, in the terms someone choosing between them actually
+# cares about: is it using the GPU, what quality number suits it, and what is
+# the catch. The quality scales are NOT interchangeable - CRF 21 on x264 and
+# CQ 21 on NVENC are different pictures and different file sizes, which is why
+# the recommendation travels with the encoder rather than being one global
+# default.
+ENCODER_INFO: dict[str, dict] = {
+    "h264_nvenc": {
+        "codec": "H.264", "hardware": True, "recommended": 23, "sane": [19, 28],
+        "summary": "Fast, on the GPU, and plays on everything.",
+        "detail": "The safe default. Bigger files than libx264 at the same quality, but minutes per "
+                  "film instead of hours, and every client made in the last fifteen years can direct play it.",
+    },
+    "hevc_nvenc": {
+        "codec": "HEVC", "hardware": True, "recommended": 26, "sane": [22, 32],
+        "summary": "About half the size, on the GPU, with a compatibility catch.",
+        "detail": "Roughly half the file of H.264 at similar quality and still GPU-fast. Older TVs, "
+                  "browsers and some streaming sticks cannot direct play HEVC and will make your server "
+                  "transcode on the fly instead - which costs more than the space it saves if it happens often.",
+    },
+    "libx264": {
+        "codec": "H.264", "hardware": False, "recommended": 21, "sane": [18, 26],
+        "summary": "Smallest H.264 files, but on the CPU.",
+        "detail": "Better quality per byte than NVENC, at perhaps a tenth of the speed. Reasonable for a "
+                  "handful of files, painful for a library.",
+    },
+    "libx265": {
+        "codec": "HEVC", "hardware": False, "recommended": 24, "sane": [20, 30],
+        "summary": "Smallest files of all, and by far the slowest.",
+        "detail": "The best compression here and the worst throughput - hours per film on a NAS CPU. "
+                  "Carries the same HEVC playback caveat as hevc_nvenc.",
+    },
+    "h264_qsv": {
+        "codec": "H.264", "hardware": True, "recommended": 23, "sane": [19, 28],
+        "summary": "Intel Quick Sync - the GPU built into an Intel CPU.",
+        "detail": "Comparable to NVENC in speed and quality. Needs the container to have /dev/dri passed "
+                  "through and an Intel chip with Quick Sync.",
+    },
+}
+
+# Probed in this order, and the first that works becomes the automatic choice.
+# H.264 on the GPU leads because it is the one that is both fast and plays
+# everywhere - the two things a library owner notices.
+ENCODER_ORDER = ["h264_nvenc", "h264_qsv", "hevc_nvenc", "libx264", "libx265"]
+
+
+def recommended_quality(encoder: str) -> int:
+    info = ENCODER_INFO.get(encoder)
+    return int(info["recommended"]) if info else 23
 
 
 def build_ffmpeg_args(

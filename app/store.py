@@ -79,8 +79,13 @@ SPECS: list[Spec] = [
     Spec("verify_duration_tolerance", "VERIFY_DURATION_TOLERANCE", "fraction", 0.015, "Duration tolerance",
          "How far the output length may drift from the source before the result is rejected, as a fraction: "
          "0.015 is 1.5%. Capped at 0.5 - a tolerance loose enough to accept half a film is not a tolerance.", "Rules"),
-    Spec("force_encoder", "FORCE_ENCODER", "text", "", "Force encoder",
-         "Leave empty to probe at boot (NVENC, then QSV, then libx264). Set to pin one.", "Rules"),
+    Spec("force_encoder", "FORCE_ENCODER", "text", "", "Encoder",
+         "Leave empty to pick the best one that actually works on this machine. Each encoder has its own "
+         "quality scale, so change the quality above to match when you pin one.", "Rules"),
+    Spec("max_concurrent", "MAX_CONCURRENT", "int", 1, "Convert at once",
+         "One at a time suits a NAS: a single set of spindles behind a single network link turns two encodes "
+         "into two slow ones. Raise it if your media sits on SSD or you have a card with no encode-session "
+         "limit, and watch whether the total throughput actually improves.", "Rules"),
     Spec("trash_keep_days", "TRASH_KEEP_DAYS", "int", 7, "Keep replaced sources (days)",
          "Replaced originals are moved to trash, never deleted outright. This is how long they survive. "
          "Raise it before a large batch - a source pruned mid-run is one you cannot get back.", "General"),
@@ -114,6 +119,10 @@ def parse_value(spec: Spec, raw: Any, roots: list[str] | None = None) -> Any:
             raise ValueError(f"{spec.label} must be a whole number")
         if n < 0:
             raise ValueError(f"{spec.label} cannot be negative")
+        if spec.key == "max_concurrent" and not 1 <= n <= 8:
+            # Above a handful the disk is the limit on any NAS, and an
+            # unbounded value here would spawn workers until the box gave up.
+            raise ValueError("Convert at once must be between 1 and 8")
         return n
     if spec.kind == "bool":
         if isinstance(raw, bool):

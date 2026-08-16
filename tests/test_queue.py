@@ -106,6 +106,75 @@ class Throughput(unittest.TestCase):
         self.assertEqual(view["eta_seconds"], 500)
 
 
+class Priority(unittest.TestCase):
+    """Files that need no conversion should not wait days behind ones that do."""
+
+    def setUp(self):
+        main.init_db()
+        conn = main.db()
+        conn.execute("DELETE FROM jobs")
+        conn.commit()
+
+    def test_a_reveal_jumps_ahead_of_older_transcodes(self):
+        QueueOrder.add(self, "old-transcode", 100, kind="transcode", priority=0)
+        QueueOrder.add(self, "older-transcode", 50, kind="transcode", priority=0)
+        QueueOrder.add(self, "new-reveal", 999, kind="reveal", priority=main.REVEAL_PRIORITY)
+        view = main._queue_view(10)
+        self.assertEqual(view["queued"][0]["id"], "new-reveal")
+
+    def test_equal_priority_still_runs_oldest_first(self):
+        QueueOrder.add(self, "second", 200)
+        QueueOrder.add(self, "first", 100)
+        self.assertEqual([j["id"] for j in main._queue_view(10)["queued"]], ["first", "second"])
+
+    def test_reveals_among_themselves_stay_in_order(self):
+        for i, name in enumerate(["r1", "r2", "r3"]):
+            QueueOrder.add(self, name, 100 + i, kind="reveal", priority=main.REVEAL_PRIORITY)
+        self.assertEqual([j["id"] for j in main._queue_view(10)["queued"]], ["r1", "r2", "r3"])
+
+    def test_the_view_agrees_with_what_the_worker_takes(self):
+        QueueOrder.add(self, "transcode", 1, kind="transcode", priority=0)
+        QueueOrder.add(self, "reveal", 2, kind="reveal", priority=main.REVEAL_PRIORITY)
+        pick = main.db().execute(
+            "SELECT * FROM jobs WHERE state='queued' ORDER BY priority, created LIMIT 1").fetchone()
+        self.assertEqual(main._queue_view(10)["queued"][0]["id"], pick["id"])
+
+    def test_the_estimate_ignores_reveals_it_will_not_spend_time_on(self):
+        QueueOrder.add(self, "done1", 0, state="done", kind="transcode", started=0.0, finished=100.0)
+        QueueOrder.add(self, "t1", 1, kind="transcode")
+        QueueOrder.add(self, "t2", 2, kind="transcode")
+        for i in range(20):
+            QueueOrder.add(self, f"rev{i}", 10 + i, kind="reveal", priority=main.REVEAL_PRIORITY)
+        view = main._queue_view(50)
+        self.assertEqual(view["queued_total"], 22)
+        self.assertEqual(view["eta_seconds"], 200)  # two transcodes, not twenty-two jobs
+
+
+class Concurrency(unittest.TestCase):
+    def test_the_limit_is_bounded_to_something_a_disk_can_survive(self):
+        spec = main.store.SPEC_BY_KEY["max_concurrent"]
+        self.assertEqual(main.store.parse_value(spec, "3"), 3)
+        for bad in ("0", "9", "-1"):
+            with self.assertRaises(ValueError):
+                main.store.parse_value(spec, bad)
+
+    def test_cancelling_a_job_that_is_not_running_says_so(self):
+        self.assertFalse(main.cancel_running("nope"))
+
+    def test_cancel_targets_one_job_not_whichever_happens_to_be_running(self):
+        # With a single global flag, cancelling job A stopped whatever was
+        # running - which with more than one worker is usually job B.
+        with main._jobs_lock:
+            main._running.clear()
+            main._running["a"] = {"cancel": False, "proc": None}
+            main._running["b"] = {"cancel": False, "proc": None}
+        self.assertTrue(main.cancel_running("a"))
+        self.assertTrue(main._cancelled("a"))
+        self.assertFalse(main._cancelled("b"))
+        with main._jobs_lock:
+            main._running.clear()
+
+
 class Trash(unittest.TestCase):
     """The promise the whole project rests on: a replaced source outlives its
     replacement. It did not - and no test covered trash() at all."""

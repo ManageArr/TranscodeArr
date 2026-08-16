@@ -79,6 +79,7 @@ PAGE = r"""<!doctype html><meta charset="utf-8"><title>TranscodeArr</title>
  <button data-tab="queue" class="on">Queue</button>
  <button data-tab="jobs">History</button>
  <button data-tab="locations">Locations</button>
+ <button data-tab="hardware">Encoding</button>
  <button data-tab="rules">Rules</button>
  <button data-tab="connections">Connections</button>
  <button data-tab="keys">API Keys</button>
@@ -119,6 +120,19 @@ PAGE = r"""<!doctype html><meta charset="utf-8"><title>TranscodeArr</title>
  </div>
  <div class="card"><h2>Scanning</h2><div id="locform"></div>
   <button class="act" onclick="saveSettings('locform','locmsg')">Save</button></div>
+</section>
+
+<section id="hardware">
+ <div class="msg" id="hwmsg"></div>
+ <div class="card">
+  <h2>This machine</h2>
+  <p class="hint">Every encoder below was tried with a real one-second encode. ffmpeg lists encoders it was
+   merely built with, so being listed proves nothing - a card that cannot do AV1 still advertises it, and
+   NVENC advertises itself with no driver loaded at all.</p>
+  <div id="hwsummary"></div>
+  <div class="row" style="margin-top:.7rem"><button class="ghost" onclick="probeHW()">Re-test now</button></div>
+ </div>
+ <div class="card"><h2>Encoders</h2><table id="hwtable"></table></div>
 </section>
 
 <section id="rules">
@@ -188,6 +202,7 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
  // Refresh on arrival rather than showing whatever the last poll left behind.
  if(b.dataset.tab==='queue') refreshQueue().catch(()=>{});
  if(b.dataset.tab==='jobs') refreshJobs().catch(()=>{});
+ if(b.dataset.tab==='hardware') loadHW().catch(()=>{});
 });
 
 // ---- the queue: what is running, and what is next in running order -------
@@ -234,9 +249,12 @@ async function refreshQueue(){
     `<td><button class="ghost" data-cancel="${esc(x.id)}">Cancel</button></td></tr>`).join('')
    :'<tr><td colspan="5">Queue is empty.</td></tr>');
 
- const shown=rows.length,total=q.queued_total||0;
- let hint=total?`${total} waiting${shown<total?` (showing the next ${shown})`:''} - one at a time, oldest first.`
+ const shown=rows.length,total=q.queued_total||0,at=q.max_concurrent||1;
+ const reveals=rows.filter(x=>x.kind==='reveal').length;
+ let hint=total?`${total} waiting${shown<total?` (showing the next ${shown})`:''} - `+
+   `${at>1?at+' at a time':'one at a time'}, files needing no conversion first, then oldest first.`
               :'Nothing waiting.';
+ if(reveals) hint+=` ${reveals} of these need no conversion and will be revealed straight away.`;
  if(q.seconds_per_job&&total)
   hint+=` About ${dur(q.seconds_per_job)} each lately, so roughly ${dur(q.eta_seconds)} to clear.`;
  $('queuehint').textContent=hint;
@@ -255,6 +273,7 @@ document.addEventListener('click',e=>{
  if(d.revoke){const t=KEYS.find(x=>x.id===d.revoke); if(t) revokeKey(t.id,t.name);}
  if(d.browse!==undefined) browse(d.browse);
  if(d.addwatch) addBrowsed();
+ if(d.useenc) useEncoder(d.useenc);
  if(d.dropwatch!==undefined) dropWatch(Number(d.dropwatch));
 });
 
@@ -342,6 +361,59 @@ async function browse(path){
  }catch(e){say('locmsg',e.message,true);}
 }
 function addBrowsed(){putWatch([...new Set([...(SET.watch_roots||[]),CURRENT])]);}
+
+// ---- hardware and encoders -----------------------------------------------
+let HW=null;
+async function loadHW(){
+ HW=await api('/api/encoders');
+ const cur=(HW.encoders||[]).find(e=>e.name===HW.in_use)||{};
+ const mismatch=HW.recommended_for_current&&HW.quality!==HW.recommended_for_current;
+ $('hwsummary').innerHTML=
+  `<div class="facts" style="margin:0 0 .5rem">
+    <span>GPU <b>${esc(HW.gpu||'none detected')}</b></span>
+    <span>using <b>${esc(HW.in_use)}</b>${cur.hardware?' <span class="tag">hardware</span>':' <span class="tag">software</span>'}</span>
+    <span>quality <b>${HW.quality}</b></span></div>
+   <p class="hint" style="margin:0">${esc(HW.why||'')}</p>`+
+  (mismatch?`<p class="hint" style="color:var(--warn);margin:.5rem 0 0">Quality is ${HW.quality};
+     ${esc(HW.in_use)} is usually run at ${HW.recommended_for_current}. Each encoder has its own scale -
+     the same number is a different picture and a different file size on each.
+     <button class="ghost" onclick="useRecommended()">Use ${HW.recommended_for_current}</button></p>`:'');
+
+ $('hwtable').innerHTML='<tr><th>Encoder</th><th>Codec</th><th>Works here</th><th>Suggested quality</th><th>What it is for</th></tr>'+
+  (HW.encoders||[]).map(e=>{
+   const state=e.available
+     ? '<span class="done">yes</span>'+(e.name===HW.in_use?' <span class="tag stored">in use</span>':'')
+     : `<span class="failed">no</span>`;
+   const pick=e.available&&e.name!==HW.in_use
+     ? `<button class="ghost" data-useenc="${esc(e.name)}">Use this</button>` : '';
+   return `<tr><td>${esc(e.name)}${e.hardware?' <span class="tag">GPU</span>':''}</td>
+    <td>${esc(e.codec||'')}</td><td>${state}</td>
+    <td>${e.recommended_quality??''}${e.sane_range?` <small style="color:var(--dim)">(${e.sane_range[0]}-${e.sane_range[1]})</small>`:''}</td>
+    <td>${esc(e.summary||'')}<br><small style="color:var(--dim)">${esc(e.available?e.detail:e.reason)}</small>
+     <div style="margin-top:.3rem">${pick}</div></td></tr>`;
+  }).join('');
+}
+async function probeHW(){
+ say('hwmsg','Re-testing every encoder with a real encode...');
+ try{await api('/api/encoders/probe',{method:'POST'});await loadHW();say('hwmsg','Done.');}
+ catch(e){say('hwmsg',e.message,true);}
+}
+async function useRecommended(){
+ try{await api('/api/settings',{method:'PUT',body:JSON.stringify({quality:HW.recommended_for_current})});
+  await loadSettings();await loadHW();say('hwmsg','Quality updated.');}catch(e){say('hwmsg',e.message,true);}
+}
+async function useEncoder(name){
+ const e=(HW.encoders||[]).find(x=>x.name===name)||{};
+ if(!confirm(`Use ${name}?\n\nIts quality scale differs, so the quality will also be set to `+
+   `${e.recommended_quality}. Files already converted are not affected.`)) return;
+ try{
+  await api('/api/settings',{method:'PUT',
+    body:JSON.stringify({force_encoder:name,quality:e.recommended_quality})});
+  await api('/api/encoders/probe',{method:'POST'});
+  await loadSettings();await loadHW();
+  say('hwmsg',`Now using ${name}. In-flight jobs finish on the old one.`);
+ }catch(err){say('hwmsg',err.message,true);}
+}
 
 // ---- arr connections -----------------------------------------------------
 function arrFormHtml(a){
@@ -435,7 +507,7 @@ async function tick(){
 }
 (async function(){
  resetArrForm();
- try{await refreshHealth();await loadSettings();await loadArrs();await loadKeys();
+ try{await refreshHealth();await loadSettings();await loadArrs();await loadKeys();await loadHW();
   await refreshQueue();await refreshJobs();
   browse((SET.watch_roots||[])[0]||'');
   timer=setInterval(tick,4000);
