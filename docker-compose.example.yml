@@ -14,10 +14,14 @@ services:
     environment:
       # compute is required: ffmpeg's NVENC initializes through CUDA.
       NVIDIA_DRIVER_CAPABILITIES: "compute,video,utility"
+      # The bootstrap key - your first way in. Mint per-consumer keys in the UI
+      # afterwards; this one keeps working and cannot be revoked from there.
       TRANSCODEARR_TOKEN: "change-me"
+      # The volume mounts themselves, so this one genuinely belongs in env.
       MEDIA_ROOTS: "/media"
-      # Start narrow. Widen to /media/Movies:/media/TV:/media/Movies-Anime:/media/TV-Anime
-      # once the canary run has been watched end to end.
+      # Everything below only SEEDS a first boot. Once a value is saved in the
+      # UI it is stored in the database and this is ignored - otherwise a
+      # recreate with a stale file would silently undo what you changed.
       WATCH_ROOTS: "/media/Temp/transcodearr-canary"
       QUALITY: "24"
       TRASH_KEEP_DAYS: "7"

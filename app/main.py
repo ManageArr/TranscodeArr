@@ -18,43 +18,48 @@ import sqlite3
 import subprocess
 import threading
 import time
+import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import arrs as arr_client
 import core
+import store
+import web
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("transcodearr")
 
 # ---------------------------------------------------------------------------
-# Configuration - env only, no config file to drift
+# Configuration - the container's shape in env, everything else in the database
 # ---------------------------------------------------------------------------
 
+# MEDIA_ROOTS names the volume mounts themselves, so it stays an env var: it
+# describes the container's shape, not its configuration, and a runtime change
+# would only point the worker at paths it cannot see. Everything else is
+# editable in the UI and lives in the database - see store.py for why a stored
+# value outranks the environment.
 MEDIA_ROOTS = [p for p in os.environ.get("MEDIA_ROOTS", "/media").split(":") if p]
-WATCH_ROOTS = [p for p in os.environ.get("WATCH_ROOTS", "").split(":") if p] or MEDIA_ROOTS
-SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
-STABLE_SECONDS = int(os.environ.get("STABLE_SECONDS", "120"))
-CONVERT_EXTENSIONS = {
-    e if e.startswith(".") else f".{e}"
-    for e in os.environ.get("CONVERT_EXTENSIONS", ".mkv,.avi,.m4v,.m2ts,.mts,.vob").lower().split(",")
-    if e
-}
-# Only dot-hidden files are touched unless this is switched on. Sweeping the
-# whole visible library into a re-encode is a decision, not a default.
-PROCESS_UNHIDDEN = os.environ.get("PROCESS_UNHIDDEN", "false").lower() == "true"
-QUALITY = int(os.environ.get("QUALITY", "24"))
 TOKEN = os.environ.get("TRANSCODEARR_TOKEN", "")
 PORT = int(os.environ.get("PORT", "8484"))
 CONFIG_DIR = os.environ.get("CONFIG_DIR", "/config")
 DB_PATH = os.path.join(CONFIG_DIR, "transcodearr.db")
 TRASH_DIR = os.environ.get("TRASH_DIR", os.path.join(CONFIG_DIR, "trash"))
-TRASH_KEEP_DAYS = int(os.environ.get("TRASH_KEEP_DAYS", "7"))
-DURATION_TOLERANCE = float(os.environ.get("VERIFY_DURATION_TOLERANCE", "0.015"))
-FORCE_ENCODER = os.environ.get("FORCE_ENCODER", "")
+
+
+def cfg() -> dict:
+    """Current settings, read fresh.
+
+    Deliberately not cached in a module global: a value changed in the UI has to
+    take effect on the next scan and the next job without a restart, and the
+    read is one indexed query against a local SQLite file - cheaper than the
+    class of bug where a saved setting quietly does nothing until reboot.
+    """
+    return store.effective(store.read_settings(db()), dict(os.environ))
 
 # Bump this with the image tag. /healthz reporting a version that is not the
 # running build makes the one field whose job is "what is deployed" a liar.
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -104,7 +109,16 @@ def init_db() -> None:
           at REAL NOT NULL
         );
         """
+        + store.SCHEMA
     )
+    # Columns added after the first release. CREATE TABLE IF NOT EXISTS does
+    # nothing to a table that already exists, so a live database - the only kind
+    # that matters here - would never gain them without this.
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    for column, decl in (("rescan", "TEXT"),):
+        if column not in have:
+            conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {decl}")
+
     # Boot rule: anything left running died with the previous process. Its
     # .part is deleted; the SOURCE was never touched, so nothing is lost and
     # the watcher will simply find the file again.
@@ -170,7 +184,8 @@ def probe_encoders() -> tuple[str, str]:
     an actual encode proves the path works, and the reason is kept so /healthz
     can say WHY the box is on CPU when it is.
     """
-    order = [FORCE_ENCODER] if FORCE_ENCODER else ["h264_nvenc", "h264_qsv", "libx264"]
+    forced = cfg()["force_encoder"]
+    order = [forced] if forced else ["h264_nvenc", "h264_qsv", "libx264"]
     reasons = []
     for enc in order:
         if enc not in core.DEFAULT_TEMPLATES:
@@ -213,7 +228,7 @@ def run_encode(job_id: str, source: str, names: core.JobNames, src_probe: core.P
         attempts = [(False, "")]
 
     for with_subs, warning in attempts:
-        args = core.build_ffmpeg_args(template, source, names.part, QUALITY, with_subs)
+        args = core.build_ffmpeg_args(template, source, names.part, cfg()["quality"], with_subs)
         conn.execute("UPDATE jobs SET log_tail=? WHERE id=?", (" ".join(args), job_id))
         conn.commit()
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -272,7 +287,7 @@ def trash(source: str) -> str:
 
 
 def prune_trash() -> None:
-    cutoff = time.time() - TRASH_KEEP_DAYS * 86400
+    cutoff = time.time() - cfg()["trash_keep_days"] * 86400
     for dirpath, _dirs, files in os.walk(TRASH_DIR, topdown=False):
         for f in files:
             p = os.path.join(dirpath, f)
@@ -286,6 +301,30 @@ def prune_trash() -> None:
                 os.rmdir(dirpath)
         except OSError:
             pass
+
+
+def notify_arrs(visible_path: str) -> str | None:
+    """Tell whichever arr owns this file to re-read it.
+
+    Jellyfin does not detect a same-name in-place replacement, and neither does
+    an arr until it is asked - so without this the stack keeps serving the old
+    file's codec, bitrate and runtime for a file that no longer exists in that
+    form. Never fatal: the media is already correct on disk, and a conversion
+    is not going to be undone because an arr was unreachable.
+    """
+    conn = db()
+    notes = []
+    for row in store.list_arrs(conn, redact=False):
+        if not row["enabled"]:
+            continue
+        try:
+            handled, message = arr_client.ArrClient(row).rescan_for(visible_path)
+        except Exception as e:  # noqa: BLE001 - an arr must never take a job down
+            handled, message = True, f"{row['name']}: {e}"
+        if handled:
+            notes.append(message)
+            store.note_arr_error(conn, row["id"], None if "rescanning" in message else message)
+    return "; ".join(notes) if notes else None
 
 
 def process(job: dict) -> None:
@@ -306,7 +345,11 @@ def process(job: dict) -> None:
     try:
         if not os.path.exists(source):
             return finish("failed", error="source vanished before processing")
-        names = core.plan_names(source)
+        # A revealed file keeps its own container. Planning with a hard-coded
+        # .mp4 would rename a skipped .mkv to .mp4 without converting it -
+        # a file whose extension lies about its contents.
+        source_ext = os.path.splitext(source)[1].lower()
+        names = core.plan_names(source, source_ext if job["kind"] == "reveal" else ".mp4")
         if os.path.exists(names.visible) and names.visible != source:
             return finish("failed", error=f"target already exists: {names.visible} - not overwriting")
 
@@ -315,10 +358,12 @@ def process(job: dict) -> None:
             return finish("failed", error="source is not a readable video (ffprobe found no video stream)")
         src_bytes = os.path.getsize(source)
 
-        # Already the right container: verify it is whole, then just reveal.
-        if job["kind"] == "reveal" or core.should_skip_transcode(src_probe, os.path.splitext(source)[1]):
+        # Already the right container, or deliberately protected by a skip rule:
+        # verify it is whole, then just reveal it.
+        if job["kind"] == "reveal" or core.should_skip_transcode(src_probe, source_ext):
             if names.hidden:
                 os.replace(source, names.visible)
+                notify_arrs(names.visible)
                 return finish("done", output=names.visible, src_bytes=src_bytes, out_bytes=src_bytes, progress=100)
             return finish("done", output=source, warning="nothing to do", progress=100)
 
@@ -332,7 +377,11 @@ def process(job: dict) -> None:
 
         # The check whose absence truncated a library: never trust exit 0.
         out_probe = ffprobe(names.part)
-        verified, why = core.verify_output(src_probe, out_probe or core.Probe(None, 0, 0, 0), DURATION_TOLERANCE)
+        try:
+            tolerance = float(cfg()["verify_duration_tolerance"])
+        except ValueError:
+            tolerance = 0.015  # an unparseable tolerance must not mean "accept anything"
+        verified, why = core.verify_output(src_probe, out_probe or core.Probe(None, 0, 0, 0), tolerance)
         if not verified:
             try:
                 os.unlink(names.part)
@@ -354,10 +403,12 @@ def process(job: dict) -> None:
         os.replace(names.part, names.hidden_final)      # hidden, complete, atomic
         trashed = trash(source)                          # source survives, in trash
         os.replace(names.hidden_final, names.visible)    # the reveal
+        rescan = notify_arrs(names.visible)
         finish(
             "done",
             output=names.visible,
             warning=warning or None,
+            rescan=rescan,
             src_bytes=src_bytes,
             out_bytes=out_bytes,
             progress=100,
@@ -391,7 +442,11 @@ def worker_loop() -> None:
 def scan_once() -> None:
     conn = db()
     now = time.time()
-    for root in WATCH_ROOTS:
+    c = cfg()
+    watch_roots = c["watch_roots"] or MEDIA_ROOTS
+    convert_extensions = set(c["convert_extensions"])
+    process_unhidden, skip_patterns = c["process_unhidden"], c["skip_patterns"]
+    for root in watch_roots:
         if not os.path.isdir(root):
             continue
         for dirpath, dirs, files in os.walk(root):
@@ -401,9 +456,9 @@ def scan_once() -> None:
                     continue
                 hidden = name.startswith(".")
                 ext = os.path.splitext(name)[1].lower()
-                if not hidden and not PROCESS_UNHIDDEN:
+                if not hidden and not process_unhidden:
                     continue
-                wanted = ext in CONVERT_EXTENSIONS or (hidden and ext == ".mp4")
+                wanted = ext in convert_extensions or (hidden and ext == ".mp4")
                 if not wanted:
                     continue
                 path = os.path.join(dirpath, name)
@@ -414,10 +469,14 @@ def scan_once() -> None:
                 prev = conn.execute("SELECT size, at FROM seen WHERE path=?", (path,)).fetchone()
                 conn.execute("INSERT OR REPLACE INTO seen (path, size, at) VALUES (?,?,?)",
                              (path, size, prev["at"] if prev and prev["size"] == size else now))
-                if prev and core.is_stable(prev["size"], size, now - prev["at"], STABLE_SECONDS):
+                if prev and core.is_stable(prev["size"], size, now - prev["at"], c["stable_seconds"]):
                     ok, resolved = core.validate_path(path, MEDIA_ROOTS)
                     if ok:
-                        kind = "reveal" if hidden and ext == ".mp4" else "transcode"
+                        # A skip rule does not mean "ignore" - the file is still
+                        # stuck behind a dot. It gets revealed in its own
+                        # container instead of re-encoded.
+                        protected = core.matches_skip(name, skip_patterns)
+                        kind = "reveal" if (hidden and ext == ".mp4") or protected else "transcode"
                         enqueue(resolved, kind)
     conn.execute("DELETE FROM seen WHERE at < ?", (now - 7 * 86400,))
     conn.commit()
@@ -430,48 +489,42 @@ def watch_loop() -> None:
             prune_trash()
         except Exception:  # noqa: BLE001
             log.exception("scan failed")
-        time.sleep(SCAN_INTERVAL)
+        time.sleep(max(15, cfg()["scan_interval_seconds"]))
 
 
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
 
-PAGE = """<!doctype html><meta charset="utf-8"><title>TranscodeArr</title>
-<style>
- body{font-family:system-ui;background:#0b1220;color:#cbd5e1;margin:2rem auto;max-width:60rem;padding:0 1rem}
- h1{color:#22d3ee;font-size:1.3rem} table{width:100%;border-collapse:collapse;font-size:.85rem}
- td,th{border-bottom:1px solid #1e293b;padding:.4rem .5rem;text-align:left} .done{color:#34d399}
- .failed{color:#f87171} .running{color:#22d3ee} .queued{color:#94a3b8} code{color:#94a3b8;font-size:.75rem}
-</style>
-<h1>TranscodeArr</h1><p id="h"></p><table id="t"></table>
-<script>
-// The token is the TRANSCODEARR_TOKEN set on the container - this page cannot
-// issue one, it can only ask for it. Kept in localStorage so it is typed once.
-const token=()=>localStorage.token||(localStorage.token=prompt('API token')||'');
-let timer;
-function stop(msg){
- // A mistyped token used to sit in localStorage forever while the table stayed
- // empty and nothing on screen said why. Forget it, say so, and stop asking.
- delete localStorage.token;
- clearInterval(timer);
- document.getElementById('t').innerHTML=`<tr><td>${msg}</td></tr>`;
-}
-async function go(){
- // /healthz needs no token, so the header renders even before you are let in.
- const z=await (await fetch('/healthz')).json();
- document.getElementById('h').innerHTML=
-  `encoder <b>${z.encoder}</b> - queue ${z.queued} - running ${z.running} - v${z.version}`+
-  (z.encoder==='libx264'?` <code>(${z.encoder_reason})</code>`:'');
- const r=await fetch('/jobs?limit=40',{headers:{Authorization:'Bearer '+token()}});
- if(r.status===401) return stop('Wrong API token - reload the page to enter it again.');
- const j=await r.json();
- document.getElementById('t').innerHTML='<tr><th>state</th><th>file</th><th>%</th><th>result</th></tr>'+
-  j.jobs.map(x=>`<tr><td class="${x.state}">${x.state}</td><td>${x.path.split('/').pop()}</td>`+
-   `<td>${x.progress??''}</td><td><code>${x.error||x.warning||x.output||''}</code></td></tr>`).join('');
-}
-go();timer=setInterval(go,3000);
-</script>"""
+def _query(path: str) -> dict[str, str]:
+    return {k: v[0] for k, v in urllib.parse.parse_qs(urllib.parse.urlparse(path).query).items()}
+
+
+def _browse(raw: str) -> tuple[int, dict]:
+    """Directories the folder picker may show.
+
+    Containment is checked on the RESOLVED path, not the requested one, so a
+    symlink or a ../ cannot walk the picker out of the mounts and turn a
+    convenience into a way to read the host filesystem over the network.
+    """
+    if not raw or raw == "/":
+        return 200, {"path": "/", "entries": [{"name": p, "path": p} for p in MEDIA_ROOTS]}
+    resolved = os.path.realpath(raw)
+    if not core.is_within(resolved, MEDIA_ROOTS):
+        return 400, {"error": "that path is outside the media roots"}
+    if not os.path.isdir(resolved):
+        return 404, {"error": "not a directory"}
+    try:
+        entries = sorted(
+            ({"name": e.name, "path": os.path.join(resolved, e.name)}
+             for e in os.scandir(resolved) if e.is_dir() and not e.name.startswith(".")),
+            key=lambda e: e["name"].lower(),
+        )
+    except OSError as e:
+        return 400, {"error": str(e)}
+    # A library root with thousands of series would otherwise ship the whole
+    # list to the browser on every click.
+    return 200, {"path": resolved, "entries": entries[:1000]}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -486,28 +539,48 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _authed(self) -> bool:
-        if not TOKEN:
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
             return False
-        return self.headers.get("Authorization", "") == f"Bearer {TOKEN}"
+        return store.verify_token(db(), header[len("Bearer "):].strip(), TOKEN)
 
     def log_message(self, *_args) -> None:  # quiet access log
         pass
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/" or self.path.startswith("/index"):
-            return self._send(200, PAGE, "text/html; charset=utf-8")
+            return self._send(200, web.PAGE, "text/html; charset=utf-8")
         if self.path == "/healthz":
             conn = db()
             counts = dict(conn.execute("SELECT state, COUNT(*) FROM jobs GROUP BY state").fetchall())
+            c = cfg()
             return self._send(200, {
                 "ok": True, "version": VERSION, "encoder": ENCODER, "encoder_reason": ENCODER_REASON,
                 "queued": counts.get("queued", 0), "running": counts.get("running", 0),
-                "media_roots": MEDIA_ROOTS, "watch_roots": WATCH_ROOTS,
-                "process_unhidden": PROCESS_UNHIDDEN, "uptime_seconds": int(time.time() - STARTED),
-                "auth_configured": bool(TOKEN),
+                "media_roots": MEDIA_ROOTS, "watch_roots": c["watch_roots"] or MEDIA_ROOTS,
+                "process_unhidden": c["process_unhidden"], "uptime_seconds": int(time.time() - STARTED),
+                "auth_configured": bool(TOKEN) or bool(store.list_tokens(conn)),
             })
         if not self._authed():
             return self._send(401, {"error": "missing or wrong bearer token"})
+        if self.path == "/api/settings":
+            rows, env = store.read_settings(db()), dict(os.environ)
+            return self._send(200, {
+                "specs": [
+                    {"key": s.key, "kind": s.kind, "label": s.label, "help": s.help, "group": s.group, "env": s.env}
+                    for s in store.SPECS
+                ],
+                "values": store.effective(rows, env),
+                "sources": store.sources(rows, env),
+                "media_roots": MEDIA_ROOTS,
+            })
+        if self.path == "/api/tokens":
+            return self._send(200, {"tokens": store.list_tokens(db())})
+        if self.path == "/api/arrs":
+            return self._send(200, {"arrs": store.list_arrs(db())})
+        if self.path.startswith("/api/fs"):
+            q = _query(self.path)
+            return self._send(*_browse(q.get("path", "")))
         m = re.fullmatch(r"/jobs/([0-9a-f-]{36})", self.path)
         if m:
             row = db().execute("SELECT * FROM jobs WHERE id=?", (m.group(1),)).fetchone()
@@ -523,20 +596,73 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"jobs": [job_dict(r) for r in rows]})
         self._send(404, {"error": "not found"})
 
+    def _body(self) -> dict:
+        raw = self.rfile.read(int(self.headers.get("Content-Length", "0") or 0)) or b"{}"
+        return json.loads(raw)
+
+    def do_PUT(self) -> None:  # noqa: N802
+        if not self._authed():
+            return self._send(401, {"error": "missing or wrong bearer token"})
+        try:
+            body = self._body()
+        except json.JSONDecodeError:
+            return self._send(400, {"error": "invalid JSON"})
+        if self.path == "/api/settings":
+            try:
+                written = store.save_settings(db(), body)
+            except ValueError as e:
+                return self._send(400, {"error": str(e)})
+            log.info("settings changed: %s", ", ".join(written))
+            return self._send(200, {"saved": written})
+        m = re.fullmatch(r"/api/arrs/([0-9a-f-]{36})", self.path)
+        if m:
+            try:
+                row = store.save_arr(db(), body, m.group(1))
+            except ValueError as e:
+                return self._send(400, {"error": str(e)})
+            return self._send(200, {"arr": {**row, "api_key": "********"}})
+        self._send(404, {"error": "not found"})
+
     def do_POST(self) -> None:  # noqa: N802
         if not self._authed():
             return self._send(401, {"error": "missing or wrong bearer token"})
-        if self.path != "/jobs":
-            return self._send(404, {"error": "not found"})
         try:
-            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+            body = self._body()
         except json.JSONDecodeError:
             return self._send(400, {"error": "invalid JSON"})
+
+        if self.path == "/api/tokens":
+            raw, row = store.mint_token(db(), str(body.get("name", "")))
+            log.info("api key minted: %s", row["name"])
+            # The only time the raw key exists outside the caller's hands.
+            return self._send(201, {"token": raw, **row})
+        if self.path == "/api/arrs":
+            try:
+                row = store.save_arr(db(), body)
+            except ValueError as e:
+                return self._send(400, {"error": str(e)})
+            return self._send(201, {"arr": {**row, "api_key": "********"}})
+        if self.path == "/api/arrs/test":
+            # An edit form never receives the stored key, so a test with a blank
+            # key means "test the one you already have".
+            key = str(body.get("api_key", "")).strip()
+            if not key and body.get("id"):
+                existing = store.get_arr(db(), str(body["id"]))
+                key = existing["api_key"] if existing else ""
+            base = str(body.get("base_url", "")).strip().rstrip("/")
+            if not base or not key:
+                return self._send(400, {"error": "base_url and api_key are required to test"})
+            ok, detail = arr_client.test(base, key)
+            return self._send(200, {"ok": ok, "detail": detail})
+
+        if self.path != "/jobs":
+            return self._send(404, {"error": "not found"})
         ok, resolved = core.validate_path(str(body.get("path", "")), MEDIA_ROOTS)
         if not ok:
             return self._send(400, {"error": resolved})
         names = core.plan_names(resolved)
-        job = enqueue(resolved, "reveal" if names.reveal_only else "transcode")
+        protected = core.matches_skip(os.path.basename(resolved), cfg()["skip_patterns"])
+        job = enqueue(resolved, "reveal" if names.reveal_only or protected else "transcode")
         if job is None:
             return self._send(409, {"error": "already queued or running for this path"})
         self._send(201, job)
@@ -544,6 +670,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:  # noqa: N802
         if not self._authed():
             return self._send(401, {"error": "missing or wrong bearer token"})
+        m = re.fullmatch(r"/api/tokens/([0-9a-f-]{36})", self.path)
+        if m:
+            return self._send(*((200, {"revoked": m.group(1)}) if store.revoke_token(db(), m.group(1))
+                                else (404, {"error": "no such key"})))
+        m = re.fullmatch(r"/api/arrs/([0-9a-f-]{36})", self.path)
+        if m:
+            return self._send(*((200, {"deleted": m.group(1)}) if store.delete_arr(db(), m.group(1))
+                                else (404, {"error": "no such connection"})))
         m = re.fullmatch(r"/jobs/([0-9a-f-]{36})", self.path)
         if not m:
             return self._send(404, {"error": "not found"})
@@ -564,11 +698,13 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     global ENCODER, ENCODER_REASON  # noqa: PLW0603
     init_db()
-    if not TOKEN:
-        log.warning("TRANSCODEARR_TOKEN is not set - the API is disabled; only the watcher runs")
+    if not TOKEN and not store.list_tokens(db()):
+        log.warning("No API key: set TRANSCODEARR_TOKEN to get in the first time, then mint keys in the UI")
     ENCODER, ENCODER_REASON = probe_encoders()
+    c = cfg()
     log.info("encoder: %s (%s)", ENCODER, ENCODER_REASON)
-    log.info("media roots: %s | watch roots: %s | unhidden: %s", MEDIA_ROOTS, WATCH_ROOTS, PROCESS_UNHIDDEN)
+    log.info("media roots: %s | watch roots: %s | unhidden: %s",
+             MEDIA_ROOTS, c["watch_roots"] or MEDIA_ROOTS, c["process_unhidden"])
     threading.Thread(target=worker_loop, daemon=True).start()
     threading.Thread(target=watch_loop, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

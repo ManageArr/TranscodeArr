@@ -1,0 +1,21 @@
+# The rules that keep media safe are pure functions with tests. This runs them.
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Tests
+        run: python -m unittest discover tests -v
+      - name: Every module imports cleanly
+        # A syntax error in a module the tests do not import would otherwise
+        # only surface when the container starts on the NAS.
+        run: python -c "import sys; sys.path.insert(0,'app'); import core, store, arrs, web, main"

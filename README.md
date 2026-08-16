@@ -47,34 +47,77 @@ encoder is not a working one - falling back NVENC -> QSV -> libx264, and
 `/healthz` reports which one won and why. On QNAP Container Station the NVIDIA
 runtime is registered as `nvidia-runtime`.
 
+## The web interface
+
+`GET /` is the whole application: jobs with live progress, watched folders with
+a folder picker that only shows what the container can actually see, conversion
+rules, Radarr/Sonarr connections, and API keys. No build step and no CDN - a NAS
+container that needs npm to draw its own settings screen is one that stops
+drawing it the day a registry goes down.
+
+Sign in with any API key. The first one is `TRANSCODEARR_TOKEN` from the
+container environment; after that, mint named keys in the UI and give each
+consumer its own revocable one.
+
+## Configuration
+
+Settings are edited in the UI and stored in the database. **A stored value wins
+over the environment from then on** - the env var is only the seed for a key
+nobody has set yet. The other way round means every `docker run` with a stale
+env silently reverts what someone changed in the UI, and they find out when the
+library has been re-encoded at the wrong quality. Each field shows whether it is
+saved here, coming from the container, or still the built-in default.
+
+Two things stay environment-only, on purpose:
+
+| Var | Default | Why it cannot move |
+| --- | --- | --- |
+| `MEDIA_ROOTS` | `/media` | Names the volume mounts themselves. Editing it at runtime would point the worker at paths the container cannot see. Nothing outside these roots is ever touched, browsed or queued. |
+| `TRANSCODEARR_TOKEN` | - | The bootstrap key. Without it, and with no minted keys, there is no way into a fresh container. |
+
+Everything else - watched folders, scan interval, stability window, extensions,
+skip rules, quality, duration tolerance, forced encoder, trash retention - is in
+the UI, and its env var (`WATCH_ROOTS`, `QUALITY`, `TRASH_KEEP_DAYS`, ...) still
+works to seed a first boot.
+
+### Skip rules
+
+A file whose name matches a skip rule is **revealed in its own container rather
+than re-encoded**. Arr naming puts the quality in the file name, so `Remux` is
+usually the only rule worth writing: it keeps disc-quality copies whole while
+still un-hiding them for the media server, which plays MKV perfectly well.
+
+## Radarr / Sonarr
+
+Optional, and only ever two calls: read the library list, and ask one title to
+rescan. Nothing writes to the arr's database.
+
+It matters because TranscodeArr replaces files in place, and neither Jellyfin
+nor an arr notices a same-name in-place replacement on its own
+(jellyfin#13565, closed "not planned") - so without it the whole stack keeps
+publishing the old file's codec, bitrate and runtime for a file that no longer
+exists in that form, and makes direct-play decisions off it.
+
+Each connection carries a path mapping, because the arr and this container mount
+the same directory in different places (Sonarr's `/tv` is this container's
+`/media/TV`). A file outside a connection's root is simply not that connection's
+business, which is how two arrs coexist without guessing.
+
 ## API
 
-Bearer token (`TRANSCODEARR_TOKEN`) on everything except `GET /healthz`.
+Bearer token on everything except `GET /healthz` and the page itself.
 
 | Route | What |
 | --- | --- |
 | `POST /jobs` `{path}` | Queue a file. Path must resolve inside `MEDIA_ROOTS`. 409 if already queued. |
-| `GET /jobs?state=&limit=` | Recent jobs. |
-| `GET /jobs/{id}` | One job: state, progress, encoder, warning/error, sizes. |
+| `GET /jobs?state=&limit=` | Recent jobs (capped at 200). |
+| `GET /jobs/{id}` | One job: state, progress, encoder, warning/error, sizes, rescan result. |
 | `DELETE /jobs/{id}` | Cancel (queued: immediately; running: terminates the encode, source untouched). |
 | `GET /healthz` | Encoder in use and why, queue depth, roots, version. Unauthenticated. |
-
-`GET /` is a small status page.
-
-## Configuration (env)
-
-| Var | Default | Notes |
-| --- | --- | --- |
-| `TRANSCODEARR_TOKEN` | - | Required for the API; without it only the watcher runs. |
-| `MEDIA_ROOTS` | `/media` | Colon-separated containment roots - nothing outside is ever touched. |
-| `WATCH_ROOTS` | = MEDIA_ROOTS | What the scanner walks. Start narrow. |
-| `PROCESS_UNHIDDEN` | `false` | Off = only dot-hidden files are processed. Sweeping the visible library into a re-encode is a decision, not a default. |
-| `CONVERT_EXTENSIONS` | `.mkv,.avi,.m4v` | What gets transcoded; dot-hidden `.mp4` is revealed without re-encoding. |
-| `SCAN_INTERVAL_SECONDS` / `STABLE_SECONDS` | `300` / `120` | Poll cadence and the size-stability window. |
-| `QUALITY` | `24` | CQ/CRF value fed to the encoder template. |
-| `TRASH_KEEP_DAYS` | `7` | How long replaced sources survive in `/config/trash`. |
-| `FORCE_ENCODER` | - | Skip probing: `h264_nvenc`, `h264_qsv`, or `libx264`. |
-| `VERIFY_DURATION_TOLERANCE` | `0.015` | How far output duration may drift from the source. |
+| `GET`/`PUT` `/api/settings` | Every setting, its current value, and where that value came from. |
+| `GET`/`POST` `/api/tokens`, `DELETE /api/tokens/{id}` | API keys. The raw key is returned once; only its hash is stored. |
+| `GET`/`POST` `/api/arrs`, `PUT`/`DELETE /api/arrs/{id}`, `POST /api/arrs/test` | Radarr/Sonarr connections. |
+| `GET /api/fs?path=` | Directories under the media roots, for the folder picker. Containment is checked on the resolved path. |
 
 ## Tests
 

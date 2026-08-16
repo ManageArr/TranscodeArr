@@ -180,6 +180,18 @@ def should_skip_transcode(probe: Probe, container_ext: str) -> bool:
     return container_ext.lower() == ".mp4"
 
 
+def matches_skip(filename: str, patterns: list[str]) -> bool:
+    """Should this file be left in its own container rather than re-encoded?
+
+    Plain case-insensitive substring matching on the file name, not a regex:
+    the thing people actually want to write is "Remux", and a regex dialect is
+    a way to get that wrong. Arr naming puts the quality in the file name, so a
+    substring is enough to protect exactly the copies worth protecting.
+    """
+    name = os.path.basename(filename).lower()
+    return any(p.strip().lower() in name for p in patterns if p.strip())
+
+
 # ---------------------------------------------------------------------------
 # Readiness - is the file actually finished being written?
 # ---------------------------------------------------------------------------
