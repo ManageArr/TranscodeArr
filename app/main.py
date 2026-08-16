@@ -52,7 +52,9 @@ TRASH_KEEP_DAYS = int(os.environ.get("TRASH_KEEP_DAYS", "7"))
 DURATION_TOLERANCE = float(os.environ.get("VERIFY_DURATION_TOLERANCE", "0.015"))
 FORCE_ENCODER = os.environ.get("FORCE_ENCODER", "")
 
-VERSION = "0.1.0"
+# Bump this with the image tag. /healthz reporting a version that is not the
+# running build makes the one field whose job is "what is deployed" a liar.
+VERSION = "0.2.0"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
