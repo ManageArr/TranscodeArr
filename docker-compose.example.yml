@@ -12,6 +12,8 @@ services:
       - /share/NAS/Media:/media
       - /share/NAS/Containers/transcodearr:/config
     environment:
+      # compute is required: ffmpeg's NVENC initializes through CUDA.
+      NVIDIA_DRIVER_CAPABILITIES: "compute,video,utility"
       TRANSCODEARR_TOKEN: "change-me"
       MEDIA_ROOTS: "/media"
       # Start narrow. Widen to /media/Movies:/media/TV:/media/Movies-Anime:/media/TV-Anime

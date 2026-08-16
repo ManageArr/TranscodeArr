@@ -81,3 +81,19 @@ Bearer token (`TRANSCODEARR_TOKEN`) on everything except `GET /healthz`.
 `python -m unittest discover tests` - the pure rules (path containment,
 staging-name arithmetic, verification, stability, argv construction) with the
 incident cases stated by name.
+
+## Ops notes from the first real deployment (QNAP, NVIDIA T1000)
+
+- Container Station registers the NVIDIA runtime as `nvidia-runtime`, not
+  `nvidia`. `NVIDIA_DRIVER_CAPABILITIES` must include `compute` - NVENC loads
+  without it and then fails at `cuInit`.
+- On a long-uptime NAS, `cuInit` can fail with `CUDA_ERROR_NOT_INITIALIZED`
+  while `nvidia-smi` works fine. dmesg shows `NV_ERR_NO_MEMORY` from the UVM
+  fault-buffer allocation: kernel memory is too fragmented to hand the driver
+  the contiguous pages it needs (observed after 101 days of uptime, with the
+  high-order page pools empty). Fix without a reboot, as root:
+  `sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory`
+  This also un-breaks hardware transcoding for every other container on the
+  box - a Jellyfin on the same host had been silently falling back to CPU.
+- The boot probe exists precisely because of the above: a listed encoder is
+  not a working one, and `/healthz` says which encoder actually won and why.

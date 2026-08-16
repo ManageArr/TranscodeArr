@@ -20,8 +20,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -s /usr/lib/jellyfin-ffmpeg/ffprobe /usr/local/bin/ffprobe
 
 # The nvidia runtime reads these to decide which driver libraries to inject.
-# "video" is the one everyone forgets - without it there is no NVENC.
-ENV NVIDIA_DRIVER_CAPABILITIES=video,utility \
+# "video" injects libnvidia-encode; "compute" injects libcuda - and ffmpeg's
+# NVENC initializes THROUGH CUDA, so without compute it loads and then dies at
+# cuInit. Found the hard way on a real QNAP.
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility \
     NVIDIA_VISIBLE_DEVICES=all \
     PYTHONUNBUFFERED=1
 
