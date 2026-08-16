@@ -446,19 +446,31 @@ PAGE = """<!doctype html><meta charset="utf-8"><title>TranscodeArr</title>
 </style>
 <h1>TranscodeArr</h1><p id="h"></p><table id="t"></table>
 <script>
-const H=localStorage.token||(localStorage.token=prompt('API token'));
+// The token is the TRANSCODEARR_TOKEN set on the container - this page cannot
+// issue one, it can only ask for it. Kept in localStorage so it is typed once.
+const token=()=>localStorage.token||(localStorage.token=prompt('API token')||'');
+let timer;
+function stop(msg){
+ // A mistyped token used to sit in localStorage forever while the table stayed
+ // empty and nothing on screen said why. Forget it, say so, and stop asking.
+ delete localStorage.token;
+ clearInterval(timer);
+ document.getElementById('t').innerHTML=`<tr><td>${msg}</td></tr>`;
+}
 async function go(){
- const h={Authorization:'Bearer '+H};
+ // /healthz needs no token, so the header renders even before you are let in.
  const z=await (await fetch('/healthz')).json();
  document.getElementById('h').innerHTML=
   `encoder <b>${z.encoder}</b> - queue ${z.queued} - running ${z.running} - v${z.version}`+
   (z.encoder==='libx264'?` <code>(${z.encoder_reason})</code>`:'');
- const j=await (await fetch('/jobs?limit=40',{headers:h})).json();
+ const r=await fetch('/jobs?limit=40',{headers:{Authorization:'Bearer '+token()}});
+ if(r.status===401) return stop('Wrong API token - reload the page to enter it again.');
+ const j=await r.json();
  document.getElementById('t').innerHTML='<tr><th>state</th><th>file</th><th>%</th><th>result</th></tr>'+
   j.jobs.map(x=>`<tr><td class="${x.state}">${x.state}</td><td>${x.path.split('/').pop()}</td>`+
    `<td>${x.progress??''}</td><td><code>${x.error||x.warning||x.output||''}</code></td></tr>`).join('');
 }
-go();setInterval(go,3000);
+go();timer=setInterval(go,3000);
 </script>"""
 
 
