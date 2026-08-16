@@ -292,9 +292,19 @@ class ProfileValidation(unittest.TestCase):
         return body
 
     def test_a_good_profile_is_accepted(self):
-        cleaned = store.clean_profile(self.ok(), ["h264_nvenc"])
+        cleaned = store.clean_profile(self.ok(preset="p4", profile="high"), ["h264_nvenc"])
         self.assertEqual(cleaned["quality"], 23)
         self.assertEqual(cleaned["max_height"], 1080)
+        self.assertEqual(cleaned["preset"], "p4")
+
+    def test_what_is_stored_is_what_will_actually_run(self):
+        # "p7" is NVENC's vocabulary. libx264 would silently use "medium"
+        # instead, so storing p7 would save a profile describing settings it
+        # does not use - and the card in the UI would be a lie.
+        cleaned = store.clean_profile(
+            self.ok(encoder="libx264", preset="p7", profile="main10"), ["libx264"])
+        self.assertEqual(cleaned["preset"], "medium")
+        self.assertEqual(cleaned["profile"], "high")
 
     def test_an_encoder_this_machine_cannot_run_is_refused(self):
         # Otherwise the profile fails on the first real film instead of here.

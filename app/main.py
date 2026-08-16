@@ -60,7 +60,7 @@ def cfg() -> dict:
 
 # Bump this with the image tag. /healthz reporting a version that is not the
 # running build makes the one field whose job is "what is deployed" a liar.
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------

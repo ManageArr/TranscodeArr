@@ -516,8 +516,12 @@ def clean_profile(body: dict, allowed_encoders: list[str] | None = None) -> dict
         raise ValueError("Audio channels must be source, stereo or 5.1")
     return {
         "name": name, "encoder": encoder, "quality": quality,
-        "preset": str(body.get("preset", "")).strip(),
-        "profile": str(body.get("profile", "")).strip(),
+        # Normalised to this encoder's own vocabulary, so what is stored is what
+        # actually runs. Keeping "p7" on a libx264 profile - which the encoder
+        # would silently replace with "medium" - saves a profile that describes
+        # settings it does not use, and the card in the UI would be a lie.
+        "preset": core.valid_option(encoder, "presets", str(body.get("preset", "")).strip()),
+        "profile": core.valid_option(encoder, "profiles", str(body.get("profile", "")).strip()),
         "max_height": max_height, "audio_codec": audio_codec,
         "audio_bitrate": audio_bitrate, "audio_channels": audio_channels,
     }
