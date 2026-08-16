@@ -213,37 +213,128 @@ def is_stable(size_then: int | None, size_now: int, seconds_between: float, need
 
 # {in} and {out} are replaced with real paths, passed as argv entries - no
 # shell is ever involved, so paths need no quoting and cannot inject.
+# No -level is pinned. It used to say 4.2, which cannot represent 4K at all:
+# ffmpeg either refuses or silently produces a stream that claims a level it
+# exceeds. Letting the encoder derive the level from the actual picture is
+# both correct and one less thing to get wrong.
 DEFAULT_TEMPLATES: dict[str, str] = {
     "h264_nvenc": (
-        "-map 0:v:0 -map 0:a? {subs} "
-        "-c:v h264_nvenc -preset p4 -profile:v main -level 4.2 -rc vbr -cq {quality} -b:v 0 "
-        "-c:a aac -b:a 192k -ac 2 -movflags +faststart"
+        "-map 0:v:0 -map 0:a? {subs} {filters}"
+        "-c:v h264_nvenc -preset {preset} -profile:v {profile} -rc vbr -cq {quality} -b:v 0 "
+        "{audio} -movflags +faststart"
     ),
     "h264_qsv": (
-        "-map 0:v:0 -map 0:a? {subs} "
-        "-c:v h264_qsv -preset medium -profile:v main -global_quality {quality} "
-        "-c:a aac -b:a 192k -ac 2 -movflags +faststart"
+        "-map 0:v:0 -map 0:a? {subs} {filters}"
+        "-c:v h264_qsv -preset {preset} -profile:v {profile} -global_quality {quality} "
+        "{audio} -movflags +faststart"
     ),
     "libx264": (
-        "-map 0:v:0 -map 0:a? {subs} "
-        "-c:v libx264 -preset medium -profile:v main -crf {quality} "
-        "-c:a aac -b:a 192k -ac 2 -movflags +faststart"
+        "-map 0:v:0 -map 0:a? {subs} {filters}"
+        "-c:v libx264 -preset {preset} -profile:v {profile} -crf {quality} "
+        "{audio} -movflags +faststart"
     ),
     # HEVC roughly halves the file at the same visual quality. The -tag:v hvc1
     # is not optional: without it Apple devices and Safari refuse to play HEVC
     # in MP4 at all, and the failure looks like a corrupt file rather than an
     # unsupported one.
     "hevc_nvenc": (
-        "-map 0:v:0 -map 0:a? {subs} "
-        "-c:v hevc_nvenc -preset p4 -tag:v hvc1 -rc vbr -cq {quality} -b:v 0 "
-        "-c:a aac -b:a 192k -ac 2 -movflags +faststart"
+        "-map 0:v:0 -map 0:a? {subs} {filters}"
+        "-c:v hevc_nvenc -preset {preset} -profile:v {profile} -tag:v hvc1 -rc vbr -cq {quality} -b:v 0 "
+        "{audio} -movflags +faststart"
     ),
     "libx265": (
-        "-map 0:v:0 -map 0:a? {subs} "
-        "-c:v libx265 -preset medium -tag:v hvc1 -crf {quality} "
-        "-c:a aac -b:a 192k -ac 2 -movflags +faststart"
+        "-map 0:v:0 -map 0:a? {subs} {filters}"
+        "-c:v libx265 -preset {preset} -profile:v {profile} -tag:v hvc1 -crf {quality} "
+        "{audio} -movflags +faststart"
     ),
 }
+
+# The speed/size dial and the codec profile, per encoder. Both were hardcoded,
+# which meant the one genuine tradeoff in transcoding - time against file size -
+# was not adjustable at all.
+NVENC_PRESETS = [
+    ("p1", "Fastest"), ("p2", "Faster"), ("p3", "Fast"), ("p4", "Balanced"),
+    ("p5", "Slower"), ("p6", "Slowest"), ("p7", "Highest quality"),
+]
+CPU_PRESETS = [
+    ("ultrafast", "Fastest"), ("veryfast", "Very fast"), ("faster", "Faster"),
+    ("medium", "Balanced"), ("slow", "Slower"), ("slower", "Slowest"), ("veryslow", "Highest quality"),
+]
+H264_PROFILES = [
+    ("high", "High - best compression, plays on anything modern"),
+    ("main", "Main - a little larger, for genuinely old hardware"),
+    ("baseline", "Baseline - largest, for very old phones and set-top boxes"),
+]
+HEVC_PROFILES = [("main", "Main - 8-bit, the compatible choice"),
+                 ("main10", "Main 10 - 10-bit, keeps HDR-grade gradients, narrower support")]
+
+ENCODER_OPTIONS: dict[str, dict] = {
+    "h264_nvenc": {"presets": NVENC_PRESETS, "default_preset": "p4",
+                   "profiles": H264_PROFILES, "default_profile": "high"},
+    "hevc_nvenc": {"presets": NVENC_PRESETS, "default_preset": "p4",
+                   "profiles": HEVC_PROFILES, "default_profile": "main"},
+    "h264_qsv": {"presets": CPU_PRESETS, "default_preset": "medium",
+                 "profiles": H264_PROFILES, "default_profile": "high"},
+    "libx264": {"presets": CPU_PRESETS, "default_preset": "medium",
+                "profiles": H264_PROFILES, "default_profile": "high"},
+    "libx265": {"presets": CPU_PRESETS, "default_preset": "medium",
+                "profiles": HEVC_PROFILES, "default_profile": "main"},
+}
+
+# 0 means "leave the picture alone", which is the default: re-scaling is a
+# one-way loss and most libraries do not want it.
+RESOLUTIONS = [
+    (0, "Same as source", "No scaling. The safe answer unless you are short of space."),
+    (2160, "4K (2160p)", "Only affects anything larger than 4K."),
+    (1080, "1080p", "The usual ceiling. Shrinks 4K substantially; leaves everything else untouched."),
+    (720, "720p", "Much smaller files, visibly softer on a big screen."),
+    (480, "480p", "For phones and tiny storage."),
+]
+
+
+def audio_args(codec: str, bitrate: int, channels: int) -> str:
+    """The audio half of an encode.
+
+    `copy` keeps the original track bit-for-bit, which is free and lossless -
+    but MP4 cannot carry DTS or TrueHD, so it fails on exactly the discs people
+    most want untouched, and the caller falls back to AAC when it does.
+
+    Channels defaults to stereo because that is what almost every TV and phone
+    actually outputs, but 0 keeps a 5.1 mix intact - the downmix is silent
+    otherwise, and someone with a receiver would never know it happened.
+    """
+    if codec == "copy":
+        return "-c:a copy"
+    parts = ["-c:a aac", f"-b:a {int(bitrate)}k"]
+    if channels:
+        parts.append(f"-ac {int(channels)}")
+    return " ".join(parts)
+
+
+def valid_option(encoder: str, kind: str, value: str) -> str:
+    """A preset/profile for THIS encoder, or that encoder's default.
+
+    Encoders do not share these vocabularies: NVENC speaks p1-p7 and libx264
+    speaks ultrafast-veryslow, so a value left behind by a previous encoder
+    would abort every job before the first frame.
+    """
+    opts = ENCODER_OPTIONS.get(encoder, {})
+    allowed = [v for v, _ in opts.get(kind, [])]
+    default = opts.get("default_preset" if kind == "presets" else "default_profile", "")
+    return value if value in allowed else default
+
+
+def scale_filter(max_height: int) -> str:
+    """A -vf that caps height and NEVER upscales.
+
+    min(ih,H) is the whole point: asking for 1080p with a 720p source must
+    leave it at 720p, because upscaling costs space and invents nothing. The
+    -2 keeps width even and proportional, which H.264 requires. The comma is
+    escaped because ffmpeg's filter syntax uses commas to chain filters.
+    """
+    if not max_height:
+        return ""
+    return f"-vf scale=-2:min(ih\\,{int(max_height)})"
 
 # What each encoder is for, in the terms someone choosing between them actually
 # cares about: is it using the GPU, what quality number suits it, and what is
@@ -302,6 +393,10 @@ def build_ffmpeg_args(
     part: str,
     quality: int,
     with_subtitles: bool,
+    preset: str = "",
+    profile: str = "",
+    max_height: int = 0,
+    audio: str = "-c:a aac -b:a 192k -ac 2",
 ) -> list[str]:
     """argv for one encode attempt.
 
@@ -310,7 +405,15 @@ def build_ffmpeg_args(
     dropped subtitle is recorded as a warning, never a silent loss.
     """
     subs = "-map 0:s? -c:s mov_text" if with_subtitles else "-sn"
-    rendered = template.format(subs=subs, quality=quality)
+    filters = scale_filter(max_height)
+    rendered = template.format(
+        subs=subs,
+        quality=quality,
+        preset=preset or "medium",
+        profile=profile or "high",
+        filters=f"{filters} " if filters else "",
+        audio=audio,
+    )
     return [
         "ffmpeg", "-hide_banner", "-nostdin", "-y",
         "-i", source,

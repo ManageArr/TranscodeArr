@@ -16,6 +16,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -59,7 +60,7 @@ def cfg() -> dict:
 
 # Bump this with the image tag. /healthz reporting a version that is not the
 # running build makes the one field whose job is "what is deployed" a liar.
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -221,6 +222,64 @@ def try_encoder(enc: str) -> tuple[bool, str]:
         return False, str(e)
 
 
+def validate_profile(fields: dict) -> tuple[bool, str]:
+    """Actually encode with this profile before letting anyone save it.
+
+    Every setting here has a way of being individually plausible and jointly
+    impossible: main10 on an encoder built without it, a preset from a
+    different encoder family, copy-audio into a container that cannot hold it,
+    a resolution the card refuses. None of that shows up in a form; all of it
+    shows up in two seconds of real encoding. This is the same rule the
+    encoder probe follows, applied to the whole configuration.
+    """
+    work = tempfile.mkdtemp(prefix="ta-validate-")
+    src = os.path.join(work, "sample.mkv")
+    out = os.path.join(work, "out.mp4")
+    try:
+        # A clip with video, audio AND a subtitle stream, so the subtitle and
+        # audio paths are exercised rather than skipped.
+        make = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-y",
+             "-f", "lavfi", "-i", "testsrc2=duration=2:size=640x360:rate=24",
+             # sine is mono - the lavfi source has no channel_layout option -
+             # so the 5.1 comes from the encoder. A surround test clip is the
+             # point: it is what proves a downmix or a copy actually works.
+             "-f", "lavfi", "-i", "sine=frequency=440:duration=2:sample_rate=48000",
+             "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "ac3", "-ac", "6", "-shortest", src],
+            capture_output=True, text=True, timeout=120,
+        )
+        if make.returncode != 0:
+            tail = (make.stderr or "").strip().splitlines()
+            return False, f"could not build a test clip: {tail[-1][:180] if tail else 'unknown error'}"
+
+        args = profile_args(fields, src, out, with_subs=True)
+        run = subprocess.run(args, capture_output=True, text=True, timeout=180)
+        if run.returncode != 0 and fields.get("audio_codec") == "copy":
+            # Same fallback a real job would take, so "copy" is not reported as
+            # broken when the job would have coped.
+            args = profile_args(fields, src, out, with_subs=True, audio_codec="aac")
+            run = subprocess.run(args, capture_output=True, text=True, timeout=180)
+            if run.returncode == 0:
+                return True, "works, but the original audio cannot be copied into MP4 - jobs will re-encode to AAC"
+        if run.returncode != 0:
+            tail = [l for l in (run.stderr or "").strip().splitlines() if l.strip()]
+            return False, tail[-1][:220] if tail else "ffmpeg failed with no output"
+
+        probe = ffprobe(out)
+        if probe is None or probe.video_streams < 1:
+            return False, "the encode produced no readable video"
+        if probe.audio_streams < 1:
+            return False, "the encode produced no audio"
+        size = os.path.getsize(out) if os.path.exists(out) else 0
+        return True, f"encoded 2s of test video and audio ({size // 1024} KB), streams verified"
+    except subprocess.TimeoutExpired:
+        return False, "the test encode timed out"
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def gpu_name() -> str | None:
     try:
         r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
@@ -314,16 +373,45 @@ def _cancelled(job_id: str) -> bool:
         return bool(entry and entry["cancel"])
 
 
+def encoding_profile() -> dict:
+    """The active profile, or the probed defaults if somehow there is none."""
+    row = store.active_profile(db())
+    if row:
+        return row
+    return {"encoder": ENCODER, "quality": core.recommended_quality(ENCODER), "preset": "",
+            "profile": "", "max_height": 0, "audio_codec": "aac", "audio_bitrate": 192,
+            "audio_channels": 2}
+
+
+def profile_args(p: dict, source: str, part: str, with_subs: bool, audio_codec: str | None = None) -> list[str]:
+    """The exact argv one profile produces. Shared by real jobs and the test
+    encode, so what gets validated is what gets run - a test that builds its
+    command differently is a test of something else."""
+    encoder = p["encoder"] if p["encoder"] in core.DEFAULT_TEMPLATES else ENCODER
+    return core.build_ffmpeg_args(
+        core.DEFAULT_TEMPLATES[encoder], source, part, p["quality"], with_subs,
+        preset=core.valid_option(encoder, "presets", p.get("preset", "")),
+        profile=core.valid_option(encoder, "profiles", p.get("profile", "")),
+        max_height=p.get("max_height", 0),
+        audio=core.audio_args(audio_codec or p.get("audio_codec", "aac"),
+                              p.get("audio_bitrate", 192), p.get("audio_channels", 2)),
+    )
+
+
 def run_encode(job_id: str, source: str, names: core.JobNames, src_probe: core.Probe) -> tuple[bool, str, str]:
     """One encode attempt cycle: with subtitles, then without. (ok, warning, error)."""
     conn = db()
-    template = core.DEFAULT_TEMPLATES[ENCODER]
-    attempts = [(True, ""), (False, "text subtitles could not be carried into mp4 - dropped")]
-    if src_probe.subtitle_streams == 0:
-        attempts = [(False, "")]
+    prof = encoding_profile()
+    attempts = [(True, prof["audio_codec"], "")]
+    if src_probe.subtitle_streams:
+        attempts.append((False, prof["audio_codec"], "text subtitles could not be carried into mp4 - dropped"))
+    if prof["audio_codec"] == "copy":
+        # MP4 cannot hold DTS or TrueHD, and those are exactly the tracks worth
+        # copying. Falling back beats failing the job over the audio.
+        attempts.append((False, "aac", "the original audio could not be copied into mp4 - re-encoded to AAC"))
 
-    for with_subs, warning in attempts:
-        args = core.build_ffmpeg_args(template, source, names.part, cfg()["quality"], with_subs)
+    for with_subs, audio_codec, warning in attempts:
+        args = profile_args(prof, source, names.part, with_subs, audio_codec)
         conn.execute("UPDATE jobs SET log_tail=? WHERE id=?", (" ".join(args), job_id))
         conn.commit()
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -819,20 +907,49 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {
                 "specs": [
                     {"key": s.key, "kind": s.kind, "label": s.label, "help": s.help, "group": s.group, "env": s.env}
-                    for s in store.SPECS
+                    for s in store.SPECS if not s.hidden
                 ],
                 "values": store.effective(rows, env, roots),
                 "sources": store.sources(rows, env, roots),
                 "media_roots": MEDIA_ROOTS,
             })
         if self.path == "/api/encoders":
+            c = cfg()
+            opts = core.ENCODER_OPTIONS.get(ENCODER, {})
             return self._send(200, {
                 "gpu": GPU,
                 "in_use": ENCODER,
                 "why": ENCODER_REASON,
-                "quality": cfg()["quality"],
+                "quality": c["quality"],
                 "recommended_for_current": core.recommended_quality(ENCODER),
                 "encoders": ENCODER_PROBES,
+                "presets": [{"value": v, "label": l} for v, l in opts.get("presets", [])],
+                "profiles": [{"value": v, "label": l} for v, l in opts.get("profiles", [])],
+                "preset": c["encoder_preset"] or opts.get("default_preset", ""),
+                "profile": c["encoder_profile"] or opts.get("default_profile", ""),
+                "default_preset": opts.get("default_preset", ""),
+                "default_profile": opts.get("default_profile", ""),
+                "resolutions": [{"value": v, "label": l, "help": h} for v, l, h in core.RESOLUTIONS],
+                "max_height": c["max_height"],
+                "sane_range": core.ENCODER_INFO.get(ENCODER, {}).get("sane", [18, 30]),
+            })
+        if self.path == "/api/profiles":
+            available = [p["name"] for p in ENCODER_PROBES if p["available"]]
+            return self._send(200, {
+                "profiles": store.list_profiles(db()),
+                "available_encoders": [
+                    {"name": p["name"], "codec": p["codec"], "hardware": p["hardware"],
+                     "recommended_quality": p["recommended_quality"], "sane_range": p["sane_range"],
+                     "summary": p["summary"],
+                     "presets": [{"value": v, "label": l} for v, l in core.ENCODER_OPTIONS.get(p["name"], {}).get("presets", [])],
+                     "profiles": [{"value": v, "label": l} for v, l in core.ENCODER_OPTIONS.get(p["name"], {}).get("profiles", [])],
+                     "default_preset": core.ENCODER_OPTIONS.get(p["name"], {}).get("default_preset", ""),
+                     "default_profile": core.ENCODER_OPTIONS.get(p["name"], {}).get("default_profile", "")}
+                    for p in ENCODER_PROBES if p["name"] in available
+                ],
+                "resolutions": [{"value": v, "label": l, "help": h} for v, l, h in core.RESOLUTIONS],
+                "audio_codecs": [{"value": v, "label": l} for v, l in store.AUDIO_CODECS],
+                "audio_channels": [{"value": v, "label": l} for v, l in store.AUDIO_CHANNELS],
             })
         if self.path == "/api/tokens":
             return self._send(200, {"tokens": store.list_tokens(db())})
@@ -916,6 +1033,34 @@ class Handler(BaseHTTPRequestHandler):
             log.info("re-probed encoders: %s (%s)", ENCODER, ENCODER_REASON)
             return self._send(200, {"gpu": GPU, "in_use": ENCODER, "why": ENCODER_REASON,
                                     "encoders": ENCODER_PROBES})
+        if self.path in ("/api/profiles", "/api/profiles/test") or re.fullmatch(r"/api/profiles/([0-9a-f-]{36})", self.path):
+            available = [p["name"] for p in ENCODER_PROBES if p["available"]]
+            try:
+                fields = store.clean_profile(body, available)
+            except ValueError as e:
+                return self._send(400, {"error": str(e)})
+            ok, note = validate_profile(fields)
+            if self.path == "/api/profiles/test":
+                return self._send(200, {"ok": ok, "detail": note, "command": " ".join(
+                    profile_args(fields, "<input>", "<output>", with_subs=True))})
+            if not ok:
+                # Never store a configuration that has been shown not to work -
+                # the alternative is discovering it on the first real film.
+                return self._send(400, {"error": f"That profile does not work on this machine: {note}"})
+            m = re.fullmatch(r"/api/profiles/([0-9a-f-]{36})", self.path)
+            try:
+                row = store.save_profile(db(), fields, m.group(1) if m else None, note)
+            except ValueError as e:
+                return self._send(400, {"error": str(e)})
+            log.info("profile saved: %s (%s)", row["name"], note)
+            return self._send(200 if m else 201, {"profile": row, "detail": note})
+        m = re.fullmatch(r"/api/profiles/([0-9a-f-]{36})/activate", self.path)
+        if m:
+            row = store.activate_profile(db(), m.group(1))
+            if not row:
+                return self._send(404, {"error": "no such profile"})
+            log.info("active profile: %s", row["name"])
+            return self._send(200, {"profile": row})
         if self.path == "/api/tokens":
             raw, row = store.mint_token(db(), str(body.get("name", "")))
             log.info("api key minted: %s", row["name"])
@@ -966,6 +1111,10 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             return self._send(*((200, {"revoked": m.group(1)}) if store.revoke_token(db(), m.group(1))
                                 else (404, {"error": "no such key"})))
+        m = re.fullmatch(r"/api/profiles/([0-9a-f-]{36})", self.path)
+        if m:
+            ok, why = store.delete_profile(db(), m.group(1))
+            return self._send(200 if ok else 400, {"deleted": m.group(1)} if ok else {"error": why})
         m = re.fullmatch(r"/api/arrs/([0-9a-f-]{36})", self.path)
         if m:
             return self._send(*((200, {"deleted": m.group(1)}) if store.delete_arr(db(), m.group(1))
@@ -1009,6 +1158,15 @@ def main() -> None:
     GPU = gpu_name()
     ENCODER, ENCODER_REASON, ENCODER_PROBES = choose_encoder()
     c = cfg()
+    # The first profile is whatever the daemon is already doing, written down.
+    # An upgrade must not quietly change how anything is encoded.
+    opts = core.ENCODER_OPTIONS.get(ENCODER, {})
+    store.ensure_default_profile(
+        db(), ENCODER, c["quality"],
+        core.valid_option(ENCODER, "presets", c["encoder_preset"]) or opts.get("default_preset", ""),
+        core.valid_option(ENCODER, "profiles", c["encoder_profile"]) or opts.get("default_profile", ""),
+        c["max_height"],
+    )
     log.info("gpu: %s", GPU or "none detected")
     log.info("encoder: %s (%s)", ENCODER, ENCODER_REASON)
     for p in ENCODER_PROBES:

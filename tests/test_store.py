@@ -232,6 +232,109 @@ class ArrRequests(unittest.TestCase):
         self.assertNotIn("urllib", arrs.USER_AGENT.lower())
 
 
+class Resolution(unittest.TestCase):
+    def test_source_resolution_adds_no_filter(self):
+        self.assertEqual(core.scale_filter(0), "")
+
+    def test_a_cap_never_upscales(self):
+        # min(ih,H) is the whole point: asking for 1080p with a 720p source has
+        # to leave it at 720p. Upscaling costs space and invents nothing.
+        f = core.scale_filter(1080)
+        self.assertIn("min(ih", f)
+        self.assertIn("1080", f)
+        self.assertTrue(f.startswith("-vf "))
+
+    def test_width_stays_even_because_h264_requires_it(self):
+        self.assertIn("-2:", core.scale_filter(720))
+
+    def test_the_comma_is_escaped_for_ffmpeg_filter_syntax(self):
+        # An unescaped comma would end the filter and start another one.
+        self.assertIn("\\,", core.scale_filter(1080))
+
+
+class PresetsAndProfiles(unittest.TestCase):
+    def test_a_preset_from_another_encoder_falls_back(self):
+        # "p4" is NVENC's vocabulary; libx264 exits before reading a frame.
+        self.assertEqual(core.valid_option("libx264", "presets", "p4"), "medium")
+        self.assertEqual(core.valid_option("h264_nvenc", "presets", "veryslow"), "p4")
+
+    def test_a_valid_option_is_kept(self):
+        self.assertEqual(core.valid_option("h264_nvenc", "presets", "p7"), "p7")
+        self.assertEqual(core.valid_option("libx264", "profiles", "main"), "main")
+
+    def test_hevc_defaults_to_a_profile_hevc_actually_has(self):
+        self.assertEqual(core.valid_option("hevc_nvenc", "profiles", "high"), "main")
+
+    def test_no_level_is_pinned_because_4k_cannot_fit_in_level_4_2(self):
+        for name, template in core.DEFAULT_TEMPLATES.items():
+            self.assertNotIn("-level", template, f"{name} pins a level")
+
+
+class Audio(unittest.TestCase):
+    def test_copy_keeps_the_original_track(self):
+        self.assertEqual(core.audio_args("copy", 192, 2), "-c:a copy")
+
+    def test_source_channels_means_no_downmix(self):
+        # -ac 2 on a 5.1 source silently flattens it, and nobody with a
+        # receiver would find out until they listened.
+        self.assertNotIn("-ac", core.audio_args("aac", 192, 0))
+        self.assertIn("-ac 6", core.audio_args("aac", 448, 6))
+
+    def test_bitrate_is_carried(self):
+        self.assertIn("-b:a 320k", core.audio_args("aac", 320, 2))
+
+
+class ProfileValidation(unittest.TestCase):
+    def ok(self, **over):
+        body = {"name": "P", "encoder": "h264_nvenc", "quality": 23, "audio_codec": "aac",
+                "audio_bitrate": 192, "audio_channels": 2, "max_height": 1080}
+        body.update(over)
+        return body
+
+    def test_a_good_profile_is_accepted(self):
+        cleaned = store.clean_profile(self.ok(), ["h264_nvenc"])
+        self.assertEqual(cleaned["quality"], 23)
+        self.assertEqual(cleaned["max_height"], 1080)
+
+    def test_an_encoder_this_machine_cannot_run_is_refused(self):
+        # Otherwise the profile fails on the first real film instead of here.
+        with self.assertRaises(ValueError):
+            store.clean_profile(self.ok(encoder="hevc_nvenc"), ["h264_nvenc"])
+
+    def test_nonsense_values_are_refused_with_a_readable_reason(self):
+        for over in ({"name": "  "}, {"quality": 99}, {"max_height": 50},
+                     {"audio_codec": "flac"}, {"audio_bitrate": 5}, {"audio_channels": 3}):
+            with self.assertRaises(ValueError):
+                store.clean_profile(self.ok(**over), ["h264_nvenc"])
+
+    def test_the_active_profile_cannot_be_deleted_out_from_under_the_worker(self):
+        conn = memdb()
+        row = store.save_profile(conn, store.clean_profile(self.ok()), None, "tested")
+        store.activate_profile(conn, row["id"])
+        ok, why = store.delete_profile(conn, row["id"])
+        self.assertFalse(ok)
+        self.assertIn("in use", why)
+
+    def test_activating_one_profile_deactivates_the_rest(self):
+        conn = memdb()
+        a = store.save_profile(conn, store.clean_profile(self.ok(name="A")), None, "t")
+        b = store.save_profile(conn, store.clean_profile(self.ok(name="B")), None, "t")
+        store.activate_profile(conn, a["id"])
+        store.activate_profile(conn, b["id"])
+        self.assertEqual(store.active_profile(conn)["id"], b["id"])
+        self.assertEqual(sum(1 for p in store.list_profiles(conn) if p["active"]), 1)
+
+    def test_the_seeded_profile_reproduces_what_the_daemon_already_does(self):
+        # An upgrade must not silently re-encode the library differently.
+        conn = memdb()
+        store.ensure_default_profile(conn, "h264_nvenc", 24, "p4", "high", 0)
+        store.ensure_default_profile(conn, "libx265", 18, "slow", "main", 720)  # must not add a second
+        profiles = store.list_profiles(conn)
+        self.assertEqual(len(profiles), 1)
+        self.assertEqual((profiles[0]["encoder"], profiles[0]["quality"]), ("h264_nvenc", 24))
+        self.assertTrue(profiles[0]["active"])
+
+
 class SkipRules(unittest.TestCase):
     def test_a_remux_can_be_protected_by_name(self):
         self.assertTrue(core.matches_skip("Film - Bluray-1080p Remux.mkv", ["remux"]))

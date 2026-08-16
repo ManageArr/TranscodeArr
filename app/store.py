@@ -56,6 +56,10 @@ class Spec:
     label: str
     help: str
     group: str = "General"
+    # Superseded by encoding profiles. Still read - they seed the first profile
+    # on upgrade - but not shown, because a visible control that no longer does
+    # anything is worse than no control at all.
+    hidden: bool = False
 
 
 SPECS: list[Spec] = [
@@ -75,13 +79,22 @@ SPECS: list[Spec] = [
          "Case-insensitive substrings matched against the file name. A match is revealed as-is instead of "
          "re-encoded - the way to protect Remux copies you would rather keep whole.", "Rules"),
     Spec("quality", "QUALITY", "int", 24, "Quality (CQ/CRF)",
-         "Lower is better looking and bigger. 24 is a sane default; 18-20 is near-transparent.", "Rules"),
+         "Lower is better looking and bigger. 24 is a sane default; 18-20 is near-transparent.", "Rules", hidden=True),
     Spec("verify_duration_tolerance", "VERIFY_DURATION_TOLERANCE", "fraction", 0.015, "Duration tolerance",
          "How far the output length may drift from the source before the result is rejected, as a fraction: "
          "0.015 is 1.5%. Capped at 0.5 - a tolerance loose enough to accept half a film is not a tolerance.", "Rules"),
     Spec("force_encoder", "FORCE_ENCODER", "text", "", "Encoder",
          "Leave empty to pick the best one that actually works on this machine. Each encoder has its own "
-         "quality scale, so change the quality above to match when you pin one.", "Rules"),
+         "quality scale, so change the quality above to match when you pin one.", "Rules", hidden=True),
+    Spec("encoder_preset", "ENCODER_PRESET", "text", "", "Speed vs size",
+         "The one real tradeoff in encoding: slower settings spend more time to make a smaller file at the "
+         "same quality. Leave empty for the balanced default of whichever encoder is in use.", "Rules", hidden=True),
+    Spec("encoder_profile", "ENCODER_PROFILE", "text", "", "Codec profile",
+         "How modern a decoder the file expects. High is right for anything made this century; drop to Main "
+         "or Baseline only for genuinely old hardware.", "Rules", hidden=True),
+    Spec("max_height", "MAX_HEIGHT", "int", 0, "Resolution",
+         "Caps the picture height. Never upscales - asking for 1080p leaves a 720p file at 720p, because "
+         "scaling up costs space and invents nothing. 0 keeps the source resolution.", "Rules", hidden=True),
     Spec("max_concurrent", "MAX_CONCURRENT", "int", 1, "Convert at once",
          "One at a time suits a NAS: a single set of spindles behind a single network link turns two encodes "
          "into two slow ones. Raise it if your media sits on SSD or you have a card with no encode-session "
@@ -119,6 +132,8 @@ def parse_value(spec: Spec, raw: Any, roots: list[str] | None = None) -> Any:
             raise ValueError(f"{spec.label} must be a whole number")
         if n < 0:
             raise ValueError(f"{spec.label} cannot be negative")
+        if spec.key == "max_height" and n and not 240 <= n <= 4320:
+            raise ValueError("Resolution must be 0 (source) or a height between 240 and 4320")
         if spec.key == "max_concurrent" and not 1 <= n <= 8:
             # Above a handful the disk is the limit on any NAS, and an
             # unbounded value here would spawn workers until the box gave up.
@@ -209,6 +224,26 @@ CREATE TABLE IF NOT EXISTS tokens (
   prefix TEXT NOT NULL,          -- first 8 chars, so a key is identifiable in a list
   created REAL NOT NULL,
   last_used REAL
+);
+-- Named encoding profiles, in the HandBrake sense: one bundle of every choice
+-- that produces a file, so switching is one decision instead of six.
+-- validated_at is only set by a real test encode - see validate_profile.
+CREATE TABLE IF NOT EXISTS profiles (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  encoder TEXT NOT NULL,
+  quality INTEGER NOT NULL,
+  preset TEXT NOT NULL DEFAULT '',
+  profile TEXT NOT NULL DEFAULT '',
+  max_height INTEGER NOT NULL DEFAULT 0,
+  audio_codec TEXT NOT NULL DEFAULT 'aac',
+  audio_bitrate INTEGER NOT NULL DEFAULT 192,
+  audio_channels INTEGER NOT NULL DEFAULT 2,
+  active INTEGER NOT NULL DEFAULT 0,
+  builtin INTEGER NOT NULL DEFAULT 0,
+  validated_at REAL,
+  validated_note TEXT,
+  created REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS arrs (
   id TEXT PRIMARY KEY,
@@ -403,4 +438,151 @@ def delete_arr(conn: sqlite3.Connection, arr_id: str) -> bool:
 
 def note_arr_error(conn: sqlite3.Connection, arr_id: str, error: str | None) -> None:
     conn.execute("UPDATE arrs SET last_error=? WHERE id=?", (error, arr_id))
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Encoding profiles
+# ---------------------------------------------------------------------------
+
+PROFILE_FIELDS = ("name", "encoder", "quality", "preset", "profile", "max_height",
+                  "audio_codec", "audio_bitrate", "audio_channels")
+
+AUDIO_CODECS = [
+    ("aac", "AAC - re-encoded, plays everywhere"),
+    ("copy", "Copy the original track - no quality loss, but MP4 cannot hold DTS or TrueHD"),
+]
+AUDIO_CHANNELS = [
+    (0, "Same as source - keeps 5.1 intact"),
+    (2, "Stereo - smaller, and what most TVs and phones actually output"),
+    (6, "5.1"),
+]
+
+
+def profile_row(r: sqlite3.Row) -> dict:
+    d = {k: r[k] for k in r.keys()}
+    d["active"] = bool(d["active"])
+    d["builtin"] = bool(d["builtin"])
+    return d
+
+
+def list_profiles(conn: sqlite3.Connection) -> list[dict]:
+    return [profile_row(r) for r in conn.execute("SELECT * FROM profiles ORDER BY builtin DESC, created").fetchall()]
+
+
+def get_profile(conn: sqlite3.Connection, profile_id: str) -> dict | None:
+    r = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+    return profile_row(r) if r else None
+
+
+def active_profile(conn: sqlite3.Connection) -> dict | None:
+    r = conn.execute("SELECT * FROM profiles WHERE active=1 LIMIT 1").fetchone()
+    return profile_row(r) if r else None
+
+
+def clean_profile(body: dict, allowed_encoders: list[str] | None = None) -> dict:
+    """Validate a submitted profile into storable values."""
+    name = str(body.get("name", "")).strip()
+    if not name:
+        raise ValueError("Give the profile a name")
+    encoder = str(body.get("encoder", "")).strip()
+    if allowed_encoders is not None and encoder not in allowed_encoders:
+        # Offering an encoder this machine cannot run is how someone builds a
+        # profile that fails on the first real file instead of on the test.
+        raise ValueError(f"{encoder or 'That encoder'} does not work on this machine")
+    try:
+        quality = int(body.get("quality", 23))
+    except (TypeError, ValueError):
+        raise ValueError("Quality must be a whole number")
+    if not 1 <= quality <= 51:
+        raise ValueError("Quality must be between 1 and 51")
+    try:
+        max_height = int(body.get("max_height", 0) or 0)
+    except (TypeError, ValueError):
+        raise ValueError("Resolution must be a whole number")
+    if max_height and not 240 <= max_height <= 4320:
+        raise ValueError("Resolution must be 0 (source) or a height between 240 and 4320")
+    audio_codec = str(body.get("audio_codec", "aac")).strip() or "aac"
+    if audio_codec not in [c for c, _ in AUDIO_CODECS]:
+        raise ValueError("Audio must be aac or copy")
+    try:
+        audio_bitrate = int(body.get("audio_bitrate", 192))
+        audio_channels = int(body.get("audio_channels", 2))
+    except (TypeError, ValueError):
+        raise ValueError("Audio bitrate and channels must be whole numbers")
+    if not 32 <= audio_bitrate <= 640:
+        raise ValueError("Audio bitrate must be between 32 and 640 kbps")
+    if audio_channels not in [c for c, _ in AUDIO_CHANNELS]:
+        raise ValueError("Audio channels must be source, stereo or 5.1")
+    return {
+        "name": name, "encoder": encoder, "quality": quality,
+        "preset": str(body.get("preset", "")).strip(),
+        "profile": str(body.get("profile", "")).strip(),
+        "max_height": max_height, "audio_codec": audio_codec,
+        "audio_bitrate": audio_bitrate, "audio_channels": audio_channels,
+    }
+
+
+def save_profile(conn: sqlite3.Connection, fields: dict, profile_id: str | None,
+                 validated_note: str | None) -> dict:
+    """Store a profile. validated_note comes from a real test encode - a profile
+    is never written without one, which is the whole point of the test."""
+    now = time.time()
+    if profile_id:
+        if not get_profile(conn, profile_id):
+            raise ValueError("no such profile")
+        conn.execute(
+            "UPDATE profiles SET name=?, encoder=?, quality=?, preset=?, profile=?, max_height=?, "
+            "audio_codec=?, audio_bitrate=?, audio_channels=?, validated_at=?, validated_note=? WHERE id=?",
+            (*[fields[k] for k in PROFILE_FIELDS], now, validated_note, profile_id),
+        )
+    else:
+        profile_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO profiles (id, name, encoder, quality, preset, profile, max_height, audio_codec, "
+            "audio_bitrate, audio_channels, active, builtin, validated_at, validated_note, created) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,0,0,?,?,?)",
+            (profile_id, *[fields[k] for k in PROFILE_FIELDS], now, validated_note, now),
+        )
+    conn.commit()
+    return get_profile(conn, profile_id)  # type: ignore[return-value]
+
+
+def activate_profile(conn: sqlite3.Connection, profile_id: str) -> dict | None:
+    if not get_profile(conn, profile_id):
+        return None
+    conn.execute("UPDATE profiles SET active=0")
+    conn.execute("UPDATE profiles SET active=1 WHERE id=?", (profile_id,))
+    conn.commit()
+    return get_profile(conn, profile_id)
+
+
+def delete_profile(conn: sqlite3.Connection, profile_id: str) -> tuple[bool, str]:
+    row = get_profile(conn, profile_id)
+    if not row:
+        return False, "no such profile"
+    if row["active"]:
+        # Deleting what every job is using leaves the worker with no settings
+        # at all; make the replacement an explicit choice first.
+        return False, "that profile is in use - activate another one first"
+    conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+    conn.commit()
+    return True, "deleted"
+
+
+def ensure_default_profile(conn: sqlite3.Connection, encoder: str, quality: int,
+                           preset: str, profile: str, max_height: int) -> None:
+    """Seed the first profile from whatever the daemon is already doing.
+
+    An upgrade must not silently change how files are encoded, so the starting
+    profile is the current behaviour written down rather than a fresh opinion.
+    """
+    if conn.execute("SELECT COUNT(*) FROM profiles").fetchone()[0]:
+        return
+    conn.execute(
+        "INSERT INTO profiles (id, name, encoder, quality, preset, profile, max_height, audio_codec, "
+        "audio_bitrate, audio_channels, active, builtin, validated_at, validated_note, created) "
+        "VALUES (?,?,?,?,?,?,?,'aac',192,2,1,1,NULL,'carried over from settings - test it to confirm',?)",
+        (str(uuid.uuid4()), "Default", encoder, quality, preset, profile, max_height, time.time()),
+    )
     conn.commit()

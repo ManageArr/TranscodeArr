@@ -71,6 +71,30 @@ PAGE = r"""<!doctype html><meta charset="utf-8"><title>TranscodeArr</title>
  .facts{display:flex;gap:1.4rem;flex-wrap:wrap;color:var(--dim);font-size:.8rem;margin-top:.6rem}
  .facts b{color:var(--ink);font-weight:600}
  .idle{color:var(--dim);font-size:.9rem;padding:.4rem 0}
+ /* Encoding tab */
+ .hero{display:flex;gap:1.6rem;flex-wrap:wrap;align-items:center}
+ .hero .big{font-size:1.5rem;color:var(--accent);font-weight:600;letter-spacing:.01em}
+ .hero .sub{color:var(--dim);font-size:.8rem}
+ .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(16rem,1fr));gap:.8rem}
+ .enc{background:#0d1728;border:1px solid var(--line);border-radius:8px;padding:.8rem;position:relative;
+      display:flex;flex-direction:column;gap:.35rem}
+ .enc.on{border-color:var(--accent);box-shadow:0 0 0 1px rgba(34,211,238,.35)}
+ .enc.off{opacity:.5}
+ .enc .top{display:flex;align-items:center;gap:.5rem;justify-content:space-between}
+ .enc .nm{font-weight:600;color:var(--ink);font-size:.92rem}
+ .enc .why{color:var(--dim);font-size:.76rem;line-height:1.35}
+ .dot{width:.5rem;height:.5rem;border-radius:50%;display:inline-block;flex:none}
+ .dot.y{background:var(--ok);box-shadow:0 0 6px rgba(52,211,153,.7)} .dot.n{background:var(--bad)}
+ .chips{display:flex;gap:.3rem;flex-wrap:wrap}
+ .chip{font-size:.66rem;text-transform:uppercase;letter-spacing:.05em;padding:.08rem .38rem;border-radius:4px;
+       border:1px solid var(--line);color:var(--dim)}
+ .chip.gpu{color:var(--ok);border-color:#14532d} .chip.cpu{color:var(--warn);border-color:#78350f}
+ .enc .act{margin-top:.4rem;align-self:flex-start}
+ .enc .using{color:var(--accent);font-size:.72rem;text-transform:uppercase;letter-spacing:.06em}
+ input[type=range]{width:100%;accent-color:var(--accent)}
+ .scale{display:flex;justify-content:space-between;color:var(--dim);font-size:.72rem;margin-top:.15rem}
+ .qnum{font-size:1.3rem;color:var(--accent);font-weight:600;font-variant-numeric:tabular-nums}
+ .two{display:grid;grid-template-columns:repeat(auto-fit,minmax(14rem,1fr));gap:0 1rem}
  td.pos{color:var(--dim);width:2.5rem;text-align:right;font-variant-numeric:tabular-nums}
  tr.next td{color:var(--accent)}
 </style>
@@ -124,15 +148,54 @@ PAGE = r"""<!doctype html><meta charset="utf-8"><title>TranscodeArr</title>
 
 <section id="hardware">
  <div class="msg" id="hwmsg"></div>
+ <div class="card"><div class="hero" id="hwhero"></div></div>
  <div class="card">
-  <h2>This machine</h2>
-  <p class="hint">Every encoder below was tried with a real one-second encode. ffmpeg lists encoders it was
-   merely built with, so being listed proves nothing - a card that cannot do AV1 still advertises it, and
-   NVENC advertises itself with no driver loaded at all.</p>
-  <div id="hwsummary"></div>
-  <div class="row" style="margin-top:.7rem"><button class="ghost" onclick="probeHW()">Re-test now</button></div>
+  <h2>Encoder</h2>
+  <p class="hint">Each one below was tried with a real one-second encode. Being listed by ffmpeg proves
+   nothing - a card that cannot do AV1 still advertises it, and NVENC advertises itself with no driver
+   loaded at all.
+   <button class="ghost" onclick="probeHW()" style="margin-left:.4rem">Re-test now</button></p>
+  <div class="grid" id="hwgrid"></div>
  </div>
- <div class="card"><h2>Encoders</h2><table id="hwtable"></table></div>
+ <div class="card">
+  <h2>Profiles</h2>
+  <p class="hint">A profile is every output choice in one bundle. The one marked in use drives every job;
+   switching is one click. Files already converted are untouched.</p>
+  <div class="grid" id="proflist"></div>
+ </div>
+ <div class="card">
+  <h2 id="profedittitle">New profile</h2>
+  <p class="hint">Only encoders that actually work on this machine are offered, and nothing is saved until a
+   real two-second encode with these exact settings succeeds - the settings that fail are the ones that look
+   perfectly reasonable in a form.</p>
+  <label><span class="lab">Name</span><input type="text" id="p_name" placeholder="e.g. 1080p Space Saver"></label>
+  <div class="two">
+   <label><span class="lab">Encoder</span><select id="p_encoder"></select><small id="p_enchelp"></small></label>
+   <label><span class="lab">Resolution</span><select id="p_res"></select><small id="p_reshelp"></small></label>
+  </div>
+  <label><span class="lab"><span>Quality</span><span class="qnum" id="p_qval">-</span></span>
+   <input type="range" id="p_quality" min="14" max="34" step="1">
+   <div class="scale"><span>smaller files</span><span id="p_qrec"></span><span>better picture</span></div></label>
+  <div class="two">
+   <label><span class="lab">Speed vs size</span><select id="p_preset"></select>
+    <small>Slower settings spend longer to make a smaller file at the same quality.</small></label>
+   <label><span class="lab">Codec profile</span><select id="p_profile"></select>
+    <small>How modern a decoder the file expects.</small></label>
+  </div>
+  <div class="two">
+   <label><span class="lab">Audio</span><select id="p_acodec"></select></label>
+   <label><span class="lab">Channels</span><select id="p_achan"></select>
+    <small>Source keeps a 5.1 mix intact.</small></label>
+  </div>
+  <label id="p_abr_wrap"><span class="lab">Audio bitrate (kbps)</span>
+   <input type="number" id="p_abitrate" min="32" max="640" step="16"></label>
+  <div class="keyout" id="p_testout"></div>
+  <div class="row">
+   <button class="ghost" onclick="testProfile()">Test this profile</button>
+   <button class="act" onclick="saveProfile()">Save</button>
+   <button class="ghost" onclick="resetProfileForm()">Clear</button>
+  </div>
+ </div>
 </section>
 
 <section id="rules">
@@ -202,7 +265,15 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
  // Refresh on arrival rather than showing whatever the last poll left behind.
  if(b.dataset.tab==='queue') refreshQueue().catch(()=>{});
  if(b.dataset.tab==='jobs') refreshJobs().catch(()=>{});
- if(b.dataset.tab==='hardware') loadHW().catch(()=>{});
+ if(b.dataset.tab==='hardware') loadProfiles().then(loadHW).catch(()=>{});
+});
+['p_encoder','p_quality','p_res','p_acodec'].forEach(id=>{
+ document.addEventListener('change',e=>{
+  if(e.target.id==='p_encoder') onEncoderChange(null);
+  if(e.target.id==='p_res') onResChange();
+  if(e.target.id==='p_acodec') onAudioChange();
+ });
+ document.addEventListener('input',e=>{ if(e.target.id==='p_quality') onQualityChange(); });
 });
 
 // ---- the queue: what is running, and what is next in running order -------
@@ -274,6 +345,10 @@ document.addEventListener('click',e=>{
  if(d.browse!==undefined) browse(d.browse);
  if(d.addwatch) addBrowsed();
  if(d.useenc) useEncoder(d.useenc);
+ if(d.useprof) useProfile(d.useprof);
+ if(d.editprof){const p=(PROF.profiles||[]).find(x=>x.id===d.editprof);
+  if(p){editingProfile=p.id;fillProfileForm(p);window.scrollTo(0,document.body.scrollHeight);}}
+ if(d.delprof){const p=(PROF.profiles||[]).find(x=>x.id===d.delprof); if(p) deleteProfile(p.id,p.name);}
  if(d.dropwatch!==undefined) dropWatch(Number(d.dropwatch));
 });
 
@@ -367,31 +442,24 @@ let HW=null;
 async function loadHW(){
  HW=await api('/api/encoders');
  const cur=(HW.encoders||[]).find(e=>e.name===HW.in_use)||{};
- const mismatch=HW.recommended_for_current&&HW.quality!==HW.recommended_for_current;
- $('hwsummary').innerHTML=
-  `<div class="facts" style="margin:0 0 .5rem">
-    <span>GPU <b>${esc(HW.gpu||'none detected')}</b></span>
-    <span>using <b>${esc(HW.in_use)}</b>${cur.hardware?' <span class="tag">hardware</span>':' <span class="tag">software</span>'}</span>
-    <span>quality <b>${HW.quality}</b></span></div>
-   <p class="hint" style="margin:0">${esc(HW.why||'')}</p>`+
-  (mismatch?`<p class="hint" style="color:var(--warn);margin:.5rem 0 0">Quality is ${HW.quality};
-     ${esc(HW.in_use)} is usually run at ${HW.recommended_for_current}. Each encoder has its own scale -
-     the same number is a different picture and a different file size on each.
-     <button class="ghost" onclick="useRecommended()">Use ${HW.recommended_for_current}</button></p>`:'');
+ const act=(PROF.profiles||[]).find(p=>p.active);
+ $('hwhero').innerHTML=
+  `<div><div class="big">${esc(act?act.name:HW.in_use)}</div>
+    <div class="sub">${act?esc(act.encoder)+' &middot; quality '+act.quality+' &middot; '+
+      (act.max_height?act.max_height+'p':'source resolution'):'no profile'}</div></div>
+   <div><div class="big">${esc((HW.gpu||'no GPU').split(',')[0])}</div>
+    <div class="sub">${cur.hardware?'hardware encoding':'software encoding'} &middot; ${esc(HW.why||'')}</div></div>`;
 
- $('hwtable').innerHTML='<tr><th>Encoder</th><th>Codec</th><th>Works here</th><th>Suggested quality</th><th>What it is for</th></tr>'+
-  (HW.encoders||[]).map(e=>{
-   const state=e.available
-     ? '<span class="done">yes</span>'+(e.name===HW.in_use?' <span class="tag stored">in use</span>':'')
-     : `<span class="failed">no</span>`;
-   const pick=e.available&&e.name!==HW.in_use
-     ? `<button class="ghost" data-useenc="${esc(e.name)}">Use this</button>` : '';
-   return `<tr><td>${esc(e.name)}${e.hardware?' <span class="tag">GPU</span>':''}</td>
-    <td>${esc(e.codec||'')}</td><td>${state}</td>
-    <td>${e.recommended_quality??''}${e.sane_range?` <small style="color:var(--dim)">(${e.sane_range[0]}-${e.sane_range[1]})</small>`:''}</td>
-    <td>${esc(e.summary||'')}<br><small style="color:var(--dim)">${esc(e.available?e.detail:e.reason)}</small>
-     <div style="margin-top:.3rem">${pick}</div></td></tr>`;
-  }).join('');
+ $('hwgrid').innerHTML=(HW.encoders||[]).map(e=>
+  `<div class="enc ${e.name===HW.in_use?'on':''} ${e.available?'':'off'}">
+    <div class="top"><span class="nm"><span class="dot ${e.available?'y':'n'}"></span> ${esc(e.name)}</span>
+     ${e.name===HW.in_use?'<span class="using">in use</span>':''}</div>
+    <div class="chips"><span class="chip ${e.hardware?'gpu':'cpu'}">${e.hardware?'GPU':'CPU'}</span>
+     <span class="chip">${esc(e.codec||'')}</span>
+     <span class="chip">suggested q${e.recommended_quality??''}</span></div>
+    <div class="why">${esc(e.summary||'')}</div>
+    <div class="why">${esc(e.available?e.detail:e.reason)}</div>
+   </div>`).join('');
 }
 async function probeHW(){
  say('hwmsg','Re-testing every encoder with a real encode...');
@@ -402,6 +470,112 @@ async function useRecommended(){
  try{await api('/api/settings',{method:'PUT',body:JSON.stringify({quality:HW.recommended_for_current})});
   await loadSettings();await loadHW();say('hwmsg','Quality updated.');}catch(e){say('hwmsg',e.message,true);}
 }
+// ---- encoding profiles ---------------------------------------------------
+let PROF={profiles:[],available_encoders:[]},editingProfile=null;
+const opt=(v,l,sel)=>`<option value="${esc(v)}" ${String(v)===String(sel)?'selected':''}>${esc(l)}</option>`;
+const encOf=name=>PROF.available_encoders.find(e=>e.name===name)||PROF.available_encoders[0]||null;
+
+async function loadProfiles(){
+ PROF=await api('/api/profiles');
+ $('proflist').innerHTML=(PROF.profiles||[]).map(p=>{
+  const res=p.max_height?p.max_height+'p':'source';
+  const aud=p.audio_codec==='copy'?'audio copied'
+    :`AAC ${p.audio_bitrate}k ${p.audio_channels?p.audio_channels+'ch':'source ch'}`;
+  return `<div class="enc ${p.active?'on':''}">
+   <div class="top"><span class="nm">${esc(p.name)}</span>
+    ${p.active?'<span class="using">in use</span>':''}</div>
+   <div class="chips"><span class="chip">${esc(p.encoder)}</span><span class="chip">q${p.quality}</span>
+    <span class="chip">${esc(res)}</span>${p.preset?`<span class="chip">${esc(p.preset)}</span>`:''}
+    ${p.profile?`<span class="chip">${esc(p.profile)}</span>`:''}</div>
+   <div class="why">${esc(aud)}</div>
+   <div class="why">${p.validated_at
+     ? '<span class="done">tested</span> '+esc(p.validated_note||'')
+     : '<span class="failed">never tested</span> '+esc(p.validated_note||'')}</div>
+   <div class="row" style="margin-top:.4rem">
+    ${p.active?'':`<button class="act" data-useprof="${esc(p.id)}">Use</button>`}
+    <button class="ghost" data-editprof="${esc(p.id)}">Edit</button>
+    ${p.active||p.builtin?'':`<button class="ghost danger" data-delprof="${esc(p.id)}">Delete</button>`}
+   </div></div>`;
+ }).join('')||'<p class="hint">No profiles yet.</p>';
+
+ if(!editingProfile) fillProfileForm(null);
+}
+
+function fillProfileForm(p){
+ const encs=PROF.available_encoders;
+ if(!encs.length){$('p_enchelp').textContent='No working encoder found on this machine.';return;}
+ const cur=p||{};
+ $('p_name').value=cur.name||'';
+ $('p_encoder').innerHTML=encs.map(e=>opt(e.name,`${e.name} (${e.codec}${e.hardware?', GPU':', CPU'})`,cur.encoder||encs[0].name)).join('');
+ $('p_res').innerHTML=(PROF.resolutions||[]).map(r=>opt(r.value,r.label,cur.max_height??0)).join('');
+ $('p_acodec').innerHTML=(PROF.audio_codecs||[]).map(a=>opt(a.value,a.label,cur.audio_codec||'aac')).join('');
+ $('p_achan').innerHTML=(PROF.audio_channels||[]).map(a=>opt(a.value,a.label,cur.audio_channels??2)).join('');
+ $('p_abitrate').value=cur.audio_bitrate??192;
+ onEncoderChange(cur);
+ onResChange();onAudioChange();
+ $('profedittitle').textContent=p?('Edit '+p.name):'New profile';
+}
+
+function onEncoderChange(cur){
+ const e=encOf($('p_encoder').value);
+ if(!e) return;
+ $('p_enchelp').textContent=e.summary||'';
+ $('p_preset').innerHTML=(e.presets||[]).map(x=>opt(x.value,x.label,(cur&&cur.preset)||e.default_preset)).join('');
+ $('p_profile').innerHTML=(e.profiles||[]).map(x=>opt(x.value,x.label,(cur&&cur.profile)||e.default_profile)).join('');
+ const [lo,hi]=e.sane_range||[14,34];
+ const q=$('p_quality');
+ // The scale is per encoder: CQ 21 on NVENC and CRF 21 on x264 are different
+ // pictures at different sizes, so the slider re-ranges rather than pretending
+ // one number means one thing everywhere.
+ q.min=Math.max(1,lo-4);q.max=hi+4;
+ q.value=(cur&&cur.quality)||e.recommended_quality;
+ $('p_qrec').textContent='suggested '+e.recommended_quality;
+ onQualityChange();
+}
+function onQualityChange(){$('p_qval').textContent=$('p_quality').value;}
+function onResChange(){
+ const r=(PROF.resolutions||[]).find(x=>String(x.value)===$('p_res').value);
+ $('p_reshelp').textContent=r?r.help:'';
+}
+function onAudioChange(){$('p_abr_wrap').style.display=$('p_acodec').value==='copy'?'none':'block';}
+
+function profileBody(){
+ return {name:$('p_name').value,encoder:$('p_encoder').value,quality:Number($('p_quality').value),
+  preset:$('p_preset').value,profile:$('p_profile').value,max_height:Number($('p_res').value),
+  audio_codec:$('p_acodec').value,audio_bitrate:Number($('p_abitrate').value),
+  audio_channels:Number($('p_achan').value)};
+}
+function resetProfileForm(){editingProfile=null;$('p_testout').style.display='none';fillProfileForm(null);}
+
+async function testProfile(){
+ const box=$('p_testout');
+ box.style.display='block';box.innerHTML='Encoding two seconds of test video with these exact settings...';
+ try{
+  const r=await api('/api/profiles/test',{method:'POST',body:JSON.stringify(profileBody())});
+  box.innerHTML=(r.ok?'<b class="done">Works.</b> ':'<b class="failed">Does not work.</b> ')+esc(r.detail)+
+   `<br><code>${esc(r.command)}</code>`;
+ }catch(e){box.innerHTML='<b class="failed">Test failed.</b> '+esc(e.message);}
+}
+async function saveProfile(){
+ try{
+  const r=await api('/api/profiles'+(editingProfile?'/'+editingProfile:''),
+    {method:'POST',body:JSON.stringify(profileBody())});
+  editingProfile=null;await loadProfiles();await loadHW();
+  say('hwmsg','Saved - '+r.detail);
+ }catch(e){say('hwmsg',e.message,true);}
+}
+async function useProfile(id){
+ try{const r=await api('/api/profiles/'+id+'/activate',{method:'POST',body:'{}'});
+  await loadProfiles();await loadHW();
+  say('hwmsg',`Now using "${r.profile.name}". Jobs already running finish on the old one.`);
+ }catch(e){say('hwmsg',e.message,true);}
+}
+async function deleteProfile(id,name){
+ if(!confirm('Delete the profile "'+name+'"?'))return;
+ try{await api('/api/profiles/'+id,{method:'DELETE'});await loadProfiles();say('hwmsg','Deleted.');}
+ catch(e){say('hwmsg',e.message,true);}
+}
+
 async function useEncoder(name){
  const e=(HW.encoders||[]).find(x=>x.name===name)||{};
  if(!confirm(`Use ${name}?\n\nIts quality scale differs, so the quality will also be set to `+
@@ -507,7 +681,8 @@ async function tick(){
 }
 (async function(){
  resetArrForm();
- try{await refreshHealth();await loadSettings();await loadArrs();await loadKeys();await loadHW();
+ try{await refreshHealth();await loadSettings();await loadArrs();await loadKeys();
+  await loadProfiles();await loadHW();
   await refreshQueue();await refreshJobs();
   browse((SET.watch_roots||[])[0]||'');
   timer=setInterval(tick,4000);
