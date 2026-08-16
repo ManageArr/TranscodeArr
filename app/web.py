@@ -95,6 +95,13 @@ PAGE = r"""<!doctype html><meta charset="utf-8"><title>TranscodeArr</title>
  .scale{display:flex;justify-content:space-between;color:var(--dim);font-size:.72rem;margin-top:.15rem}
  .qnum{font-size:1.3rem;color:var(--accent);font-weight:600;font-variant-numeric:tabular-nums}
  .two{display:grid;grid-template-columns:repeat(auto-fit,minmax(14rem,1fr));gap:0 1rem}
+ .meters{display:grid;grid-template-columns:repeat(auto-fit,minmax(11rem,1fr));gap:.9rem}
+ .meter .mtop{display:flex;justify-content:space-between;align-items:baseline;font-size:.78rem;color:var(--dim)}
+ .meter .mval{font-size:1.05rem;color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
+ .meter .bar{margin-top:.3rem}
+ .meter .sub{color:var(--dim);font-size:.72rem;margin-top:.25rem;line-height:1.3}
+ .bar i.warn{background:linear-gradient(90deg,#b45309,var(--warn))}
+ .bar i.bad{background:linear-gradient(90deg,#991b1b,var(--bad))}
  td.pos{color:var(--dim);width:2.5rem;text-align:right;font-variant-numeric:tabular-nums}
  tr.next td{color:var(--accent)}
 </style>
@@ -110,6 +117,10 @@ PAGE = r"""<!doctype html><meta charset="utf-8"><title>TranscodeArr</title>
 </nav>
 
 <section id="queue" class="on">
+ <div class="card"><h2>Host</h2>
+  <p class="hint" id="hostnote">&nbsp;</p>
+  <div class="meters" id="host"></div>
+ </div>
  <div class="card now" id="nowcard"><h2>Converting now</h2><div id="now"></div></div>
  <div class="card">
   <h2>Up next</h2>
@@ -263,7 +274,7 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
  document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('on',x===b));
  document.querySelectorAll('section').forEach(s=>s.classList.toggle('on',s.id===b.dataset.tab));
  // Refresh on arrival rather than showing whatever the last poll left behind.
- if(b.dataset.tab==='queue') refreshQueue().catch(()=>{});
+ if(b.dataset.tab==='queue'){refreshQueue().catch(()=>{});refreshHost().catch(()=>{});}
  if(b.dataset.tab==='jobs') refreshJobs().catch(()=>{});
  if(b.dataset.tab==='hardware') loadProfiles().then(loadHW).catch(()=>{});
 });
@@ -288,6 +299,44 @@ function dur(s){
  if(m) return `${m}m ${s%60}s`;
  return `${s}s`;
 }
+const gb=b=>(b/1073741824).toFixed(1)+' GB';
+function meter(label,value,pct,sub){
+ const p=pct==null?null:Math.max(0,Math.min(100,pct));
+ const cls=p==null?'':p>=90?'bad':p>=75?'warn':'';
+ return `<div class="meter"><div class="mtop"><span>${esc(label)}</span><span class="mval">${esc(value)}</span></div>
+  <div class="bar"><i class="${cls}" style="width:${p==null?0:p}%"></i></div>
+  <div class="sub">${sub||''}</div></div>`;
+}
+async function refreshHost(){
+ let s;
+ try{s=await api('/api/system');}catch(e){return;}
+ $('hostnote').textContent=s.note||'';
+ const out=[];
+ if(s.cpu) out.push(meter('CPU',s.cpu.percent==null?'-':s.cpu.percent+'%',s.cpu.percent,
+   esc([s.cpu.model,(s.cpu.cores?s.cpu.cores+' threads':'')].filter(Boolean).join(' &middot; '))));
+ if(s.load) out.push(meter('Load',s.load.one.toFixed(2),s.load.per_core*100,
+   `${s.load.per_core} per thread &middot; 5m ${s.load.five.toFixed(2)} &middot; 15m ${s.load.fifteen.toFixed(2)}`
+   +(s.load.per_core>1?' <span style="color:var(--warn)">- more work queued than threads</span>':'')));
+ if(s.memory) out.push(meter('Memory',s.memory.percent+'%',s.memory.percent,
+   `${gb(s.memory.used)} of ${gb(s.memory.total)} used &middot; ${gb(s.memory.available)} available`));
+ if(s.gpu){
+  out.push(meter('GPU',(s.gpu.percent??'-')+'%',s.gpu.percent,
+   `${esc(s.gpu.name||'')}${s.gpu.temperature_c!=null?' &middot; '+s.gpu.temperature_c+'&deg;C':''}`));
+  const sess=s.gpu.encoder_sessions;
+  out.push(meter('Encoder',sess==null?'-':sess+(sess===1?' session':' sessions'),
+   sess==null?null:Math.min(100,sess*25),
+   (s.gpu.encoder_fps?s.gpu.encoder_fps+' fps encoded':'idle')
+   +` &middot; ${s.converting} job${s.converting===1?'':'s'} of ${s.max_concurrent} allowed`));
+  if(s.gpu.memory_total_mb) out.push(meter('GPU memory',
+    Math.round(s.gpu.memory_used_mb)+' MB',
+    100*s.gpu.memory_used_mb/s.gpu.memory_total_mb,
+    `of ${Math.round(s.gpu.memory_total_mb)} MB`));
+ } else if(s.other_gpu){
+  out.push(meter('GPU','present',null,esc(s.other_gpu)+' - utilisation needs vendor tools this container does not carry'));
+ }
+ $('host').innerHTML=out.join('');
+}
+
 async function refreshQueue(){
  const q=await api('/queue?limit=200');
  const r=(q.running||[])[0];
@@ -675,7 +724,7 @@ async function tick(){
   await refreshHealth();
   // Only refresh the visible tab: polling the history and the queue together
   // every few seconds is two queries nobody is looking at.
-  if($('queue').classList.contains('on')) await refreshQueue();
+  if($('queue').classList.contains('on')){await refreshQueue();await refreshHost();}
   else if($('jobs').classList.contains('on')) await refreshJobs();
  }catch(e){}
 }
@@ -683,7 +732,7 @@ async function tick(){
  resetArrForm();
  try{await refreshHealth();await loadSettings();await loadArrs();await loadKeys();
   await loadProfiles();await loadHW();
-  await refreshQueue();await refreshJobs();
+  await refreshQueue();await refreshHost();await refreshJobs();
   browse((SET.watch_roots||[])[0]||'');
   timer=setInterval(tick,4000);
  }catch(e){if(String(e.message)!=='unauthorised')$('summary').textContent=e.message;}

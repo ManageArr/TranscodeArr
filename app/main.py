@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import arrs as arr_client
 import core
 import store
+import system
 import web
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -60,7 +61,7 @@ def cfg() -> dict:
 
 # Bump this with the image tag. /healthz reporting a version that is not the
 # running build makes the one field whose job is "what is deployed" a liar.
-VERSION = "0.7.1"
+VERSION = "0.8.0"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -933,6 +934,12 @@ class Handler(BaseHTTPRequestHandler):
                 "max_height": c["max_height"],
                 "sane_range": core.ENCODER_INFO.get(ENCODER, {}).get("sane", [18, 30]),
             })
+        if self.path == "/api/system":
+            snap = system.snapshot()
+            with _jobs_lock:
+                snap["converting"] = len(_running)
+            snap["max_concurrent"] = cfg()["max_concurrent"]
+            return self._send(200, snap)
         if self.path == "/api/profiles":
             available = [p["name"] for p in ENCODER_PROBES if p["available"]]
             return self._send(200, {

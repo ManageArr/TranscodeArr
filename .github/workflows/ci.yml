@@ -18,4 +18,4 @@ jobs:
       - name: Every module imports cleanly
         # A syntax error in a module the tests do not import would otherwise
         # only surface when the container starts on the NAS.
-        run: python -c "import sys; sys.path.insert(0,'app'); import core, store, arrs, web, main"
+        run: python -c "import sys; sys.path.insert(0,'app'); import core, store, arrs, system, web, main"
