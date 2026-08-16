@@ -158,11 +158,11 @@ class Concurrency(unittest.TestCase):
             with self.assertRaises(ValueError):
                 main.store.parse_value(spec, bad)
 
-    def test_cancelling_a_job_that_is_not_running_says_so(self):
+    def test_canceling_a_job_that_is_not_running_says_so(self):
         self.assertFalse(main.cancel_running("nope"))
 
     def test_cancel_targets_one_job_not_whichever_happens_to_be_running(self):
-        # With a single global flag, cancelling job A stopped whatever was
+        # With a single global flag, canceling job A stopped whatever was
         # running - which with more than one worker is usually job B.
         with main._jobs_lock:
             main._running.clear()

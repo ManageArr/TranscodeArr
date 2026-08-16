@@ -42,7 +42,12 @@ def is_within(path: str, roots: list[str]) -> bool:
     norm = os.path.normcase(os.path.normpath(path))
     for root in roots:
         r = os.path.normcase(os.path.normpath(root))
-        if norm == r or norm.startswith(r + os.sep):
+        # rstrip because normpath leaves the filesystem root AS a separator: "/"
+        # stays "/", so a bare `r + os.sep` asks whether the path starts with
+        # "//" and nothing is ever inside "/". Every other root loses its
+        # trailing separator to normpath already, so this changes nothing for
+        # them - only the root directory, where the answer was wrong.
+        if norm == r or norm.startswith(r.rstrip(os.sep) + os.sep):
             return True
     return False
 
@@ -116,6 +121,50 @@ def plan_names(source: str, target_ext: str = ".mp4") -> JobNames:
 
 
 # ---------------------------------------------------------------------------
+# Where a replaced source is kept
+# ---------------------------------------------------------------------------
+
+# Dot-prefixed twice over on purpose: the media server ignores dot-directories,
+# and so does the watcher's own walk, so a trashed source is never served and
+# never picked up for a second conversion.
+TRASH_DIRNAME = ".transcodearr-trash"
+
+
+def trash_override_is_unsafe(override: str, roots: list[str]) -> bool:
+    """Would this TRASH_DIR put the trash at or above a media root?
+
+    The daemon prunes by walking every trash root and unlinking whatever is past
+    the retention window, so a trash root that CONTAINS the library is a
+    scheduled delete of the library. `/media/trash` is fine and supported;
+    `/media` is not. The direction matters: asking the other question - is the
+    override inside a root - refuses the supported case and waves the fatal one
+    through.
+    """
+    return bool(override) and any(is_within(root, [override]) for root in roots)
+
+
+def trash_destination(source: str, roots: list[str], override: str = "") -> str:
+    """Where this source's safety copy belongs.
+
+    Under the media root that CONTAINS the source, because same mount means the
+    move is a rename that cannot half-finish. The old default put it in the
+    config volume, which on a NAS is a different bind mount, so every replaced
+    source became a full byte copy: 127 GB of them were measured sitting in the
+    config share of the live deployment, next to the SQLite database. TRASH_DIR
+    overrides the location and keeps the media-root-relative mirroring either
+    way, so recovering a file is still a move back to where it came from.
+    """
+    for root in roots:
+        if is_within(source, [root]):
+            return os.path.join(override or os.path.join(root, TRASH_DIRNAME),
+                                os.path.relpath(source, root))
+    # Outside every root the mirroring has no anchor, so keep the copy beside
+    # the file - still one filesystem, which is the property that matters.
+    return os.path.join(override or os.path.join(os.path.dirname(source), TRASH_DIRNAME),
+                        os.path.basename(source))
+
+
+# ---------------------------------------------------------------------------
 # Verification - the check whose absence truncated a library
 # ---------------------------------------------------------------------------
 
@@ -174,7 +223,7 @@ def should_skip_transcode(probe: Probe, container_ext: str) -> bool:
     """Already-fine files are revealed, not re-encoded.
 
     Placeholder for the richer remux rule (H.264-in-anything -> -c copy);
-    v1 keeps it to "an .mp4 needs no transcode", which is the behaviour the
+    v1 keeps it to "an .mp4 needs no transcode", which is the behavior the
     original script had.
     """
     return container_ext.lower() == ".mp4"
@@ -205,6 +254,115 @@ def is_stable(size_then: int | None, size_now: int, seconds_between: float, need
     mtime-age rule passes the instant the first byte lands.
     """
     return size_then is not None and size_now == size_then and seconds_between >= needed
+
+
+def in_retry_cooldown(last_failure_at: float | None, now: float, cooldown_hours: float) -> bool:
+    """Should the WATCHER leave a path that recently failed alone?
+
+    Queued work is deduped per path, but a finished failure is not: a file that
+    cannot be converted at all - a truncated source, audio nothing here can
+    read - was re-queued on the next scan and every scan after it, burning a
+    full ffmpeg attempt on the GPU every few minutes forever. 0 hours retries as
+    soon as the watcher sees it again; queueing a file from the API is somebody
+    asking for it now and ignores this either way.
+    """
+    if not cooldown_hours or last_failure_at is None:
+        return False
+    return now - last_failure_at < cooldown_hours * 3600
+
+
+def is_stalled(seconds_since_progress: float, timeout_minutes: float) -> bool:
+    """Has an encode gone quiet for long enough to be dead rather than slow?
+
+    Measured against ffmpeg's -progress output, which is emitted roughly every
+    500ms of WALL clock however slow the encode itself runs - so silence means
+    the process is wedged, typically on an SMB/NFS share that went away, and
+    never that the file is big. 0 disables the watchdog.
+    """
+    if not timeout_minutes:
+        return False
+    return seconds_since_progress > timeout_minutes * 60
+
+
+# ---------------------------------------------------------------------------
+# The conversion window - when the worker may CLAIM a job
+# ---------------------------------------------------------------------------
+#
+# The window gates the CLAIM and never terminates a running encode. A closing
+# window drains: the in-flight job finishes, is verified and revealed like any
+# other, and nothing new is claimed. Killing at the boundary would throw away a
+# 40GB remux at 90% and buy back the same hours the next night.
+#
+# The watcher goes on queueing while the window is shut, because queueing costs
+# nothing and it means the queue is already built when the window opens. A
+# paused box with a growing queue is working, not broken.
+#
+# These take minutes since LOCAL midnight, which the caller derives from the TZ
+# the container was given. That is the trap worth stating twice: the container
+# is UTC by default and the NAS this runs on is EDT, so a window typed as
+# 01:00-06:00 runs at 21:00 local unless TZ is set - four hours wrong, every
+# night, with nothing on screen that looks wrong.
+
+_WINDOW_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$")
+
+
+def parse_window(text: str) -> tuple[int, int] | None:
+    """"HH:MM-HH:MM" as (start, end) minutes since midnight. None means always.
+
+    Malformed text raises instead of degrading to "always", because that is the
+    expensive direction to be wrong in: a typo in the one setting whose whole
+    job is "do not encode while I am watching television" would become a box
+    that encodes at 8pm and never says why.
+    """
+    if not text or not text.strip():
+        return None
+    match = _WINDOW_RE.match(text)
+    if not match:
+        raise ValueError(
+            f"'{text.strip()}' is not a time window. Write two 24-hour times joined by a hyphen, "
+            "for example 22:00-06:00, or leave it empty to convert at any hour."
+        )
+    start_h, start_min, end_h, end_min = (int(g) for g in match.groups())
+    if start_h > 23 or end_h > 23 or start_min > 59 or end_min > 59:
+        raise ValueError(f"'{text.strip()}' has a time outside 00:00-23:59.")
+    return start_h * 60 + start_min, end_h * 60 + end_min
+
+
+def within_window(now_minutes: int, window: tuple[int, int] | None) -> bool:
+    """Is this local minute inside the window? Start inclusive, end exclusive.
+
+    Spanning midnight is the normal case here rather than the edge one - "encode
+    overnight" is 22:00-06:00 - so the naive `start <= now < end` would hold that
+    window shut for all twenty-four hours while the queue grew forever.
+
+    Equal start and end is a FULL day, not a zero-length window. Empty text
+    already means always, so reading it as zero-length would give this setting a
+    second way to say "never convert" and no way at all to say "from 02:00 round
+    to 02:00" - and "never" belongs to the Stop button, which says so on screen,
+    not to a window that reads like a schedule.
+    """
+    if window is None:
+        return True
+    start, end = window
+    if start == end:
+        return True
+    if start < end:
+        return start <= now_minutes < end
+    return now_minutes >= start or now_minutes < end
+
+
+def next_window_change(now_minutes: int, window: tuple[int, int] | None) -> int:
+    """Minutes until the window next opens or closes. 0 when it never will.
+
+    So the UI can say "starts converting in 3h 12m" rather than only "paused".
+    A paused worker with a queue that keeps climbing is the most alarming thing
+    this feature does, and the countdown is what makes it read as a schedule
+    instead of as a worker that has died quietly.
+    """
+    if window is None or window[0] == window[1]:
+        return 0
+    target = window[1] if within_window(now_minutes, window) else window[0]
+    return (target - now_minutes) % 1440
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +573,92 @@ def recommended_quality(encoder: str) -> int:
     return int(info["recommended"]) if info else 23
 
 
+# The profiles TranscodeArr ships with: one per encoder, named for the choice
+# someone is actually making rather than for the codec they have never heard of.
+# Only the name lives here - quality, preset and codec profile are read from
+# ENCODER_INFO and ENCODER_OPTIONS below, because a second hardcoded copy of
+# "23" is a number that drifts from the encoder's own recommendation the first
+# time anybody tunes one and not the other.
+SHIPPED_PROFILE_NAMES: dict[str, str] = {
+    "h264_nvenc": "Balanced, on the GPU",
+    "h264_qsv": "Quick Sync, on Intel graphics",
+    "hevc_nvenc": "Half the size, on the GPU",
+    "libx264": "Smallest H.264, on the CPU",
+    "libx265": "Smallest of all, on the CPU",
+}
+
+
+def shipped_profile(encoder: str) -> dict:
+    """The stored fields for one shipped profile - derived, never duplicated.
+
+    Audio is AAC stereo for all five: it is the combination every client can
+    direct play, and someone who wants their 5.1 kept has to say so, because a
+    silent downmix is the one audio mistake nobody notices until the receiver
+    stays quiet.
+    """
+    opts = ENCODER_OPTIONS.get(encoder, {})
+    return {
+        "name": SHIPPED_PROFILE_NAMES[encoder],
+        "encoder": encoder,
+        "quality": recommended_quality(encoder),
+        "preset": opts.get("default_preset", ""),
+        "profile": opts.get("default_profile", ""),
+        "max_height": 0,
+        "audio_codec": "aac",
+        "audio_bitrate": 192,
+        "audio_channels": 2,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Throttling - keeping one encode from starving the media server
+# ---------------------------------------------------------------------------
+
+
+def throttle_prefix(nice: int, idle_io: bool) -> list[str]:
+    """The argv that wraps ffmpeg with nice and ionice. Empty when neither is on.
+
+    A list and never a shell string: everything downstream of this prefix is an
+    operator-supplied path, and a string would need quoting to survive a file
+    name with a space in it - which is most of them.
+
+    ionice gets -t so an IO scheduler that refuses the idle class execs ffmpeg
+    anyway. Without it, switching a throttle on would fail every job at spawn
+    with a nonzero exit and no message resembling an encoding error.
+
+    Niceness is clamped to 0-19, only ever nicer. A negative value asks for MORE
+    CPU than the media server this is supposed to yield to, which is the exact
+    opposite of why the setting exists, and it is the one direction that needs
+    privilege the container may genuinely have.
+    """
+    prefix: list[str] = []
+    if idle_io:
+        prefix += ["ionice", "-t", "-c", "3"]
+    level = max(0, min(19, int(nice or 0)))
+    if level:
+        prefix += ["nice", "-n", str(level)]
+    return prefix
+
+
+def thread_args(encoder: str, threads: int) -> list[str]:
+    """-threads for the SOFTWARE encoders, empty for the hardware ones.
+
+    libx264 and libx265 take every core they can see, which is what makes a
+    CPU-only box stutter mid-film while a job runs. NVENC and QSV do the work on
+    the chip, where this flag caps a few coordination threads and buys nothing,
+    so passing it there would be a knob that only appears to do something.
+
+    Which encoders are software is read from ENCODER_INFO rather than listed
+    again, because a second copy of that list drifts the first time an encoder
+    is added to one of them and not the other.
+    """
+    info = ENCODER_INFO.get(encoder)
+    count = int(threads or 0)
+    if count < 1 or not info or info["hardware"]:
+        return []
+    return ["-threads", str(count)]
+
+
 def build_ffmpeg_args(
     template: str,
     source: str,
@@ -426,6 +670,7 @@ def build_ffmpeg_args(
     max_height: int = 0,
     audio: str = "-c:a aac -b:a 192k -ac 2",
     hwaccel: list[str] | None = None,
+    threads: list[str] | None = None,
 ) -> list[str]:
     """argv for one encode attempt.
 
@@ -449,6 +694,12 @@ def build_ffmpeg_args(
         *(hwaccel or []),
         "-i", source,
         *rendered.split(),
+        # Given by the caller as thread_args(encoder, n) exactly as hwaccel is,
+        # because the encoder name is what decides whether it means anything and
+        # this function is handed a template rather than an encoder. It sits
+        # after -i on purpose: the same flag before the input caps the DECODER,
+        # which is not the half pinning the cores.
+        *(threads or []),
         "-progress", "pipe:1",
         part,
     ]

@@ -1,0 +1,100 @@
+# A git tag is the only thing that publishes an image, so every artifact on
+# GHCR corresponds to a commit someone can check out and read.
+#
+# Actions are pinned to mutable major tags rather than commit SHAs. SHA pinning
+# is deferred until the SHAs can be resolved and verified online.
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Tests
+        # A tag can be placed on any commit, including one CI never saw. This
+        # container deletes nothing, but it does replace real media in place,
+        # so the safety rules get to run once more before anyone can pull it.
+        run: python -m unittest discover tests -v
+
+      - name: Tag matches the version the image will report
+        # Reads main.VERSION the way the running container does, with
+        # TRANSCODEARR_VERSION unset so the built-in fallback is what answers.
+        # An image tagged 0.9.1 whose /healthz says 0.9.0 turns the one field
+        # that answers "what is deployed" into a liar, and it is only ever found
+        # by someone debugging the wrong build.
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          fallback=$(python -c "import sys; sys.path.insert(0,'app'); import main; print(main.VERSION)")
+          if [ "$tag" != "$fallback" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match app/main.py VERSION $fallback - bump the constant or fix the tag"
+            exit 1
+          fi
+
+      # arm64 is emulated through binfmt here. debian:bookworm-slim and the
+      # jellyfin apt repo both publish arm64, but this image has never been run
+      # on an arm64 host - the build passing is not the same as it working.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      # The default GITHUB_TOKEN can write packages in its OWN owner's namespace,
+      # which is this org - no PAT to store or rotate. github.actor is whoever
+      # pushed the tag; GHCR only checks the password, so any real user works.
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # Lowercase, always. The org is spelled ManageArr but GHCR rejects an
+          # uppercase letter anywhere in an image reference, so a name typed the
+          # way the org signs itself fails at push time and only at push time.
+          # A brand new GHCR package is created PRIVATE even from a public repo:
+          # after the first tag lands, set it to Public once in the package
+          # settings, or every docker pull answers "denied" to anyone not
+          # signed in.
+          images: ghcr.io/managearr/transcodearr
+          # :latest comes from the default flavor (latest=auto): it follows the
+          # newest plain semver tag and skips prereleases like v1.0.0-rc1, and
+          # the two short tags below are skipped for prereleases too.
+          # {{major}} stayed out while this was pre-1.0, where a :0 tag spanning
+          # 0.9 to 0.10 would have walked itself across breaking changes. From
+          # 1.0.0 that is exactly what a major promises not to do, so :1 is now
+          # the tag worth pinning to and the one people will reach for.
+          # {{version}} stays first: metadata-action reports the first tag as
+          # steps.meta.outputs.version, and that feeds the VERSION build-arg
+          # below. Reorder these and /healthz starts reporting "1".
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # VERSION is the tag itself, minus the v: the Dockerfile turns it into
+          # ENV TRANSCODEARR_VERSION, which is what /healthz reports. REVISION
+          # is the other ARG the Dockerfile declares - left unpassed it defaults
+          # to "unknown" and the image's org.opencontainers.image.revision label
+          # stops naming the commit anyone can check out and read, which is the
+          # whole reason only a tag publishes.
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            REVISION=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

@@ -8,7 +8,7 @@ specific to special-case.
 
 Two real exceptions, both handled by degrading rather than guessing:
 
-* Some LXC/LXD hosts mount **lxcfs**, which virtualises those files to show
+* Some LXC/LXD hosts mount **lxcfs**, which virtualizes those files to show
   the container's own limits instead of the host's. The numbers stay
   meaningful, they just describe a smaller machine, so nothing breaks.
 * The **GPU** is the genuinely host-specific part, because it depends on how
@@ -165,7 +165,7 @@ def gpu() -> dict | None:
 
 
 def other_gpu() -> str | None:
-    """Intel/AMD present? Named, not measured - reading their utilisation needs
+    """Intel/AMD present? Named, not measured - reading their utilization needs
     tools and privileges a media worker has no business holding."""
     try:
         if os.path.isdir("/dev/dri") and os.listdir("/dev/dri"):

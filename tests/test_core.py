@@ -74,6 +74,28 @@ class PlanNames(unittest.TestCase):
         self.assertEqual(n.visible, self.j("Movie.mp4"))
 
 
+class TrashOverride(unittest.TestCase):
+    """prune_trash unlinks everything past the retention window under every
+    trash root, so a trash root that contains the library deletes the library."""
+
+    ROOTS = ["/media", "/media2"]
+
+    def test_a_media_root_itself_is_refused(self):
+        self.assertTrue(core.trash_override_is_unsafe("/media", self.ROOTS))
+
+    def test_a_parent_of_a_media_root_is_refused(self):
+        self.assertTrue(core.trash_override_is_unsafe("/", self.ROOTS))
+
+    def test_a_folder_inside_a_media_root_is_the_supported_case(self):
+        self.assertFalse(core.trash_override_is_unsafe("/media/trash", self.ROOTS))
+
+    def test_a_folder_off_the_media_mounts_is_allowed(self):
+        self.assertFalse(core.trash_override_is_unsafe("/config/trash", self.ROOTS))
+
+    def test_no_override_means_the_default(self):
+        self.assertFalse(core.trash_override_is_unsafe("", self.ROOTS))
+
+
 class VerifyOutput(unittest.TestCase):
     """The check whose absence truncated a real library."""
 
@@ -114,6 +136,139 @@ class Stability(unittest.TestCase):
         self.assertFalse(core.is_stable(1000, 1000, 60, 120))   # not long enough
         self.assertFalse(core.is_stable(1000, 2000, 300, 120))  # still growing
         self.assertFalse(core.is_stable(None, 1000, 999, 120))  # never seen before
+
+
+class ConvertWindow(unittest.TestCase):
+    """When the box is allowed to start converting.
+
+    Spanning midnight is the case this has to get right, because "overnight" is
+    the only window anybody actually types. The naive start <= now < end holds
+    22:00-06:00 shut for all twenty-four hours while the queue grows forever,
+    and nothing on screen looks wrong while it happens.
+    """
+
+    def test_a_window_that_spans_midnight_is_open_across_midnight(self):
+        window = core.parse_window("22:00-06:00")
+        self.assertEqual(window, (1320, 360))
+        for hour, minute, expected in ((23, 30, True), (2, 0, True), (12, 0, False), (6, 30, False)):
+            self.assertEqual(core.within_window(hour * 60 + minute, window), expected, (hour, minute))
+
+    def test_a_plain_window_is_still_a_plain_window(self):
+        window = core.parse_window("01:00-06:00")
+        self.assertTrue(core.within_window(3 * 60, window))
+        self.assertFalse(core.within_window(23 * 60, window))
+        self.assertFalse(core.within_window(0, window))
+
+    def test_the_start_is_inclusive_and_the_end_is_exclusive(self):
+        # Both ends inclusive would run one minute into the morning every day,
+        # and both exclusive loses the minute the window is meant to open on.
+        window = core.parse_window("22:00-06:00")
+        self.assertFalse(core.within_window(1319, window))
+        self.assertTrue(core.within_window(1320, window))
+        self.assertTrue(core.within_window(359, window))
+        self.assertFalse(core.within_window(360, window))
+
+    def test_a_typo_raises_instead_of_quietly_meaning_always(self):
+        # The expensive direction to be wrong in: the one setting whose job is
+        # "do not encode while I am watching television" becoming a box that
+        # encodes at 8pm and never says why.
+        for bad in ("2200-0600", "22:00", "22:00-", "24:00-06:00", "22:00-06:99",
+                    "10pm-6am", "22:00 06:00", "22:00_06:00", "always"):
+            with self.assertRaises(ValueError, msg=f"{bad!r} was accepted"):
+                core.parse_window(bad)
+
+    def test_the_refusal_is_written_to_be_shown_to_a_person(self):
+        with self.assertRaises(ValueError) as raised:
+            core.parse_window("10pm to 6am")
+        self.assertIn("22:00-06:00", str(raised.exception))
+
+    def test_empty_is_the_only_way_to_say_always(self):
+        for text in ("", "   ", "\t"):
+            self.assertIsNone(core.parse_window(text))
+        for minute in (0, 13 * 60, 1439):
+            self.assertTrue(core.within_window(minute, None))
+
+    def test_equal_ends_are_a_full_day_and_never_a_way_to_say_never(self):
+        # Empty already means always, so a second reading of "never" would leave
+        # no way to say "from 02:00 round to 02:00" - and never belongs to the
+        # Stop button, which says so on screen.
+        window = core.parse_window("02:00-02:00")
+        for minute in range(0, 1440, 37):
+            self.assertTrue(core.within_window(minute, window), minute)
+
+    def test_the_countdown_points_at_the_next_edge(self):
+        window = core.parse_window("22:00-06:00")
+        self.assertEqual(core.next_window_change(18 * 60 + 30, window), 3 * 60 + 30)  # until it opens
+        self.assertEqual(core.next_window_change(23 * 60, window), 7 * 60)            # until it closes
+
+    def test_zero_is_reserved_for_a_window_that_will_never_change(self):
+        # The UI reads 0 as "nothing is scheduled". One minute of the day that
+        # answered 0 by accident would print "opens in 0m" at exactly that
+        # minute, every day, and read as a stuck countdown.
+        self.assertEqual(core.next_window_change(0, None), 0)
+        self.assertEqual(core.next_window_change(0, core.parse_window("02:00-02:00")), 0)
+        for text in ("22:00-06:00", "01:00-06:00", "00:00-23:59", "23:59-00:01"):
+            window = core.parse_window(text)
+            for minute in range(1440):
+                left = core.next_window_change(minute, window)
+                self.assertTrue(1 <= left <= 1440, (text, minute, left))
+
+
+class Throttling(unittest.TestCase):
+    """Yielding to the media server this box exists to feed."""
+
+    def test_asking_for_neither_wraps_nothing(self):
+        self.assertEqual(core.throttle_prefix(0, False), [])
+
+    def test_ionice_gets_t_so_a_refused_class_still_execs_ffmpeg(self):
+        # Without -t, ionice exits nonzero on a scheduler with no idle class and
+        # every job dies at spawn with a message that looks nothing like an
+        # encoding error - switching on a throttle would stop the queue dead.
+        self.assertEqual(core.throttle_prefix(0, True), ["ionice", "-t", "-c", "3"])
+
+    def test_niceness_is_only_ever_nicer(self):
+        # A negative value asks for MORE CPU than the media server, which is the
+        # opposite of the setting's whole reason for existing.
+        self.assertEqual(core.throttle_prefix(-5, False), [])
+        self.assertEqual(core.throttle_prefix(None, False), [])
+        self.assertEqual(core.throttle_prefix(99, False), ["nice", "-n", "19"])
+        self.assertEqual(core.throttle_prefix(10, False), ["nice", "-n", "10"])
+
+    def test_both_together_leave_ffmpeg_at_the_end(self):
+        # Each of these execs the next in place, so the PID Popen holds is still
+        # ffmpeg - which is what keeps cancel and the stall watchdog working.
+        self.assertEqual(core.throttle_prefix(10, True),
+                         ["ionice", "-t", "-c", "3", "nice", "-n", "10"])
+
+    def test_only_the_software_encoders_take_a_thread_cap(self):
+        # On NVENC and QSV the work is on the chip; -threads caps a few
+        # coordination threads and buys nothing, so it would be a knob that only
+        # appears to do something.
+        for encoder in core.ENCODER_ORDER:
+            expected = [] if core.ENCODER_INFO[encoder]["hardware"] else ["-threads", "2"]
+            self.assertEqual(core.thread_args(encoder, 2), expected, encoder)
+
+    def test_no_cap_asked_for_means_no_flag_at_all(self):
+        for count in (0, None, -1):
+            self.assertEqual(core.thread_args("libx264", count), [], count)
+        self.assertEqual(core.thread_args("av1_qsv", 4), [])  # an encoder we do not ship
+
+    def test_the_thread_cap_lands_between_the_input_and_the_output(self):
+        # Before -i it caps the DECODER and the encoder still takes every core,
+        # which is a throttle that reads as switched on and does nothing.
+        args = core.build_ffmpeg_args(core.DEFAULT_TEMPLATES["libx265"], "/m/x.mkv", "/m/.x.tapart.mp4",
+                                      24, False, threads=core.thread_args("libx265", 3))
+        self.assertGreater(args.index("-threads"), args.index("-i"))
+        self.assertEqual(args[args.index("-threads") + 1], "3")
+        self.assertEqual(args[-1], "/m/.x.tapart.mp4")
+
+    def test_an_uncapped_job_gets_exactly_the_command_it_always_did(self):
+        template = core.DEFAULT_TEMPLATES["libx265"]
+        base = core.build_ffmpeg_args(template, "/m/x.mkv", "/m/.x.tapart.mp4", 24, False)
+        for threads in (None, [], core.thread_args("h264_nvenc", 4)):
+            self.assertEqual(
+                core.build_ffmpeg_args(template, "/m/x.mkv", "/m/.x.tapart.mp4", 24, False, threads=threads),
+                base)
 
 
 class FfmpegArgs(unittest.TestCase):

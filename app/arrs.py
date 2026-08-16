@@ -13,9 +13,12 @@ to rescan one title. Nothing here writes to the arr's database.
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import socket
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -44,7 +47,51 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
 _opener = urllib.request.build_opener(_NoRedirects)
 
 
+def blocked_reason(url: str) -> str | None:
+    """Why this URL must never be requested, or None when it is allowed.
+
+    An arr connection is caller-supplied, so this endpoint is a request the
+    container makes on a stranger's behalf. Private space is deliberately NOT
+    blocked: a real Radarr lives on the LAN (192.168/10.x), on a Docker bridge
+    (172.16/12, or just the container name), or on loopback when the container
+    is host-networked, and refusing those would break the correct setup for
+    almost everyone. The one destination that is never an arr is link-local -
+    169.254.169.254 is the cloud metadata service, where a "connection test"
+    becomes a read of the host's instance credentials.
+
+    Names are resolved before deciding, so a hostname aimed at metadata is
+    caught as well as the literal address.
+    """
+    host = urllib.parse.urlsplit(url).hostname
+    if not host:
+        return "Refusing to connect: no host in the URL"
+    try:
+        addresses = {info[4][0] for info in socket.getaddrinfo(host, None)}
+    except socket.gaierror:
+        # A name that does not resolve cannot reach metadata either, and the
+        # real DNS error is far more useful to whoever typed the URL.
+        return None
+    for address in addresses:
+        try:
+            ip = ipaddress.ip_address(address.split("%", 1)[0])
+        except ValueError:  # not an address family we can route to anyway
+            continue
+        # ::ffff:169.254.169.254 and 2002:a9fe:a9fe:: land on the same metadata
+        # service, and neither reports is_link_local in its wrapped form.
+        ip = getattr(ip, "ipv4_mapped", None) or getattr(ip, "sixtofour", None) or ip
+        if ip.is_link_local:
+            return (f"Refusing to connect to {host} ({ip}): link-local addresses "
+                    "(169.254.0.0/16, fe80::/10) are the cloud metadata service, not an arr")
+    return None
+
+
 def _request(method: str, url: str, api_key: str, body: dict | None = None) -> tuple[Any, str | None]:
+    # Guarded here rather than at the API handler because every outbound call
+    # carrying the X-Api-Key goes through this one function, including the
+    # rescans that run later from a stored row.
+    blocked = blocked_reason(url)
+    if blocked:
+        return None, blocked
     req = urllib.request.Request(url, method=method)
     req.add_header("X-Api-Key", api_key)
     req.add_header("User-Agent", USER_AGENT)

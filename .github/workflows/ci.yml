@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -19,3 +22,13 @@ jobs:
         # A syntax error in a module the tests do not import would otherwise
         # only surface when the container starts on the NAS.
         run: python -c "import sys; sys.path.insert(0,'app'); import core, store, arrs, system, web, main"
+
+  image:
+    # Nothing above this job reads the Dockerfile, so a typo in the jellyfin
+    # repo line or an apt purge that takes something the app needs used to pass
+    # green here and only fail once a user pulled the image. Build it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Image builds
+        run: docker build -t transcodearr:ci .

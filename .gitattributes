@@ -1,0 +1,7 @@
+# This repo is edited on Windows, where a checkout or an editor can hand back
+# CRLF. Two files had already been committed that way. A CR is invisible in a
+# review and harmless in Python, but it is not harmless in a shell script the
+# image runs - a CR on the shebang line makes the kernel hunt for an interpreter
+# named "sh\r" - which is why the Dockerfile strips them from the entrypoint at
+# build time. Normalize here instead, so nothing has to.
+* text=auto eol=lf

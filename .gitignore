@@ -5,3 +5,25 @@ __pycache__/
 # Scratch files from editing sessions
 .rest.txt
 .scratch-*
+
+# The quick start says to copy the example and paste a real TRANSCODEARR_TOKEN
+# into the copy. Only the example is tracked, by name; the copy never is.
+docker-compose.yml
+docker-compose.override.yml
+.env
+
+# Whatever a local run leaves in /config. The TLS page writes a private key
+# there, and a key pushed to a public repo is compromised the moment it lands -
+# deleting the commit afterwards does not take it back, only a new key does.
+config/
+*.pem
+*.key
+*.crt
+
+# The queue database and its write-ahead log.
+*.db
+*.db-wal
+*.db-shm
+
+# Sources kept back from a test run against a real library.
+.transcodearr-trash/

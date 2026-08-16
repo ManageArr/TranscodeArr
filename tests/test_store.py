@@ -53,7 +53,7 @@ class Parsing(unittest.TestCase):
     def spec(self, key):
         return store.SPEC_BY_KEY[key]
 
-    def test_extensions_are_normalised_with_a_leading_dot(self):
+    def test_extensions_are_normalized_with_a_leading_dot(self):
         self.assertEqual(store.parse_value(self.spec("convert_extensions"), "mkv, .AVI"), [".mkv", ".avi"])
 
     def test_paths_accept_colon_and_newline_separated_input(self):
@@ -361,15 +361,73 @@ class ProfileValidation(unittest.TestCase):
         self.assertEqual(store.active_profile(conn)["id"], b["id"])
         self.assertEqual(sum(1 for p in store.list_profiles(conn) if p["active"]), 1)
 
-    def test_the_seeded_profile_reproduces_what_the_daemon_already_does(self):
-        # An upgrade must not silently re-encode the library differently.
+class ShippedProfiles(unittest.TestCase):
+    """The five we ship: seeded once, read-only, and unusable until tested."""
+
+    def test_seeding_twice_does_not_add_a_sixth(self):
         conn = memdb()
-        store.ensure_default_profile(conn, "h264_nvenc", 24, "p4", "high", 0)
-        store.ensure_default_profile(conn, "libx265", 18, "slow", "main", 720)  # must not add a second
-        profiles = store.list_profiles(conn)
-        self.assertEqual(len(profiles), 1)
-        self.assertEqual((profiles[0]["encoder"], profiles[0]["quality"]), ("h264_nvenc", 24))
-        self.assertTrue(profiles[0]["active"])
+        first = store.ensure_shipped_profiles(conn)
+        second = store.ensure_shipped_profiles(conn)
+        self.assertEqual(first, second)
+        self.assertEqual(len(store.list_profiles(conn)), len(core.ENCODER_ORDER))
+
+    def test_each_shipped_profile_matches_its_encoder_recommendation(self):
+        # The values are derived from ENCODER_INFO rather than copied, so a
+        # second hardcoded "23" can never drift from the encoder's own advice.
+        conn = memdb()
+        store.ensure_shipped_profiles(conn)
+        for p in store.list_profiles(conn):
+            self.assertTrue(p["builtin"])
+            self.assertEqual(p["quality"], core.recommended_quality(p["encoder"]))
+
+    def test_a_shipped_profile_cannot_be_edited_or_deleted(self):
+        conn = memdb()
+        store.ensure_shipped_profiles(conn)
+        shipped = store.list_profiles(conn)[0]
+        with self.assertRaises(ValueError):
+            store.save_profile(conn, store.clean_profile(
+                {"name": "hacked", "encoder": shipped["encoder"], "quality": 30}), shipped["id"], "t")
+        ok, why = store.delete_profile(conn, shipped["id"])
+        self.assertFalse(ok)
+        self.assertIn("cannot be deleted", why)
+
+    def test_an_untested_profile_cannot_be_activated(self):
+        # Choosing a profile is choosing what every future job runs. Finding out
+        # on the first film that this box has no Quick Sync is the silent
+        # failure the test encode exists to prevent.
+        conn = memdb()
+        store.ensure_shipped_profiles(conn)
+        shipped = store.list_profiles(conn)[0]
+        row, why = store.activate_profile(conn, shipped["id"])
+        self.assertIsNone(row)
+        self.assertIn("does not work here", why)
+        store.record_validation(conn, shipped["id"], False, "no such device")
+        self.assertIsNone(store.activate_profile(conn, shipped["id"])[0])
+        store.record_validation(conn, shipped["id"], True, "verified with a real encode")
+        row, _ = store.activate_profile(conn, shipped["id"])
+        self.assertIsNotNone(row)
+        self.assertTrue(row["active"])
+
+    def test_a_pre_0_9_1_default_is_kept_as_the_users_own_profile(self):
+        # It holds settings somebody chose. An upgrade that re-qualities their
+        # library is the exact failure this project is built around, so it keeps
+        # its values and its active flag and only stops claiming to be ours.
+        conn = memdb()
+        conn.execute(
+            "INSERT INTO profiles (id, name, encoder, quality, preset, profile, max_height, audio_codec,"
+            " audio_bitrate, audio_channels, active, builtin, validated_at, validated_ok, validated_note,"
+            " created) VALUES ('legacy-id','Default','h264_nvenc',24,'p4','high',0,'aac',192,2,1,1,"
+            " 1.0,1,'carried over',1.0)")
+        conn.commit()
+        self.assertEqual(store.adopt_legacy_default(conn), "legacy-id")
+        store.ensure_shipped_profiles(conn)
+        kept = store.get_profile(conn, "legacy-id")
+        self.assertFalse(kept["builtin"])          # now editable and deletable
+        self.assertTrue(kept["active"])            # still driving every job
+        self.assertEqual(kept["quality"], 24)      # and still at THEIR quality
+        self.assertEqual(len(store.list_profiles(conn)), len(core.ENCODER_ORDER) + 1)
+        # Idempotent: a later boot must not demote a shipped profile too.
+        self.assertIsNone(store.adopt_legacy_default(conn))
 
 
 class SkipRules(unittest.TestCase):

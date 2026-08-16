@@ -1,28 +1,174 @@
-# TranscodeArr on a QNAP with an NVIDIA card and Container Station.
-# The runtime name is Container Station's own registration: "nvidia-runtime"
-# (not the "nvidia" most guides assume - check `docker info | grep -i runtimes`).
+# TranscodeArr - example compose file. This container needs nothing else
+# running to work. Copy it, then change four things:
+#   1. the GPU section: keep ONE of the four blocks below, delete the rest
+#   2. nothing, for the key: left empty, the container generates one on its
+#      first boot and prints it to the log. Set it only if you want to choose.
+#   3. the two volume paths, and WATCH_ROOTS to a folder underneath them.
+#      WATCH_ROOTS is the one that decides what gets converted: everything
+#      matching under it is eligible on the first scan, not just new arrivals,
+#      so start it on one small folder and widen it in the UI afterwards.
+#   4. TZ, to your own zone: left unset the container is UTC, and every
+#      schedule you type here then runs at the wrong time without saying so
 services:
   transcodearr:
-    build: .
+    image: ghcr.io/managearr/transcodearr:latest
+    # "latest" follows the newest release. Every release also publishes 1, 1.2
+    # and 1.2.3 style tags, so pin one of those instead if you would rather
+    # decide when this changes on a library it is actively rewriting. Working
+    # from a clone of the repo? Comment the line above and uncomment this:
+    # build: .
     container_name: transcodearr
-    runtime: nvidia-runtime
+    restart: unless-stopped
+
+    # ---- GPU, option 1: NVIDIA (the default here). Needs the NVIDIA
+    # Container Toolkit installed on the host. "video" is the capability that
+    # carries NVENC; the image also asks for "compute", because ffmpeg
+    # initializes NVENC through CUDA and dies at cuInit without libcuda.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video]
+
+    # ---- GPU, option 2: NVIDIA on QNAP Container Station. It registers the
+    # runtime under its own name and ignores the deploy: block above, so
+    # delete that block and uncomment this. Anywhere else this name aborts
+    # the container with "unknown or invalid runtime name", so confirm what
+    # your host actually calls it: docker info | grep -i runtimes
+    # runtime: nvidia-runtime
+
+    # ---- GPU, option 3: Intel QSV or AMD VAAPI. Delete the deploy: block
+    # and pass the render node through instead. It is owned by a group that
+    # PUID/PGID is not in, and the gid differs per distro, so read it off the
+    # host: ls -l /dev/dri  ->  crw-rw---- root render ... renderD128
+    # devices:
+    #   - /dev/dri:/dev/dri
+    # group_add:
+    #   - "104"   # the gid of "render" ON YOUR HOST, not a universal number
+
+    # ---- GPU, option 4: none. Delete the deploy: block and add nothing.
+    # The boot probe falls back to libx264 on its own - slow on a NAS CPU,
+    # but correct, and /healthz tells you which encoder won and why.
+
     ports:
-      - "8484:8484"
+      # Localhost only. Put the NAS's own LAN address in front to reach the
+      # UI from another machine (e.g. "192.168.1.10:8484:8484"), and stop
+      # there: this API queues encodes and replaces files in your library, so
+      # it has no business on 0.0.0.0 and none whatsoever on the internet.
+      - "127.0.0.1:8484:8484"
+
     volumes:
+      # Your library. Nothing outside the media roots is ever read, browsed
+      # or queued. Replaced sources move to a .transcodearr-trash folder on
+      # this same mount, which is what makes that move an instant rename
+      # instead of a copy of a 40 GB file.
       - /share/NAS/Media:/media
+      # Queue database, settings, API key hashes. Worth backing up: losing it
+      # loses your configuration, never your media.
       - /share/NAS/Containers/transcodearr:/config
+
     environment:
-      # compute is required: ffmpeg's NVENC initializes through CUDA.
-      NVIDIA_DRIVER_CAPABILITIES: "compute,video,utility"
-      # The bootstrap key - your first way in. Mint per-consumer keys in the UI
-      # afterwards; this one keeps working and cannot be revoked from there.
-      TRANSCODEARR_TOKEN: "change-me"
-      # The volume mounts themselves, so this one genuinely belongs in env.
+      # ---- read from here on every boot ----
+      # Your first way in. Generate one, paste it here, keep it out of git:
+      #   openssl rand -hex 24
+      # Left empty, the container mints a key on its first boot and prints it
+      # once - read it back with `docker logs transcodearr`. Set a value here
+      # only if you would rather choose it yourself. The literal "change-me" is
+      # refused as a key, so a deploy pasted out of an example is never wide
+      # open. Mint per-consumer keys in the UI afterwards; a key set here keeps
+      # working and cannot be revoked there.
+      TRANSCODEARR_TOKEN: ""
+      # Forgotten the admin password? Uncomment to delete the admin account at
+      # the next boot, sign in with the key above, make a new account - then
+      # COMMENT IT OUT AGAIN, or the next restart deletes that one too. Minted
+      # API keys survive it. Full steps: "Locked out" in the README.
+      # TRANSCODEARR_RESET_ADMIN: "1"
+      # Names the volume mounts themselves, which is why it cannot move into
+      # the UI - editing it at runtime would point the worker at paths the
+      # container cannot see. Colon-separated for more than one.
       MEDIA_ROOTS: "/media"
-      # Everything below only SEEDS a first boot. Once a value is saved in the
-      # UI it is stored in the database and this is ignored - otherwise a
-      # recreate with a stale file would silently undo what you changed.
-      WATCH_ROOTS: "/media/Temp/transcodearr-canary"
+      # Who the container runs as after startup. Match whoever owns your
+      # media, or the MP4s it writes land as root and your media server
+      # cannot read them. Only /config is chowned, never your library.
+      PUID: "1000"
+      PGID: "1000"
+      # SET THIS. A container with no TZ is UTC while your NAS is not, and
+      # every clock in here is the container's: a convert window typed as
+      # 22:00-06:00 then runs four hours out, silently, all night, and nothing
+      # on any screen looks wrong. Use a real zone name - the zone database is
+      # in the image. The UI and the boot log print the local time beside the
+      # window so a mismatch is visible instead of discovered.
+      TZ: "America/New_York"
+
+      # ---- everything below only SEEDS a first boot ----
+      # Once a value is saved in the UI it lives in the database and this
+      # file is ignored for it, because the other way round means a recreate
+      # with a stale file silently undoes what you changed - and you find out
+      # when the library has been re-encoded at the wrong quality.
+      #
+      # THE ONE THAT DECIDES WHAT GETS CONVERTED. Every matching file under
+      # these folders is eligible on the first scan - the whole library, not
+      # just new arrivals - and each one is re-encoded with its original moved
+      # to trash, where TRASH_KEEP_DAYS then deletes it. So point this at ONE
+      # small folder to begin with, even if you have to make it, watch a few
+      # files convert and check the results yourself, and widen it in the UI
+      # afterwards. Left EMPTY it watches every media root, which is the whole
+      # mount. A folder that does not exist is skipped in silence, so a path
+      # copied from someone else's setup gives you a healthy container that
+      # quietly never does anything.
+      WATCH_ROOTS: "/media/Movies"
       QUALITY: "24"
       TRASH_KEEP_DAYS: "7"
-    restart: unless-stopped
+
+      # Narrows eligibility to files whose name starts with a dot, so your
+      # media server never sees a file until this has converted and verified
+      # it - nobody can start playing the copy that is about to be replaced.
+      # Nothing writes that dot for you: Radarr and Sonarr need a Custom Script
+      # to do it, and there is a real tradeoff to weigh. Both are in the README
+      # under "Only convert dot-hidden files". Leave it off for a one-off
+      # conversion of an existing library; that is what the default is for.
+      # HIDDEN_ONLY: "true"
+
+      # When to convert. The window is read in the TZ above and may span
+      # midnight. Only NEW work is gated: an encode already running always
+      # finishes and is verified, and the watcher keeps queueing while the
+      # window is shut - so a stopped box with a growing queue is this
+      # working, not broken. Run state lives in memory, which is why a manual
+      # Stop does not survive a restart while auto start is on.
+      # AUTO_START: "false"            # boot paused, wait for someone to press Start
+      # CONVERT_WINDOW: "22:00-06:00"  # empty means always
+
+      # Throttling, for a box with no GPU. A libx265 job otherwise pins every
+      # core and the first anyone hears about it is playback stuttering while
+      # their own library is being converted. Niceness is CPU only - on a NAS
+      # it is usually the spindles a 40GB remux takes away from playback, so
+      # the idle IO class is the one that matters.
+      # ENCODE_NICE: "10"        # 0 normal, 19 "only a core nobody else wants"
+      # ENCODE_IDLE_IO: "true"   # read and write only when the disk is idle
+      # ENCODE_THREADS: "4"      # 0 lets ffmpeg take every core
+
+      # HTTPS, served by the container itself. Set BOTH or neither: with one
+      # of them set it refuses to start rather than quietly serve the login
+      # form in clear text. A reverse proxy that already terminates TLS is the
+      # better answer for anything reachable from outside your LAN; this is
+      # for a LAN box with no proxy. No certificate? The UI generates a
+      # self-signed pair at exactly these paths, and /config is a volume so it
+      # survives a recreate.
+      # TLS_CERT: "/config/tls/cert.pem"
+      # TLS_KEY: "/config/tls/key.pem"
+
+    # Nothing here needs root once it is running. The four capabilities
+    # handed back are what startup actually costs: CHOWN and DAC_OVERRIDE to
+    # take ownership of /config, SETUID and SETGID to step down to PUID/PGID.
+    # Drop those as well and PUID/PGID cannot be applied at all.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true

@@ -1,4 +1,10 @@
+# Only app/ and docker-entrypoint.sh get COPYd, so everything else here is just
+# build-context weight. Keep docker-entrypoint.sh OUT of this list: excluding a
+# file the Dockerfile copies fails the build with a "not found" that reads like
+# the file is missing from the repo.
 .git
+.github
+.gitignore
 __pycache__
 tests
 *.md
