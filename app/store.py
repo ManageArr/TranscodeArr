@@ -95,6 +95,11 @@ SPECS: list[Spec] = [
     Spec("max_height", "MAX_HEIGHT", "int", 0, "Resolution",
          "Caps the picture height. Never upscales - asking for 1080p leaves a 720p file at 720p, because "
          "scaling up costs space and invents nothing. 0 keeps the source resolution.", "Rules", hidden=True),
+    Spec("hardware_decode", "HARDWARE_DECODE", "bool", True, "Decode on the GPU too",
+         "The encoder was always on the GPU; the decoder was not, and decoding 1080p in software is what "
+         "actually pins a NAS CPU. Measured on a real episode: 21.3s of CPU became 3.9s and the job ran 45% "
+         "faster, for a byte-identical file. Only applies to NVIDIA encoders, and ffmpeg falls back to CPU "
+         "decoding by itself for anything the card cannot decode.", "Rules"),
     Spec("max_concurrent", "MAX_CONCURRENT", "int", 1, "Convert at once",
          "One at a time suits a NAS: a single set of spindles behind a single network link turns two encodes "
          "into two slow ones. Raise it if your media sits on SSD or you have a card with no encode-session "

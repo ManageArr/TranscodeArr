@@ -270,6 +270,33 @@ class PresetsAndProfiles(unittest.TestCase):
             self.assertNotIn("-level", template, f"{name} pins a level")
 
 
+class HardwareDecode(unittest.TestCase):
+    """Decoder-side flags. Measured: 21.3s CPU -> 3.9s on a real episode."""
+
+    def test_frames_stay_on_the_gpu_when_no_filter_needs_them(self):
+        self.assertEqual(core.hwaccel_args("h264_nvenc", 0),
+                         ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
+
+    def test_a_resolution_cap_brings_frames_back_to_system_memory(self):
+        # A CPU scale filter cannot read GPU memory - keeping the frames there
+        # fails the whole encode. Verified against real ffmpeg.
+        self.assertEqual(core.hwaccel_args("h264_nvenc", 1080), ["-hwaccel", "cuda"])
+
+    def test_cuda_is_not_offered_to_encoders_that_cannot_use_it(self):
+        for enc in ("libx264", "libx265", "h264_qsv"):
+            self.assertEqual(core.hwaccel_args(enc, 0), [])
+
+    def test_it_can_be_switched_off(self):
+        self.assertEqual(core.hwaccel_args("h264_nvenc", 0, enabled=False), [])
+
+    def test_decoder_flags_land_before_the_input(self):
+        # After -i they are silently ignored, and the CPU stays pinned while
+        # everything looks correct.
+        args = core.build_ffmpeg_args(core.DEFAULT_TEMPLATES["h264_nvenc"], "/m/x.mkv", "/m/.x.tapart.mp4",
+                                      23, False, hwaccel=["-hwaccel", "cuda"])
+        self.assertLess(args.index("-hwaccel"), args.index("-i"))
+
+
 class Audio(unittest.TestCase):
     def test_copy_keeps_the_original_track(self):
         self.assertEqual(core.audio_args("copy", 192, 2), "-c:a copy")

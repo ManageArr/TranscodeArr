@@ -61,7 +61,7 @@ def cfg() -> dict:
 
 # Bump this with the image tag. /healthz reporting a version that is not the
 # running build makes the one field whose job is "what is deployed" a liar.
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -253,7 +253,7 @@ def validate_profile(fields: dict) -> tuple[bool, str]:
             tail = (make.stderr or "").strip().splitlines()
             return False, f"could not build a test clip: {tail[-1][:180] if tail else 'unknown error'}"
 
-        args = profile_args(fields, src, out, with_subs=True)
+        args = profile_args(fields, src, out, with_subs=True, hardware_decode=cfg()["hardware_decode"])
         run = subprocess.run(args, capture_output=True, text=True, timeout=180)
         if run.returncode != 0 and fields.get("audio_codec") == "copy":
             # Same fallback a real job would take, so "copy" is not reported as
@@ -384,7 +384,8 @@ def encoding_profile() -> dict:
             "audio_channels": 2}
 
 
-def profile_args(p: dict, source: str, part: str, with_subs: bool, audio_codec: str | None = None) -> list[str]:
+def profile_args(p: dict, source: str, part: str, with_subs: bool, audio_codec: str | None = None,
+                 hardware_decode: bool = True) -> list[str]:
     """The exact argv one profile produces. Shared by real jobs and the test
     encode, so what gets validated is what gets run - a test that builds its
     command differently is a test of something else."""
@@ -396,6 +397,7 @@ def profile_args(p: dict, source: str, part: str, with_subs: bool, audio_codec: 
         max_height=p.get("max_height", 0),
         audio=core.audio_args(audio_codec or p.get("audio_codec", "aac"),
                               p.get("audio_bitrate", 192), p.get("audio_channels", 2)),
+        hwaccel=core.hwaccel_args(encoder, p.get("max_height", 0), hardware_decode),
     )
 
 
@@ -403,16 +405,23 @@ def run_encode(job_id: str, source: str, names: core.JobNames, src_probe: core.P
     """One encode attempt cycle: with subtitles, then without. (ok, warning, error)."""
     conn = db()
     prof = encoding_profile()
-    attempts = [(True, prof["audio_codec"], "")]
+    hw = cfg()["hardware_decode"]
+    attempts = [(True, prof["audio_codec"], hw, "")]
     if src_probe.subtitle_streams:
-        attempts.append((False, prof["audio_codec"], "text subtitles could not be carried into mp4 - dropped"))
+        attempts.append((False, prof["audio_codec"], hw, "text subtitles could not be carried into mp4 - dropped"))
     if prof["audio_codec"] == "copy":
         # MP4 cannot hold DTS or TrueHD, and those are exactly the tracks worth
         # copying. Falling back beats failing the job over the audio.
-        attempts.append((False, "aac", "the original audio could not be copied into mp4 - re-encoded to AAC"))
+        attempts.append((False, "aac", hw, "the original audio could not be copied into mp4 - re-encoded to AAC"))
+    if hw:
+        # ffmpeg falls back to software decoding on its own for a codec NVDEC
+        # cannot handle, so this last resort is for the rarer case: a driver
+        # that accepts the flag and then fails mid-stream. Better one slow
+        # encode than a failed file.
+        attempts.append((False, "aac", False, "hardware decoding failed - decoded on the CPU instead"))
 
-    for with_subs, audio_codec, warning in attempts:
-        args = profile_args(prof, source, names.part, with_subs, audio_codec)
+    for with_subs, audio_codec, hardware_decode, warning in attempts:
+        args = profile_args(prof, source, names.part, with_subs, audio_codec, hardware_decode)
         conn.execute("UPDATE jobs SET log_tail=? WHERE id=?", (" ".join(args), job_id))
         conn.commit()
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
