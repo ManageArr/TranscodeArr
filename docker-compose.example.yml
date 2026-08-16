@@ -1,0 +1,22 @@
+# TranscodeArr on a QNAP with an NVIDIA card and Container Station.
+# The runtime name is Container Station's own registration: "nvidia-runtime"
+# (not the "nvidia" most guides assume - check `docker info | grep -i runtimes`).
+services:
+  transcodearr:
+    build: .
+    container_name: transcodearr
+    runtime: nvidia-runtime
+    ports:
+      - "8484:8484"
+    volumes:
+      - /share/NAS/Media:/media
+      - /share/NAS/Containers/transcodearr:/config
+    environment:
+      TRANSCODEARR_TOKEN: "change-me"
+      MEDIA_ROOTS: "/media"
+      # Start narrow. Widen to /media/Movies:/media/TV:/media/Movies-Anime:/media/TV-Anime
+      # once the canary run has been watched end to end.
+      WATCH_ROOTS: "/media/Temp/transcodearr-canary"
+      QUALITY: "24"
+      TRASH_KEEP_DAYS: "7"
+    restart: unless-stopped

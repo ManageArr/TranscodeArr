@@ -1,0 +1,250 @@
+"""The pure logic of TranscodeArr - no I/O, no subprocesses, no clock.
+
+Everything here is a function from values to values, so the rules that keep
+media safe can be tested exactly, without a filesystem or an ffmpeg. The
+daemon (main.py) is deliberately thin around this.
+
+The rules exist because of a real incident: a watcher that trusted mtime for
+"is this file finished copying" queued files the moment their first byte
+landed (imports preserve the release's own timestamp, so every file looked
+old), transcoded the fragment that existed, and deleted the source on exit
+code 0. Thirty-six movies in a real library are now permanently short.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+
+# ---------------------------------------------------------------------------
+# Path safety
+# ---------------------------------------------------------------------------
+
+VIDEO_EXTENSIONS = {".mkv", ".avi", ".m4v", ".mp4", ".mov", ".wmv", ".ts", ".webm", ".flv", ".mpg", ".mpeg"}
+
+# What the API and watcher will act on. The staging marker must never match a
+# convertible extension or the worker would eat its own output.
+PART_MARKER = ".tapart"
+
+
+def is_within(path: str, roots: list[str]) -> bool:
+    """Whether a RESOLVED path sits inside one of the given roots.
+
+    The caller resolves symlinks first (os.path.realpath); checking the raw
+    path would let a symlink walk straight out of the root.
+    """
+    norm = os.path.normcase(os.path.normpath(path))
+    for root in roots:
+        r = os.path.normcase(os.path.normpath(root))
+        if norm == r or norm.startswith(r + os.sep):
+            return True
+    return False
+
+
+def validate_path(raw: str, roots: list[str], realpath=os.path.realpath) -> tuple[bool, str]:
+    """(ok, resolved-or-reason). The one gate every job goes through.
+
+    This API accepts a filesystem path and spawns a process on it, so the
+    checks are an allowlist: inside a configured media root (after resolving),
+    a known video extension, not our own staging file.
+    """
+    if not raw or not raw.strip():
+        return False, "no path given"
+    if "\x00" in raw or "\n" in raw or "\r" in raw:
+        return False, "path contains a control character"
+    if not roots:
+        return False, "no media roots configured - refusing to touch anything"
+    resolved = realpath(raw.strip())
+    if not is_within(resolved, roots):
+        return False, f"{resolved} is outside every configured media root"
+    name = os.path.basename(resolved)
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in VIDEO_EXTENSIONS:
+        return False, f"{ext or '(no extension)'} is not a video extension"
+    if PART_MARKER in name:
+        return False, "refusing to process a staging file"
+    return True, resolved
+
+
+# ---------------------------------------------------------------------------
+# The hide / stage / reveal name arithmetic
+# ---------------------------------------------------------------------------
+#
+# Jellyfin ignores dot-prefixed files (a hardcoded "**/.*" in its ignore
+# patterns - undocumented but stable since the Emby fork). That accident of
+# Unix convention is the whole hiding mechanism:
+#
+#   arr imports        .Movie (2026).mkv      hidden, complete
+#   worker encodes to  .Movie (2026).tapart.mp4   hidden, partial
+#   verified, becomes  .Movie (2026).mp4      hidden, complete   (os.replace)
+#   source -> trash
+#   revealed as        Movie (2026).mp4       visible            (os.replace)
+#
+# Never a visible partial file, never two visible copies, and the source
+# outlives the encode in the trash.
+
+
+@dataclass(frozen=True)
+class JobNames:
+    source: str          # what we were given
+    hidden: bool         # whether the source name starts with a dot
+    part: str            # hidden staging path the encoder writes
+    hidden_final: str    # hidden, verified output before the reveal
+    visible: str         # what the world eventually sees
+    reveal_only: bool    # already an acceptable container - just needs unhiding
+
+
+def plan_names(source: str, target_ext: str = ".mp4") -> JobNames:
+    directory, base = os.path.split(source)
+    hidden = base.startswith(".")
+    stem, ext = os.path.splitext(base[1:] if hidden else base)
+    join = lambda name: os.path.join(directory, name)  # noqa: E731
+    return JobNames(
+        source=source,
+        hidden=hidden,
+        part=join(f".{stem}{PART_MARKER}{target_ext}"),
+        hidden_final=join(f".{stem}{target_ext}"),
+        visible=join(f"{stem}{target_ext}"),
+        reveal_only=hidden and ext.lower() == target_ext,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Verification - the check whose absence truncated a library
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Probe:
+    duration: float | None
+    video_streams: int
+    audio_streams: int
+    subtitle_streams: int
+
+
+def parse_ffprobe(payload: dict) -> Probe:
+    streams = payload.get("streams") or []
+    fmt = payload.get("format") or {}
+    duration = None
+    try:
+        duration = float(fmt.get("duration"))
+    except (TypeError, ValueError):
+        pass
+    count = lambda kind: sum(1 for s in streams if s.get("codec_type") == kind)  # noqa: E731
+    return Probe(
+        duration=duration,
+        video_streams=count("video"),
+        audio_streams=count("audio"),
+        subtitle_streams=count("subtitle"),
+    )
+
+
+def verify_output(source: Probe, output: Probe, tolerance: float = 0.015) -> tuple[bool, str]:
+    """Whether the encode may replace the source. Exit code 0 is not asked.
+
+    ffmpeg (and HandBrake before it) will exit 0 having encoded whatever
+    bytes existed - a file still copying encodes into a short, valid,
+    wrong file. Only comparing durations catches that.
+    """
+    if output.video_streams < 1:
+        return False, "output has no video stream"
+    if output.audio_streams < 1 and source.audio_streams > 0:
+        return False, "output lost every audio stream"
+    if source.duration is None or output.duration is None:
+        return False, "duration unreadable on one side - refusing to replace the source"
+    if source.duration <= 0:
+        return False, "source duration is zero"
+    drift = abs(output.duration - source.duration) / source.duration
+    if drift > tolerance:
+        return (
+            False,
+            f"duration mismatch: source {source.duration:.0f}s, output {output.duration:.0f}s "
+            f"({drift * 100:.1f}% off) - source kept",
+        )
+    return True, "ok"
+
+
+def should_skip_transcode(probe: Probe, container_ext: str) -> bool:
+    """Already-fine files are revealed, not re-encoded.
+
+    Placeholder for the richer remux rule (H.264-in-anything -> -c copy);
+    v1 keeps it to "an .mp4 needs no transcode", which is the behaviour the
+    original script had.
+    """
+    return container_ext.lower() == ".mp4"
+
+
+# ---------------------------------------------------------------------------
+# Readiness - is the file actually finished being written?
+# ---------------------------------------------------------------------------
+
+
+def is_stable(size_then: int | None, size_now: int, seconds_between: float, needed: float) -> bool:
+    """Size-based stability: unchanged size across a real interval.
+
+    Never mtime. Imported media carries the release's own timestamp - a
+    library's median mtime age was measured at twelve YEARS - so any
+    mtime-age rule passes the instant the first byte lands.
+    """
+    return size_then is not None and size_now == size_then and seconds_between >= needed
+
+
+# ---------------------------------------------------------------------------
+# ffmpeg command construction
+# ---------------------------------------------------------------------------
+
+# {in} and {out} are replaced with real paths, passed as argv entries - no
+# shell is ever involved, so paths need no quoting and cannot inject.
+DEFAULT_TEMPLATES: dict[str, str] = {
+    "h264_nvenc": (
+        "-map 0:v:0 -map 0:a? {subs} "
+        "-c:v h264_nvenc -preset p4 -profile:v main -level 4.2 -rc vbr -cq {quality} -b:v 0 "
+        "-c:a aac -b:a 192k -ac 2 -movflags +faststart"
+    ),
+    "h264_qsv": (
+        "-map 0:v:0 -map 0:a? {subs} "
+        "-c:v h264_qsv -preset medium -profile:v main -global_quality {quality} "
+        "-c:a aac -b:a 192k -ac 2 -movflags +faststart"
+    ),
+    "libx264": (
+        "-map 0:v:0 -map 0:a? {subs} "
+        "-c:v libx264 -preset medium -profile:v main -crf {quality} "
+        "-c:a aac -b:a 192k -ac 2 -movflags +faststart"
+    ),
+}
+
+
+def build_ffmpeg_args(
+    template: str,
+    source: str,
+    part: str,
+    quality: int,
+    with_subtitles: bool,
+) -> list[str]:
+    """argv for one encode attempt.
+
+    MP4 cannot carry PGS/VOBSUB image subtitles, so text subs are converted to
+    mov_text and the caller retries without subtitles when that fails - a
+    dropped subtitle is recorded as a warning, never a silent loss.
+    """
+    subs = "-map 0:s? -c:s mov_text" if with_subtitles else "-sn"
+    rendered = template.format(subs=subs, quality=quality)
+    return [
+        "ffmpeg", "-hide_banner", "-nostdin", "-y",
+        "-i", source,
+        *rendered.split(),
+        "-progress", "pipe:1",
+        part,
+    ]
+
+
+PROGRESS_RE = re.compile(r"out_time_us=(\d+)")
+
+
+def parse_progress(line: str, duration: float | None) -> int | None:
+    """Percent complete from one line of ffmpeg -progress output."""
+    m = PROGRESS_RE.search(line)
+    if not m or not duration or duration <= 0:
+        return None
+    return min(99, int((int(m.group(1)) / 1_000_000) / duration * 100))
