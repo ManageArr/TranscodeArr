@@ -21,7 +21,12 @@ from dataclasses import dataclass
 # Path safety
 # ---------------------------------------------------------------------------
 
-VIDEO_EXTENSIONS = {".mkv", ".avi", ".m4v", ".mp4", ".mov", ".wmv", ".ts", ".webm", ".flv", ".mpg", ".mpeg"}
+# Blu-ray's .m2ts and DVD's .vob are here because a real library had them: a
+# file whose extension is missing from this set is refused by the API and
+# skipped by the watcher, so it stays hidden forever without ever appearing as
+# an error. Silence is the failure mode this whole worker exists to avoid.
+VIDEO_EXTENSIONS = {".mkv", ".avi", ".m4v", ".mp4", ".mov", ".wmv", ".ts", ".m2ts", ".mts",
+                    ".vob", ".webm", ".flv", ".mpg", ".mpeg"}
 
 # What the API and watcher will act on. The staging marker must never match a
 # convertible extension or the worker would eat its own output.

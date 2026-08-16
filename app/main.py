@@ -36,7 +36,7 @@ SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
 STABLE_SECONDS = int(os.environ.get("STABLE_SECONDS", "120"))
 CONVERT_EXTENSIONS = {
     e if e.startswith(".") else f".{e}"
-    for e in os.environ.get("CONVERT_EXTENSIONS", ".mkv,.avi,.m4v").lower().split(",")
+    for e in os.environ.get("CONVERT_EXTENSIONS", ".mkv,.avi,.m4v,.m2ts,.mts,.vob").lower().split(",")
     if e
 }
 # Only dot-hidden files are touched unless this is switched on. Sweeping the

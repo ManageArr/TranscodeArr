@@ -34,6 +34,13 @@ class ValidatePath(unittest.TestCase):
         self.assertFalse(self.check("/media/notes.txt")[0])
         self.assertFalse(self.check("/media/x" + core.PART_MARKER + ".mp4")[0])
 
+    def test_accepts_disc_container_extensions(self):
+        # A real library had a .m2ts. An extension missing from the set is
+        # refused by the API and skipped by the watcher, so the file stays
+        # hidden forever and nothing ever reports it.
+        for name in ["/media/Movies/.Film.m2ts", "/media/Movies/.Film.mts", "/media/Movies/.Film.vob"]:
+            self.assertTrue(self.check(name)[0], name)
+
     def test_refuses_control_characters_and_empty(self):
         self.assertFalse(self.check("/media/x\n.mkv")[0])
         self.assertFalse(self.check("")[0])
