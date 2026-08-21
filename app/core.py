@@ -241,6 +241,31 @@ def parse_ffprobe(payload: dict) -> Probe:
     )
 
 
+# What a failure has to say before this worker will ask an arr to throw the
+# file away and find another. Deliberately a short allowlist of "the bytes we
+# were given are not a whole video", and deliberately NOT a list of everything
+# that can fail: a GPU whose driver stopped initializing, a share that went
+# away, a name already taken - every one of those is a failure of the machine
+# or the moment, and answering it by binning somebody's episode and starting a
+# download would be the most expensive possible wrong guess.
+_BAD_SOURCE = re.compile(
+    r"duration mismatch"          # the output is short - ffmpeg could not read it all
+    r"|has no video stream"
+    r"|lost every audio stream"
+    r"|not a readable video", re.I)
+
+
+def is_bad_source_failure(error: str) -> bool:
+    """Whether this failure is the SOURCE's fault rather than this machine's.
+
+    Only a verification failure qualifies, and only the kinds that mean the
+    file itself is short or missing a stream. An encode that never started is
+    never in here: "cuInit failed" and "target already exists" are conditions
+    of the host and the library, they clear on their own, and the file is fine.
+    """
+    return bool(error) and bool(_BAD_SOURCE.search(error))
+
+
 def may_replace_target(before: tuple | None, now: tuple | None) -> bool:
     """Whether the file sitting at a job's visible target may be displaced.
 

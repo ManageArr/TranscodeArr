@@ -123,6 +123,17 @@ SPECS: list[Spec] = [
          "progress about twice a second however slow the encode is, so silence means it is wedged - usually "
          "on a share that went away - and not that the file is large. 0 turns the watchdog off, and a "
          "stalled job then holds its slot for the life of the container.", "Rules"),
+    Spec("replace_bad_source", "REPLACE_BAD_SOURCE", "bool", False,
+         "Ask Sonarr/Radarr to replace an unreadable file",
+         "Off by default, and it starts a download. When a conversion fails VERIFICATION because the source "
+         "is short or missing a stream - not because the GPU stopped working, and not because a name was "
+         "taken - the arr that owns the file is asked to mark the release it came from as failed. That "
+         "blocklists it, which is the point: deleting the file and searching lets the arr hand back the "
+         "identical release and reproduce the identical failure forever. Nothing here deletes your media; "
+         "the arr replaces the file when its own search finds something. Asked once per file, so a "
+         "replacement that is also bad stops and waits for a person. If the grab was a season pack, the "
+         "PACK is blocklisted - it contains the unreadable episode, so any future grab of it brings the "
+         "problem back.", "Rules"),
     Spec("trash_keep_days", "TRASH_KEEP_DAYS", "int", 7, "Keep replaced sources (days)",
          "Replaced originals are moved to trash, never deleted outright. This is how long they survive. "
          "Raise it before a large batch - a source pruned mid-run is one you cannot get back.", "General"),

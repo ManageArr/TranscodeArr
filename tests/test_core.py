@@ -421,6 +421,51 @@ class RestoringPutsItBackInTheQueue(unittest.TestCase):
         self.assertTrue(self.check("Show - S01E01.mkv", hidden_only=False))
 
 
+class WhoseFaultIsThisFailure(unittest.TestCase):
+    """Which failures mean the SOURCE is bad, and are therefore worth telling
+    an arr to blocklist a release and pull gigabytes over.
+
+    The expensive wrong answer is the false positive: a GPU that stopped
+    initializing is a condition of the host that clears on its own, and
+    answering it by retiring somebody's release and starting a download is the
+    worst guess this worker could make.
+    """
+
+    def test_a_short_output_is_the_sources_fault(self):
+        self.assertTrue(core.is_bad_source_failure(
+            "output failed verification: duration mismatch: source 2724s, output 2624s (3.7% off) - source kept"))
+
+    def test_a_missing_stream_is_the_sources_fault(self):
+        self.assertTrue(core.is_bad_source_failure("output failed verification: output has no video stream"))
+        self.assertTrue(core.is_bad_source_failure("output failed verification: output lost every audio stream"))
+        self.assertTrue(core.is_bad_source_failure(
+            "source is not a readable video (ffprobe found no video stream)"))
+
+    def test_a_dead_gpu_is_never_the_sources_fault(self):
+        # The one that has to be right. This exact text failed dozens of jobs
+        # on a real box for hours; each one would have blocklisted a release
+        # and started a download.
+        for host_problem in [
+            "ffmpeg exited 171: [h264_nvenc] dl_fn->cuda_dl->cuInit(0) failed -> "
+            "CUDA_ERROR_NOT_INITIALIZED: initialization error",
+            "ffmpeg exited 187: No device available for decoder: device type cuda needed for codec h264",
+            "ffmpeg exited 171: [h264_nvenc] 10 bit encode not supported",
+        ]:
+            self.assertFalse(core.is_bad_source_failure(host_problem), host_problem[:60])
+
+    def test_a_library_condition_is_never_the_sources_fault(self):
+        for other in [
+            "target already exists: /media/TV/Show/Show - S01E01.mp4 - not overwriting",
+            "staging name is taken: /media/TV/Show/.Show - S01E01.mp4 - not overwriting",
+            "source changed during the encode - encode discarded, source untouched",
+            "no progress for 30 minutes - encode killed (is the share still mounted?)",
+            "source vanished before processing",
+            "cancelled",
+            "",
+        ]:
+            self.assertFalse(core.is_bad_source_failure(other), other[:60])
+
+
 class ErrorSummary(unittest.TestCase):
     """What a failed job is allowed to say. The old tail said nothing."""
 

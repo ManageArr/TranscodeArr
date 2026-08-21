@@ -306,6 +306,81 @@ class PageCacheIsHandedBack(JobCase):
         self.assertEqual(main.release_page_cache("", None, "/no/such/file.mkv"), 0)
 
 
+class AskingAnArrForAReplacement(JobCase):
+    """Off by default, once per file, and never for a failure of the machine.
+
+    This is the only feature here that spends somebody's bandwidth and retires
+    a release, so what it must NOT do matters more than what it does.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.asked = []
+
+    def ask(self, error, replace=True):
+        """Drive request_replacement with a fake arr linked; record the calls."""
+        source = self.write(".Movie.mkv", "the source")
+        rows = [{"id": "a1", "name": "Sonarr", "kind": "sonarr", "enabled": 1,
+                 "base_url": "http://s", "api_key": "k", "arr_path": "/tv", "worker_path": self.media}]
+        settings = dict(main.cfg())
+        settings["replace_bad_source"] = replace
+        asked = self.asked
+
+        class FakeArr:
+            def __init__(self, _row):
+                pass
+
+            def replace_bad_file(self, path):
+                asked.append(path)
+                return True, "Sonarr: blocklisted Some.Release-GRP and asked for a replacement"
+
+        with mock.patch.object(main.store, "list_arrs", lambda conn, redact=True: rows),                 mock.patch.object(main, "_client_for", FakeArr),                 mock.patch.object(main, "cfg", lambda: settings):
+            main.request_replacement("job1234", source, error)
+        return source
+
+    SHORT = "output failed verification: duration mismatch: source 2724s, output 2624s (3.7% off)"
+
+    def test_a_short_output_asks_the_arr_to_blocklist_and_replace(self):
+        source = self.ask(self.SHORT)
+        self.assertEqual(self.asked, [source])
+
+    def test_a_dead_gpu_asks_nobody(self):
+        # The expensive false positive. This exact text failed dozens of jobs
+        # on a real box in one evening; every one would have retired a release
+        # and started a download.
+        self.ask("ffmpeg exited 171: [h264_nvenc] cuInit(0) failed -> CUDA_ERROR_NOT_INITIALIZED")
+        self.assertEqual(self.asked, [])
+
+    def test_switched_off_asks_nobody(self):
+        self.ask(self.SHORT, replace=False)
+        self.assertEqual(self.asked, [])
+
+    def test_it_asks_once_per_file_and_not_again(self):
+        # A replacement that is also unreadable means something another
+        # download will not fix. Stop, and let a person look.
+        source = self.ask(self.SHORT)
+        self.assertEqual(len(self.asked), 1)
+        conn = main.db()
+        conn.execute("INSERT INTO jobs (id, path, state, kind, created, rescan) VALUES (?,?,?,?,?,?)",
+                     ("old", source, "failed", "transcode", time.time(),
+                      main.REPLACEMENT_MARK + " Sonarr: blocklisted it"))
+        conn.commit()
+        self.assertTrue(main.already_asked_for_replacement(source))
+        self.ask(self.SHORT)
+        self.assertEqual(len(self.asked), 1, "it asked a second time for the same file")
+
+    def test_the_request_is_recorded_on_the_job_that_triggered_it(self):
+        conn = main.db()
+        source = self.write(".Movie.mkv", "the source")
+        conn.execute("INSERT INTO jobs (id, path, state, kind, created) VALUES (?,?,?,?,?)",
+                     ("job1234", source, "failed", "transcode", time.time()))
+        conn.commit()
+        self.ask(self.SHORT)
+        row = self.row("job1234")
+        self.assertTrue(str(row["rescan"] or "").startswith(main.REPLACEMENT_MARK), row["rescan"])
+        self.assertIn("blocklisted", row["rescan"])
+
+
 class TheTrashCanBeUndone(JobCase):
     """Restore and Delete act on media, and take their paths from a client."""
 

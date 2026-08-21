@@ -632,6 +632,42 @@ stall is not retried down the fallback ladder - a share that has gone will not
 come back between attempts, and each attempt would cost another full timeout of
 a held worker slot.
 
+### When the file itself is bad, and Sonarr/Radarr can find another
+
+Some sources are simply unreadable in part. A file that converts to 96% and
+then fails `duration mismatch: source 2724s, output 2624s` has about a hundred
+seconds ffmpeg cannot get through, and it will fail that way every retry
+forever - the verification is correct, and the source is the problem.
+
+Turn on **Ask Sonarr/Radarr to replace an unreadable file** (`REPLACE_BAD_SOURCE`,
+off by default) and the arr that owns the file is asked to mark the release it
+came from as **failed**, which blocklists it. The arr then searches for a
+different release on its own.
+
+**Blocklisting is the point, not a detail.** Deleting the file and searching
+lets the arr hand back the identical release, which converts to the identical
+failure, forever - the loop this exists to break. Marking the grab failed is
+the only thing that takes that release out of the running.
+
+Three things it deliberately will not do:
+
+- **It never fires for a failure of the machine.** Only a verification failure
+  that names the source qualifies - short output, missing video, missing audio.
+  A GPU whose driver stopped initializing, a share that went away, a name
+  already taken: those are conditions of the host and the library, they clear
+  on their own, and answering one by retiring a release and pulling gigabytes
+  would be the most expensive possible wrong guess.
+- **It never deletes your media.** The unreadable file stays exactly where it
+  is; the arr replaces it when its own search finds something.
+- **It asks once per file.** If the replacement is also unreadable, another
+  download will not fix it, and it stops for a person to look.
+
+One consequence worth knowing before you switch it on: when the grab was a
+**season pack**, the pack is what gets blocklisted. That is the correct
+behaviour - the pack contains the unreadable episode, so any future grab of it
+brings the same problem back - but one bad episode can retire the release the
+rest of the season came from.
+
 ### When the name is already taken
 
 A conversion of `.Show - S01E01.mkv` wants to end up at `Show - S01E01.mp4`. It

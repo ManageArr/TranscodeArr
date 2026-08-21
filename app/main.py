@@ -121,7 +121,7 @@ def cfg() -> dict:
 # A constant compiled into the image cannot be overridden from outside it. Bump
 # it with the image tag: the release workflow refuses a tag that disagrees with
 # it, and a test refuses a Dockerfile that does.
-VERSION = "1.0.7"
+VERSION = "1.1.0"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -1211,6 +1211,65 @@ def notify_arrs(visible_path: str) -> str | None:
     return "; ".join(notes) if notes else None
 
 
+# The marker a replacement request leaves in the jobs.rescan column, so the
+# next failure for the same path can see that this was already tried.
+REPLACEMENT_MARK = "replacement:"
+
+
+def already_asked_for_replacement(path: str) -> bool:
+    """Has an arr already been asked to replace this file?
+
+    Once per file, deliberately. If the replacement is ALSO unreadable then
+    something is wrong that another download will not fix - a bad encode at the
+    source, a whole release group, a disk quietly returning garbage - and the
+    honest response is to stop and let a person look, not to keep blocklisting
+    releases and pulling gigabytes in a loop.
+    """
+    return db().execute(
+        "SELECT 1 FROM jobs WHERE path=? AND rescan LIKE ? LIMIT 1",
+        (path, REPLACEMENT_MARK + "%"),
+    ).fetchone() is not None
+
+
+def request_replacement(job_id: str, source: str, error: str) -> None:
+    """Ask whichever arr owns an unreadable file to blocklist it and find another.
+
+    Runs only on a verification failure that names the SOURCE - see
+    core.is_bad_source_failure - and only when the operator has turned it on.
+    Never deletes anything: the arr replaces the file when its own search finds
+    something, and until then the unreadable file is exactly where it was.
+
+    Failures here are recorded and never raised. The job has already failed;
+    an unreachable Sonarr must not turn that into a crash.
+    """
+    if not cfg()["replace_bad_source"] or not core.is_bad_source_failure(error):
+        return
+    if already_asked_for_replacement(source):
+        log.info("job %s: already asked for a replacement of this file once - not asking again", job_id[:8])
+        return
+    conn = db()
+    notes = []
+    for row in store.list_arrs(conn, redact=False):
+        if not row["enabled"]:
+            continue
+        try:
+            handled, message = _client_for(row).replace_bad_file(source)
+        except Exception as e:  # noqa: BLE001 - an arr must never take a job down
+            handled, message = True, f"{row['name']}: {e}"
+        if handled:
+            notes.append(message)
+            break   # one arr owns the file; asking the rest would be asking about somebody else's library
+    if not notes:
+        notes.append("no linked arr owns this file")
+    note = REPLACEMENT_MARK + " " + "; ".join(notes)
+    log.info("job %s: %s", job_id[:8], note)
+    try:
+        conn.execute("UPDATE jobs SET rescan=? WHERE id=?", (note, job_id))
+        conn.commit()
+    except sqlite3.Error:
+        log.warning("could not record the replacement request for %s", job_id[:8])
+
+
 def rescan_after(job_id: str, visible_path: str) -> None:
     """Notify the arrs once the job is already recorded as done."""
     try:
@@ -1300,6 +1359,15 @@ def process(job: dict) -> None:
         )
         conn.commit()
         log.info("job %s %s %s", job_id[:8], state, fields.get("error") or fields.get("output") or "")
+        if state == "failed":
+            # Same funnel, same reason. request_replacement decides for itself
+            # whether this failure is the source's fault and whether the
+            # operator asked for this at all - so nothing here has to know
+            # which of the nine exits it came from.
+            try:
+                request_replacement(job_id, source, str(fields.get("error") or ""))
+            except Exception:  # noqa: BLE001 - an arr must never take a job down
+                log.exception("replacement request for job %s failed", job_id[:8])
         if state in ("done", "failed"):
             # Fired here rather than at the two happy endings, because finish()
             # is the single funnel every terminal state goes through - including

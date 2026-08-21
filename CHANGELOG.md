@@ -17,9 +17,50 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.0.7` is the release to run. Everything in the sections below is in it and is
+`1.1.0` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.1.0] - 2026-08-21
+
+### Added
+
+- **Sonarr and Radarr can be asked to replace a file that is simply bad.**
+  Some sources are unreadable in part: one converts to 96% and fails
+  `duration mismatch: source 2724s, output 2624s` every retry forever, because
+  the verification is right and the file has a hundred seconds ffmpeg cannot
+  get through. Turn on **Ask Sonarr/Radarr to replace an unreadable file**
+  (`REPLACE_BAD_SOURCE`, off by default) and the arr that owns it is asked to
+  mark the grab as **failed**, which blocklists the release and starts its own
+  search.
+
+  Blocklisting is the point rather than a detail. Deleting the file and
+  searching lets the arr hand back the identical release, which converts to the
+  identical failure, round and round - that loop is the whole reason this needs
+  the arr rather than a retry.
+
+  What it will not do matters more than what it does, because it is the only
+  thing here that spends bandwidth and retires somebody's release:
+
+  - **Never for a failure of the machine.** Only a verification failure naming
+    the source qualifies. A GPU that stopped initializing, a share that went
+    away, a name already taken - all of those clear on their own, and one
+    evening on a real box produced dozens of `CUDA_ERROR_NOT_INITIALIZED`
+    failures that would each have retired a release and started a download.
+    A test asserts that exact text asks nobody.
+  - **Never deletes your media.** The unreadable file stays where it is; the
+    arr replaces it if its own search finds something.
+  - **Once per file.** A replacement that is also unreadable is not something
+    another download fixes, so it stops for a person to look.
+
+  Verified against the live Sonarr 4.0.19 this was built for, read-only, before
+  any of it was written: the episode-file lookup by path, the episode, the grab
+  in history, and that `POST /api/v3/history/failed/{id}` is a real route.
+
+  One consequence to know before switching it on: when the grab was a **season
+  pack**, the pack is blocklisted. That is correct - the pack contains the
+  unreadable episode - but one bad episode can retire the release the rest of
+  the season came from.
 
 ## [1.0.7] - 2026-08-21
 
