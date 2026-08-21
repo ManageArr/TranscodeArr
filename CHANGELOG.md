@@ -17,9 +17,26 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.3.0` is the release to run. Everything in the sections below is in it and is
+`1.3.1` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.3.1] - 2026-08-21
+
+### Fixed
+
+- **Lowering trash retention now says what it is about to delete.** Retention
+  is applied on the next scan, minutes later, permanently - and `0` here is
+  **not** "keep forever": it empties the trash completely. The setting directly
+  below it, Keep job history, reads `0` as keep every row forever. Two adjacent
+  retention settings where zero means opposite things is a trap, and the one
+  that springs it destroys the only copy that makes a conversion undoable.
+
+  Lowering the value now confirms, naming the file count and total size at
+  risk, and `0` gets its own wording saying plainly that it is not "forever".
+  Both help texts now name the other's meaning of zero. Nothing about what the
+  values *do* changed - an empty field was already refused rather than read as
+  zero, which was checked rather than assumed.
 
 ## [1.3.0] - 2026-08-21
 

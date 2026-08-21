@@ -145,11 +145,14 @@ SPECS: list[Spec] = [
          "imported from it; it stops that release being grabbed again.", "Rules"),
     Spec("trash_keep_days", "TRASH_KEEP_DAYS", "int", 7, "Keep replaced sources (days)",
          "Replaced originals are moved to trash, never deleted outright. This is how long they survive. "
-         "Raise it before a large batch - a source pruned mid-run is one you cannot get back.", "General"),
+         "Raise it before a large batch - a source pruned mid-run is one you cannot get back. Lowering it "
+         "deletes on the NEXT SCAN, minutes later. 0 is not 'keep forever' here - it empties the trash "
+         "entirely, which is the opposite of what 0 means for Keep job history below.", "General"),
     Spec("keep_history_days", "KEEP_HISTORY_DAYS", "int", 30, "Keep job history (days)",
          "Done, failed and cancelled jobs older than this are deleted on the next scan. Nothing deleted them "
          "before, so a library-sized run left tens of thousands of rows in the same database file every "
-         "writer here contends for. 0 keeps every row forever.", "General"),
+         "writer here contends for. 0 keeps every row forever - note that 0 means the opposite for Keep "
+         "replaced sources above, where it deletes the trash.", "General"),
     Spec("auto_start", "AUTO_START", "bool", True, "Start converting on boot",
          "On, the container starts converting as soon as it boots. Off, it boots paused and waits for someone "
          "to press Start - the right setting for a first run against a library nobody has swept yet. Run state "

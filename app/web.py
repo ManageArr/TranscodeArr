@@ -1070,11 +1070,31 @@ async function trashAction(which,btn,one){
 async function saveTrashDays(btn){
  const v=parseInt($('trashdays').value,10);
  if(!Number.isFinite(v)||v<0){say('trashmsg','Days must be 0 or more.',true);return;}
+ // Lowering retention deletes on the NEXT SCAN, minutes later, with no second
+ // chance - and the neighbouring "Keep job history" setting reads 0 as "keep
+ // forever", so 0 is exactly the value somebody might type expecting the
+ // opposite of what it does here.
+ const now=TRASH.keep_days;
+ if(v===0&&!confirm(
+   `Keep replaced originals for 0 days?
+
+`+
+   `That is not "keep forever" - it deletes the ENTIRE trash on the next scan: `+
+   `${TRASH.total} file${TRASH.total===1?'':'s'}, ${gb(TRASH.bytes)}.
+
+`+
+   `This is the copy that exists so a conversion can be undone. There is no other one.`))return;
+ if(v>0&&v<now&&!confirm(
+   `Lower retention from ${days(now)} to ${days(v)}?
+
+`+
+   `Anything already in the trash for more than ${days(v)} is deleted on the next scan - `+
+   `up to ${TRASH.total} file${TRASH.total===1?'':'s'} and ${gb(TRASH.bytes)}, permanently.`))return;
  await busy(btn,'Saving...',async()=>{
   try{
-   // PUT, not POST: /api/settings has a GET and a PUT and no POST at all, so
-   // posting to it fell through to the catch-all 404 and reported "Not Found"
-   // at somebody who had just typed a number into a box.
+   // PUT, not POST: /api/settings has a GET and a PUT and no POST, so posting
+   // to it fell through to the catch-all 404 and reported "Not Found" at
+   // somebody who had just typed a number into a box.
    await api('/api/settings',{method:'PUT',body:JSON.stringify({trash_keep_days:v})});
    if(SET)SET.trash_keep_days=v;
    say('trashmsg',v?`Kept for ${days(v)}.`:'Nothing is kept - the next scan prunes the trash empty.');

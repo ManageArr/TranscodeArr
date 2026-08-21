@@ -121,7 +121,7 @@ def cfg() -> dict:
 # A constant compiled into the image cannot be overridden from outside it. Bump
 # it with the image tag: the release workflow refuses a tag that disagrees with
 # it, and a test refuses a Dockerfile that does.
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
