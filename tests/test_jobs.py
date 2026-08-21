@@ -239,6 +239,61 @@ class TheGuardIsReAskedNotRemembered(JobCase):
         self.assertFalse(os.path.exists(os.path.join(self.trash, "Movies", "Movie.mp4")))
 
 
+class PageCacheIsHandedBack(JobCase):
+    """A conversion reads a whole source and writes a whole output, and neither
+    is read again. Left resident they filled 50 GB of a 64 GB box in 90 minutes
+    and starved the NVIDIA driver of the high-order pages cuInit needs."""
+
+    def test_a_finished_job_releases_the_files_it_will_not_read_again(self):
+        source = self.write(".Movie.mkv", "the original")
+        seen = []
+        real = main.release_page_cache
+
+        def spy(*paths):
+            seen.append([p for p in paths if p])
+            return real(*paths)
+
+        with mock.patch.object(main, "release_page_cache", spy):
+            row = self.run_job(self.claim(source), self.encoder_that_writes("the encode"))
+        self.assertEqual(row["state"], "done", row["error"])
+        released = [p for call in seen for p in call]
+        visible = os.path.join(self.media, "Movies", "Movie.mp4")
+        trashed = os.path.join(self.trash, "Movies", ".Movie.mkv")
+        # The output, flushed before the source was trashed, and the source.
+        self.assertIn(trashed, released)
+        self.assertTrue(any(p in (visible, os.path.join(self.media, "Movies", ".Movie.mp4"))
+                            for p in released), released)
+
+    def test_the_output_is_flushed_before_the_source_is_trashed(self):
+        # Ordering, not decoration: until the output is on disk, trashing the
+        # source leaves one copy of the episode in the page cache of a NAS.
+        source = self.write(".Movie.mkv", "the original")
+        order = []
+        real_release, real_trash = main.release_page_cache, main.trash
+
+        with mock.patch.object(main, "release_page_cache",
+                               lambda *p: (order.append("release"), real_release(*p))[1]), \
+             mock.patch.object(main, "trash",
+                               lambda *a, **k: (order.append("trash"), real_trash(*a, **k))[1]):
+            row = self.run_job(self.claim(source), self.encoder_that_writes("the encode"))
+        self.assertEqual(row["state"], "done", row["error"])
+        self.assertEqual(order[:2], ["release", "trash"], order)
+
+    def test_releasing_never_damages_or_removes_the_file(self):
+        # It is an advisory call about cache, not about content. If this ever
+        # became destructive it would do so silently and on every job.
+        path = self.write("Keep.mp4", "every byte of this matters")
+        self.assertEqual(main.release_page_cache(path), 1 if hasattr(os, "posix_fadvise") else 0)
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(self.read(path), "every byte of this matters")
+
+    def test_it_shrugs_at_paths_that_are_not_there(self):
+        # Called with a trashed path and a displaced path, and the second is ""
+        # for most jobs. None of that is worth an exception after the media is
+        # already correct on disk.
+        self.assertEqual(main.release_page_cache("", None, "/no/such/file.mkv"), 0)
+
+
 class TheTrashCanBeUndone(JobCase):
     """Restore and Delete act on media, and take their paths from a client."""
 

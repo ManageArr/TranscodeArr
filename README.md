@@ -2038,6 +2038,33 @@ on them.
   `sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory`
   This also un-breaks hardware transcoding for every other container on the
   box - a Jellyfin on the same host had been silently falling back to CPU.
+- **Converting is itself what refragments memory, so this recurs.** The first
+  time it took 101 days of uptime. Under a sustained queue it came back in
+  **90 minutes**: 18 jobs, each reading ~2 GB and writing ~1.7 GB, put 50 GB
+  into page cache and left 1 GB free on a 64 GB box, and the high-order pools
+  went from 1819 free order-9 pages to zero. The kernel was trying and failing
+  to fix it - `/proc/vmstat` on that box read `compact_stall 7197`,
+  `compact_fail 7048`, `compact_success 149`.
+
+  Since 1.0.6 this container hands those pages back itself: every finished job
+  flushes its output and calls `POSIX_FADV_DONTNEED` on the output and on both
+  files it moved to the trash, none of which anything reads again. That removes
+  the biggest single source of the pressure and needs no privileges.
+
+  It does **not** replace host tuning, and it cannot: `/proc/sys` is mounted
+  read-only in a container, so `drop_caches` and `compact_memory` are refused
+  even to root inside one. Do not run this image privileged to work around
+  that - it parses arbitrary media with ffmpeg, and host kernel write access is
+  the wrong thing to hand it. Tune the host instead, as root:
+
+  ```
+  sysctl -w vm.min_free_kbytes=1048576      # 1 GB reserve; the default 128 MB
+                                            # on a 64 GB box is 0.2%
+  sysctl -w vm.watermark_scale_factor=200   # reclaim earlier; default 10
+  ```
+
+  Both are runtime-only and reset on reboot; put them wherever your NAS runs
+  startup commands to make them stick.
 - The boot probe exists precisely because of the above: a listed encoder is
   not a working one, and `/healthz` says which encoder actually won and why.
 - After the memory-compaction fix, use **Re-test hardware** in the Encoding tab

@@ -121,7 +121,7 @@ def cfg() -> dict:
 # A constant compiled into the image cannot be overridden from outside it. Bump
 # it with the image tag: the release workflow refuses a tag that disagrees with
 # it, and a test refuses a Dockerfile that does.
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -853,6 +853,53 @@ def trash(source: str, job_id: str | None = None) -> str:
     return dest
 
 
+def release_page_cache(*paths: str) -> int:
+    """Tell the kernel these files' pages will not be read again. Returns how
+    many it actually released, which is what the tests assert on.
+
+    A conversion reads a whole source and writes a whole output, neither of
+    which anything reads again - the source is in the trash and the output is
+    streamed once, sequentially, by a media server that reads ahead anyway.
+    Left alone those pages stay resident, and on the box this was found on 18
+    jobs in 90 minutes put 50 GB into page cache and left 1 GB free on a 64 GB
+    machine. That is not a caching problem, it is a fragmentation one: the
+    kernel then has no high-order pages to hand the NVIDIA driver, cuInit fails
+    with CUDA_ERROR_NOT_INITIALIZED, and EVERY encode fails until somebody
+    compacts memory by hand.
+
+    This is the only half of that this container can do. /proc/sys is mounted
+    read-only in Docker, so drop_caches and compact_memory are refused even to
+    root in here - and the fix for that is host tuning (see the README), not
+    running this thing privileged. What it CAN do is stop being the thing that
+    fills the cache in the first place.
+
+    POSIX_FADV_DONTNEED ignores dirty pages, so each file is flushed first.
+    That fsync is worth having on its own: it is the difference between an
+    output that is on disk and one that is merely in the page cache of a NAS
+    about to lose power, and it happens before the source is trashed.
+    """
+    advise = getattr(os, "posix_fadvise", None)
+    if advise is None:
+        return 0  # not Linux; nothing to do and nothing to warn about
+    released = 0
+    for path in paths:
+        if not path:
+            continue
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            os.fsync(fd)
+            advise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            released += 1
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    return released
+
+
 def file_identity(path: str) -> tuple | None:
     """Enough of a file to tell "still the same one" from "somebody rewrote it".
 
@@ -1383,12 +1430,20 @@ def process(job: dict) -> None:
             return finish("failed", error=taken)
 
         os.replace(names.part, names.hidden_final)      # hidden, complete, atomic
+        # Flushed to disk BEFORE the source is trashed, not after. Until this
+        # returns, the verified output exists only in the page cache of a NAS -
+        # and the next line moves the one other copy of that episode. It also
+        # hands those pages back, which is the point: see release_page_cache.
+        release_page_cache(names.hidden_final)
         trashed = trash(source)                          # source survives, in trash
         # The file this job decided at pre-flight to displace, moved aside
         # rather than clobbered. Between the trash above and this one, both
         # copies of the episode outlive the swap by the full retention window.
         replaced = displace(names.visible, existing_target)
         os.replace(names.hidden_final, names.visible)    # the reveal
+        # Both of these are in the trash now, where nothing reads them, and
+        # between them they are most of what this job put in the page cache.
+        release_page_cache(trashed, replaced)
         # Marked done BEFORE talking to any arr. The media is already correct on
         # disk at this point; letting an unreachable arr throw into the handler
         # below would stamp 'failed' on a conversion that completely succeeded,

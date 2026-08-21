@@ -17,9 +17,43 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.0.5` is the release to run. Everything in the sections below is in it and is
+`1.0.6` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.0.6] - 2026-08-21
+
+### Added
+
+- **Every finished job hands its page cache back.** Converting is what
+  refragments kernel memory, so the `cuInit` failure in the notes below is not
+  a one-off: the first occurrence took 101 days of uptime, and under a
+  sustained queue it returned in **90 minutes**. Eighteen jobs, each reading
+  ~2 GB and writing ~1.7 GB, put 50 GB into page cache and left 1 GB free on a
+  64 GB box; free order-9 pages went from 1819 to zero and every encode began
+  failing with `CUDA_ERROR_NOT_INITIALIZED`. The kernel was already trying -
+  that box read `compact_stall 7197`, `compact_fail 7048`,
+  `compact_success 149`.
+
+  None of those pages are ever read again: the source is in the trash and the
+  output is streamed once by a media server that reads ahead anyway. A job now
+  flushes its output and calls `POSIX_FADV_DONTNEED` on it and on both files it
+  moved to the trash. No privileges, no setting, and it removes the single
+  biggest source of the pressure.
+
+  The flush is ordered deliberately - the output is fsynced **before** the
+  source is trashed. `POSIX_FADV_DONTNEED` skips dirty pages so it was needed
+  anyway, but it also closes a real gap: until that returns the verified output
+  exists only in the page cache of a NAS, and the next step moves the one other
+  copy of that episode.
+
+  **This does not replace host tuning and cannot.** `/proc/sys` is mounted
+  read-only in a container, so `drop_caches` and `compact_memory` are refused
+  even to root inside one - verified on the box this was found on. The README
+  now carries the two sysctls that prevent it (`vm.min_free_kbytes`,
+  `vm.watermark_scale_factor`) and says plainly not to run this image
+  privileged to get around the restriction: it parses arbitrary media with
+  ffmpeg, and host kernel write access is the wrong thing to hand it.
 
 ## [1.0.5] - 2026-08-21
 
