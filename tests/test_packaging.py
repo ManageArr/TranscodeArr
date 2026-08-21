@@ -33,11 +33,28 @@ def only(pattern, text, what):
 
 class Version(unittest.TestCase):
     def setUp(self):
-        # The literal, not main.VERSION: TRANSCODEARR_VERSION is set in the
-        # environment of a running container and by other tests, and the
-        # constant is what a source checkout falls back to.
-        self.version = only(r'VERSION = os\.environ\.get\("TRANSCODEARR_VERSION"\) or "([^"]+)"',
-                            read("app/main.py"), "VERSION constant in main.py")
+        # Read out of the source rather than imported, so this stays a test of
+        # what the file SAYS. main.VERSION is now a plain constant and no
+        # environment variable can move it - which is the fix for a container
+        # that reported 1.0.0 while running 1.0.1 - but reading the literal is
+        # still what catches a bump that edited only one of the four places.
+        self.version = only(r'^VERSION = "([^"]+)"$', read("app/main.py"),
+                            "VERSION constant in main.py")
+
+    def test_nothing_outside_the_image_can_move_the_version(self):
+        # The regression this guards: Container Station rebuilds a container
+        # from the environment it recorded at create, so an explicit
+        # TRANSCODEARR_VERSION outlives every image update and /healthz reports
+        # the build the container was FIRST made from, forever.
+        # Matched on the code, not the word: the comment above the constant
+        # explains this regression by name and must stay sayable.
+        self.assertNotRegex(read("app/main.py"), r'environ\S*\(\s*"TRANSCODEARR_VERSION"',
+                            "main.py reads the version from the environment again - an env var is the "
+                            "one part of a container that survives being rebuilt on a newer image")
+        # re.M or the anchor only ever tries the first line of the Dockerfile,
+        # and the assertion passes without looking at the ENV it is about.
+        self.assertNotRegex(read("Dockerfile"), re.compile(r"^ENV TRANSCODEARR_VERSION", re.M),
+                            "the image sets TRANSCODEARR_VERSION again, which is what froze /healthz")
 
     def test_the_dockerfile_default_builds_an_image_that_reports_the_truth(self):
         arg = only(r"^ARG VERSION=(.+)$", read("Dockerfile"), "ARG VERSION")

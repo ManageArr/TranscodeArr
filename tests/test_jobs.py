@@ -100,14 +100,41 @@ class NothingIsOverwritten(JobCase):
     """os.replace destroys the destination silently and atomically. Every path
     into it needs a reason to believe the destination is not somebody's media."""
 
-    def test_a_file_already_at_the_visible_name_stops_the_job(self):
-        source = self.write(".Movie (2026).mkv", "the source")
-        target = self.write("Movie (2026).mp4", "somebody else's copy")
-        row = self.run_job(self.claim(source))
-        self.assertEqual(row["state"], "failed")
-        self.assertIn("already exists", row["error"])
-        self.assertEqual(self.read(target), "somebody else's copy")
-        self.assertEqual(self.read(source), "the source")
+    def test_a_file_already_at_the_visible_name_is_displaced_into_the_trash(self):
+        # This used to fail the job. 26 files in a real library sat on that
+        # refusal for days: an arr had re-imported the episode, the previous
+        # conversion still held the visible name, and nothing on disk changed
+        # between attempts so every retry failed identically forever.
+        source = self.write(".Movie (2026).mkv", "the re-imported source")
+        target = self.write("Movie (2026).mp4", "the previous conversion")
+        row = self.run_job(self.claim(source), self.encoder_that_writes("the new conversion"))
+        self.assertEqual(row["state"], "done", row["error"])
+        self.assertEqual(self.read(target), "the new conversion")
+        # Displaced, never destroyed: both the source and the file it replaced
+        # are recoverable for the whole retention window.
+        self.assertEqual(self.read(os.path.join(self.trash, "Movies", ".Movie (2026).mkv")),
+                         "the re-imported source")
+        self.assertEqual(self.read(os.path.join(self.trash, "Movies", "Movie (2026).mp4")),
+                         "the previous conversion")
+
+    def test_replacing_a_file_is_reported_and_not_done_quietly(self):
+        # Somebody may have been about to watch what this replaced. The reason
+        # it is safe is that the old file still exists, which only helps a
+        # person who is told where it went.
+        self.write("Movie.mp4", "the previous conversion")
+        source = self.write(".Movie.mkv", "the re-imported source")
+        row = self.run_job(self.claim(source), self.encoder_that_writes("the new conversion"))
+        self.assertEqual(row["state"], "done", row["error"])
+        self.assertIn("replaced the file already at this name", row["warning"])
+        self.assertIn("replaced file preserved at", row["log_tail"])
+        self.assertIn("source preserved at", row["log_tail"])
+
+    def test_an_untouched_target_leaves_no_replacement_note(self):
+        source = self.write(".Movie.mkv", "the original")
+        row = self.run_job(self.claim(source), self.encoder_that_writes("the encode"))
+        self.assertEqual(row["state"], "done", row["error"])
+        self.assertIsNone(row["warning"])
+        self.assertNotIn("replaced", row["log_tail"])
 
     def test_a_file_already_at_the_hidden_staging_name_stops_the_job(self):
         # .Movie.mp4 is where the verified encode lands before the reveal, and
@@ -184,9 +211,32 @@ class TheGuardIsReAskedNotRemembered(JobCase):
             main.process(job)
         row = self.row(job["id"])
         self.assertEqual(row["state"], "failed")
-        self.assertIn("already exists", row["error"])
+        # Not "already exists" any more: a file that was already there IS
+        # displaced now. What is refused is a file that arrived after the job
+        # looked - and the message has to say which of the two happened.
+        self.assertIn("written by something else while this job ran", row["error"])
         self.assertEqual(self.read(visible), "an import that landed mid-job")
         self.assertEqual(self.read(source), "the hidden copy")
+        # And it is not sitting in the trash either - refusing means untouched.
+        self.assertFalse(os.path.exists(os.path.join(self.trash, "Movies", "Movie.mp4")))
+
+    def test_a_target_swapped_during_the_encode_is_refused_not_displaced(self):
+        # The pre-flight saw a file it was willing to displace. A DIFFERENT one
+        # is there by the time the encode finishes, which is an arr importing an
+        # upgrade - newer than the source this job converted.
+        source = self.write(".Movie.mkv", "the source")
+        visible = self.write("Movie.mp4", "the previous conversion")
+
+        def upgraded_target(names):
+            with open(names.visible, "w", encoding="utf-8") as f:
+                f.write("an upgrade that landed mid-encode")
+
+        row = self.run_job(self.claim(source), self.encoder_that_writes("the encode", upgraded_target))
+        self.assertEqual(row["state"], "failed")
+        self.assertIn("written by something else while this job ran", row["error"])
+        self.assertEqual(self.read(visible), "an upgrade that landed mid-encode")
+        self.assertEqual(self.read(source), "the source")
+        self.assertFalse(os.path.exists(os.path.join(self.trash, "Movies", "Movie.mp4")))
 
 
 class RetryCooldown(JobCase):

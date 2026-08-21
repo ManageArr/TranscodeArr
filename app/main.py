@@ -105,12 +105,23 @@ def cfg() -> dict:
     """
     return store.effective(store.read_settings(db()), dict(os.environ), MEDIA_ROOTS)
 
-# A built image sets TRANSCODEARR_VERSION from its build tag; the constant is
-# the fallback for running from a source checkout. Bump the constant with the
-# image tag - the release workflow refuses a tag that disagrees with it, and
-# /healthz reporting a version that is not the running build makes the one
-# field whose job is "what is deployed" a liar.
-VERSION = os.environ.get("TRANSCODEARR_VERSION") or "1.0.1"
+# The only place the running version is written, and deliberately not an
+# environment lookup any more.
+#
+# It used to read TRANSCODEARR_VERSION first and fall back to this constant -
+# two sources of truth for one fact, and the environment one is the half that
+# can go stale. It did: updating the QNAP container to 1.0.1 left the OLD
+# container's explicit TRANSCODEARR_VERSION=1.0.0 in place, because Container
+# Station rebuilds a container from the environment it recorded at create and
+# an explicit env beats the new image's ENV. /healthz reported 1.0.0 while
+# 1.0.1 code was running - the exact lie this field exists to prevent, on the
+# one field somebody reads when they are already debugging the wrong build,
+# and it would have survived every future update down that path.
+#
+# A constant compiled into the image cannot be overridden from outside it. Bump
+# it with the image tag: the release workflow refuses a tag that disagrees with
+# it, and a test refuses a Dockerfile that does.
+VERSION = "1.0.2"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -811,6 +822,53 @@ def trash(source: str) -> str:
     return dest
 
 
+def file_identity(path: str) -> tuple | None:
+    """Enough of a file to tell "still the same one" from "somebody rewrote it".
+
+    Inode, size and mtime together, because each catches a different way an arr
+    replaces a file: a rename-into-place changes the inode, an in-place rewrite
+    changes size or mtime, and nothing an importer does leaves all three alone.
+    None when there is no file there.
+
+    Deliberately not a hash. This is asked about a 40GB remux twice per job, and
+    a rule that costs two full reads of the library's biggest file is a rule
+    that gets switched off.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def displace(visible: str, expected: tuple | None) -> str:
+    """Move the file already at a visible target into the trash. "" if none.
+
+    Never an unlink, and never left for os.replace to do silently: what is
+    being displaced is somebody's episode, and unlike a source - which is only
+    ever replaced by a verified encode OF that source - it has no other copy
+    anywhere. It gets the same 30 days in the trash that every replaced source
+    gets, mirrored under the same relative path, so undoing this is a move back.
+
+    Re-checks the identity it was told to expect. occupied() asked the same
+    question moments ago and this is the call that actually destroys something,
+    so it does not take that answer on trust.
+    """
+    if not expected or file_identity(visible) != expected:
+        return ""
+    return trash(visible)
+
+
+def displaced_note(replaced: str) -> str | None:
+    """The warning a job carries when it replaced a file, or None.
+
+    A warning rather than silence: replacing an episode somebody may have been
+    about to watch is not a detail, and the whole reason this is safe is that
+    the old file still exists - which is only useful to somebody who is told.
+    """
+    return f"replaced the file already at this name - the previous one is at {replaced}" if replaced else None
+
+
 def trash_roots() -> list[str]:
     """Every directory that can be holding trashed sources.
 
@@ -1003,22 +1061,37 @@ def process(job: dict) -> None:
         protected = job["kind"] == "reveal" or core.matches_skip(os.path.basename(source), cfg()["skip_patterns"])
         names = core.plan_names(source, source_ext if protected else ".mp4")
 
+        # Whatever already sits at the visible target, sampled BEFORE anything
+        # is encoded. This is the whole basis of telling a file that was
+        # already there apart from one that arrived while we worked.
+        existing_target = None if names.visible == source else file_identity(names.visible)
+
         def occupied() -> str | None:
-            """Whichever of our two write targets already holds somebody's file.
+            """Whichever of our two write targets holds a file we must not touch.
 
             Called before the encode AND again immediately before every
-            os.replace. os.replace destroys the destination without a word, and
-            the pre-flight answer is hours stale by the time an encode finishes
-            - an arr that imports the upgraded release mid-run lands exactly
-            here, and replacing it loses a file that was never ours to touch
-            and never reaches the trash.
+            os.replace, because os.replace destroys the destination without a
+            word and the pre-flight answer is hours stale by the time an encode
+            finishes.
+
+            The visible target may hold the file it held at pre-flight: that is
+            the previous conversion of an episode that has just been imported
+            again, and it is displaced into the trash rather than refused.
+            Refusing is what left whole seasons failing every six hours forever
+            with nothing on disk changing between attempts. Anything ELSE there
+            arrived mid-run - see core.may_replace_target.
+
+            The staging name stays absolutely off limits. A file at
+            `.Show - S01E01.mp4` is a hidden import waiting for its own reveal
+            job, not a stale output, and displacing it would eat somebody
+            else's pending work.
             """
-            if os.path.exists(names.visible) and names.visible != source:
-                return f"target already exists: {names.visible} - not overwriting"
-            # For a reveal, hidden_final IS the source, which is fine; any
-            # other existing file is somebody's media and must stop the job.
             if names.hidden_final != source and os.path.exists(names.hidden_final):
                 return f"staging name is taken: {names.hidden_final} - not overwriting"
+            if names.visible != source and not core.may_replace_target(
+                    existing_target, file_identity(names.visible)):
+                return (f"{names.visible} was written by something else while this job ran - "
+                        "not overwriting the newer file")
             return None
 
         taken = occupied()
@@ -1043,8 +1116,10 @@ def process(job: dict) -> None:
                 taken = occupied()
                 if taken:
                     return finish("failed", error=taken)
+                replaced = displace(names.visible, existing_target)
                 os.replace(source, names.visible)
-                finish("done", output=names.visible, src_bytes=src_bytes, out_bytes=src_bytes, progress=100)
+                finish("done", output=names.visible, warning=displaced_note(replaced),
+                       src_bytes=src_bytes, out_bytes=src_bytes, progress=100)
                 return rescan_after(job_id, names.visible)
             return finish("done", output=source, warning="nothing to do", progress=100)
 
@@ -1097,19 +1172,26 @@ def process(job: dict) -> None:
 
         os.replace(names.part, names.hidden_final)      # hidden, complete, atomic
         trashed = trash(source)                          # source survives, in trash
+        # The file this job decided at pre-flight to displace, moved aside
+        # rather than clobbered. Between the trash above and this one, both
+        # copies of the episode outlive the swap by the full retention window.
+        replaced = displace(names.visible, existing_target)
         os.replace(names.hidden_final, names.visible)    # the reveal
         # Marked done BEFORE talking to any arr. The media is already correct on
         # disk at this point; letting an unreachable arr throw into the handler
         # below would stamp 'failed' on a conversion that completely succeeded,
-        # and re-running it would then trip the "target already exists" guard.
+        # and re-running it would then trip the staging-name guard.
         finish(
             "done",
             output=names.visible,
-            warning=warning or None,
+            warning="; ".join(filter(None, [warning, displaced_note(replaced)])) or None,
             src_bytes=src_bytes,
             out_bytes=out_bytes,
             progress=100,
-            log_tail=f"source preserved at {trashed}",
+            # Both safety copies, because a swap that replaced a file has two
+            # things somebody might want back, not one.
+            log_tail="; ".join(filter(None, [f"source preserved at {trashed}",
+                                             f"replaced file preserved at {replaced}" if replaced else ""])),
         )
         rescan_after(job_id, names.visible)
     except Exception as e:  # noqa: BLE001
@@ -1196,10 +1278,20 @@ _warned_missing: set[str] = set()
 VISIBLE_ONLY_SKIPPED = 0
 
 
-def scan_once() -> None:
+def scan_once() -> dict:
+    """One walk of the watched folders. Returns what it found, for the caller
+    that asked for it by hand - the interval's own scan throws the answer away.
+    """
     global VISIBLE_ONLY_SKIPPED  # noqa: PLW0603
     conn = db()
     now = time.time()
+    queued = 0
+    missing: list[str] = []
+    # A candidate the stability window has not finished holding yet. Worth
+    # counting separately: "found nothing to do" and "found six files that are
+    # still being copied" are different answers, and only one of them means
+    # come back later.
+    settling = 0
     c = cfg()
     watch_roots = c["watch_roots"] or MEDIA_ROOTS
     convert_extensions = set(c["convert_extensions"])
@@ -1215,6 +1307,7 @@ def scan_once() -> None:
     visible_skipped = hidden_found = 0
     for root in watch_roots:
         if not os.path.isdir(root):
+            missing.append(root)
             # The bare `continue` this replaces is why a copy-pasted config with
             # a root nobody mounted looks perfectly healthy and converts
             # nothing - the silence this worker exists to remove.
@@ -1260,7 +1353,10 @@ def scan_once() -> None:
                         # container instead of re-encoded.
                         protected = core.matches_skip(name, skip_patterns)
                         kind = "reveal" if (hidden and ext == ".mp4") or protected else "transcode"
-                        enqueue(resolved, kind)
+                        if enqueue(resolved, kind):
+                            queued += 1
+                else:
+                    settling += 1
             # Commit per directory. sqlite3 opens a transaction on the first
             # write and holds the WAL write lock until commit - across a whole
             # library walk that is minutes, during which every other writer
@@ -1301,6 +1397,32 @@ def scan_once() -> None:
     # keeping every one of them forever, and it is the only sweep that runs.
     store.purge_expired_sessions(conn)
     conn.commit()
+    return {"queued": queued, "eligible": hidden_found, "settling": settling,
+            "skipped_visible": visible_skipped, "missing_roots": missing, "at": now}
+
+
+# One walk at a time. The interval's scan and an operator pressing the button
+# would otherwise stat the whole library twice at once and fight over the WAL
+# write lock the walk already holds per directory.
+_scan_lock = threading.Lock()
+
+
+def scan_now() -> dict:
+    """A scan somebody asked for, rather than the interval's.
+
+    Answers with what it found instead of only queueing it, because the
+    question behind the button is "is there anything to do" - and "nothing"
+    is an answer the queue alone cannot give: an empty queue looks identical
+    whether the walk found nothing or never ran.
+    """
+    if not _scan_lock.acquire(blocking=False):
+        # Refused rather than queued behind the other one: the caller is
+        # waiting on an HTTP response, and a library walk is minutes.
+        return {"scanned": False, "detail": "a scan was already running - its results land in the queue"}
+    try:
+        return {"scanned": True, **scan_once()}
+    finally:
+        _scan_lock.release()
 
 
 def watch_loop() -> None:
@@ -1310,7 +1432,8 @@ def watch_loop() -> None:
     # stopped box with a climbing queue is this working, not this broken.
     while True:
         try:
-            scan_once()
+            with _scan_lock:
+                scan_once()
             prune_trash()
         except Exception:  # noqa: BLE001
             log.exception("scan failed")
@@ -2115,6 +2238,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"changed": changed})
         if route == "/api/tls/selfsigned":
             return self._self_signed(body)
+
+        if route == "/api/scan":
+            # Walk the watched folders now instead of at the next interval, and
+            # say what was found. Someone who has just fixed a mount, flipped
+            # the dot-hidden rule or dropped files in wants an answer in
+            # seconds, and waiting out a five-minute interval to learn that the
+            # setting was wrong is the silence this worker exists to remove.
+            result = scan_now()
+            if result.get("scanned"):
+                log.info("scan on request: queued %s of %s eligible (%s settling, %s skipped for being visible)",
+                         result["queued"], result["eligible"], result["settling"], result["skipped_visible"])
+            return self._send(200, result)
 
         if route == "/api/encoders/probe":
             # Re-probe on demand: hardware changes under a container more often

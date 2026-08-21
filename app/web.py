@@ -281,6 +281,11 @@ document.documentElement.dataset.theme=localStorage.theme||'dark'</script>
  <div class="card">
   <h2>Up next</h2>
   <p class="hint" id="queuehint">In the order they will run - one at a time, oldest first.</p>
+  <div class="msg" id="scanmsg"></div>
+  <div class="row" style="margin-bottom:.8rem">
+   <button class="ghost" id="scanbtn" onclick="scanNow(this)">Check for files to convert</button>
+   <span class="hint">The watcher does this on its own every scan interval. This is the same walk, now.</span>
+  </div>
   <table id="queuetable"></table>
  </div>
 </section>
@@ -766,6 +771,25 @@ async function runControl(which,btn){
    say('runmsg',which==='start'?'Started. '+z.reason
      :'Stopping. The file already encoding finishes and is revealed; nothing new is claimed.');
   }catch(e){say('runmsg',e.message,true);}
+ });
+}
+
+// Reports what the walk found, not just that it ran. An empty queue looks the
+// same whether there was nothing to convert or the watched folders are wrong,
+// and that is the one question this button exists to answer.
+async function scanNow(btn){
+ await busy(btn,'Walking every watched folder...',async()=>{
+  try{
+   const z=await api('/api/scan',{method:'POST',body:'{}'});
+   if(!z.scanned){say('scanmsg',z.detail);return;}
+   const bits=[z.queued?`Queued ${z.queued}.`:'Nothing new to convert.'];
+   bits.push(`${z.eligible} eligible file${z.eligible===1?'':'s'} in the watched folders`);
+   if(z.settling)bits.push(`${z.settling} still settling (size has not held still yet)`);
+   if(z.skipped_visible)bits.push(`${z.skipped_visible} skipped for not being dot-hidden`);
+   if((z.missing_roots||[]).length)bits.push('watched folder missing in this container: '+z.missing_roots.join(', '));
+   say('scanmsg',bits.join(' - '),(z.missing_roots||[]).length>0);
+   await refreshQueue();
+  }catch(e){say('scanmsg',e.message,true);}
  });
 }
 

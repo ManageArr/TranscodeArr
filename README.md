@@ -632,6 +632,32 @@ stall is not retried down the fallback ladder - a share that has gone will not
 come back between attempts, and each attempt would cost another full timeout of
 a held worker slot.
 
+### When the name is already taken
+
+A conversion of `.Show - S01E01.mkv` wants to end up at `Show - S01E01.mp4`. It
+is normal to find something already there: an arr upgrades an episode, imports
+the new release behind a dot, and the previous conversion is still sitting at
+the visible name.
+
+**Since 1.0.2 the incoming conversion wins, and the file it displaces goes to
+the trash** rather than under `os.replace`. Before that the job failed with
+"target already exists" and never stopped failing - nothing on disk changed
+between attempts, so the same file failed every `retry_failed_after_hours`
+forever. A real library had 26 of them.
+
+What is still refused, and always will be, is a **different** file appearing at
+that name after the job started. The check runs twice - once before the encode
+and once immediately before the replace - and the second one compares inode,
+size and mtime against the first. An arr finishing an import during a two-hour
+encode lands on exactly this name, and that file is newer than the source this
+job converted; the encode is the disposable side of that trade. It fails with
+`was written by something else while this job ran`, which is deliberately not
+the same sentence as the old one.
+
+The hidden staging name (`.Show - S01E01.mp4`) is never displaced under any
+circumstances. A file there is a hidden import waiting for its own reveal job,
+not a stale output, and taking it would consume somebody else's pending work.
+
 Done, failed and cancelled rows are deleted after `keep_history_days` (30 by
 default) on each scan. Nothing deleted them before, and a library-sized run
 leaves tens of thousands of rows in the one SQLite file the watcher, the worker
@@ -1308,6 +1334,12 @@ Replaced sources are moved, never deleted. The path is mirrored relative to the
 media root that held it, so recovering a file is a move back to where it came
 from. The trash is pruned by age on every scan.
 
+**Two files can go in from one job.** When a conversion lands on a name that
+already holds a file, that file is displaced into the trash too, and the job
+reports it as a warning naming where it went. Both copies of the episode then
+outlive the swap by the full retention window. See
+[When the name is already taken](#when-the-name-is-already-taken).
+
 Retention is measured from **when a file was trashed**, not from its mtime.
 Imported media carries the release's own timestamp (a median of twelve years old
 in a real library), so pruning by that inherited date deleted every source older
@@ -1558,6 +1590,7 @@ The one difference is the envelope on a **single** job.
 | `GET /api/jobs/{id}` | One job, plus `log_tail`. `200 {"job": {...}}` or `404 {"error": "no such job"}`. |
 | `DELETE /api/jobs/{id}` | Cancel. `200 {"cancelled": id}` if it was still queued; `202 {"canceling": id}` if it was running (the encode is terminated and the source is untouched); `404` if there is no such job; `409 {"error": "job is done"}` if it already finished. |
 | `GET /api/queue?limit=` | The live picture, in the order it will actually happen. `limit` defaults to 100, clamped 1-500, and caps the `queued` list only. |
+| `POST /api/scan` | Walk the watched folders **now** rather than at the next interval, and report what was there. `200 {"scanned": true, "queued": n, "eligible": n, "settling": n, "skipped_visible": n, "missing_roots": [...], "at": <epoch>}`. `scanned: false` with a `detail` when a scan was already running - it is refused rather than queued behind one, because a library walk is minutes and the caller is holding an HTTP response open. `eligible` counts the files in the watched folders that this configuration would convert; `settling` are the ones whose size has not held still for `stable_seconds` yet; `skipped_visible` are the ones passed over for not being dot-hidden. An empty queue and an empty library look identical from `GET /api/queue`, which is the whole reason this answers with counts instead of just doing the work. |
 
 **`cancelled` and `canceling` really are spelled differently, and neither is a
 typo.** `cancelled` is the job STATE - a stored database value and a frozen enum

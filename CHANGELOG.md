@@ -17,9 +17,70 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.0.1` is the release to run. Everything in the sections below is in it and is
+`1.0.2` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
-the point of this file, and neither 1.0.0 nor 1.0.1 changed much of it.
+the point of this file, and the patch releases changed little of it.
+
+## [1.0.2] - 2026-08-20
+
+### Changed
+
+- **A conversion that lands on a name already taken now replaces it, instead of
+  failing forever.** An arr upgrades an episode, imports the new release behind
+  a dot, and the previous conversion is still at the visible name - so the job
+  failed with `target already exists` and kept failing, because nothing on disk
+  changed between attempts. A real library had 26 files doing that, and they
+  would have done it until somebody deleted one by hand.
+
+  The displaced file goes to the **trash**, never under `os.replace`: unlike a
+  source - which is only ever replaced by a verified encode of itself - it has
+  no other copy anywhere, so it gets the same retention every replaced source
+  gets, mirrored under the same relative path. A job that replaced something
+  says so in its warning and records both safety copies.
+
+  **The mid-run race is still refused, and that has not weakened.** The check
+  runs before the encode and again immediately before the replace, and the
+  second compares inode, size and mtime against the first: only the exact file
+  the job decided to displace may be displaced. Anything else arrived while the
+  encode ran - an arr importing an upgrade lands on precisely this name - and
+  it is newer than the source this job converted. That failure now reads `was
+  written by something else while this job ran`, deliberately not the old
+  sentence, because they are different events and used to be indistinguishable.
+  The hidden staging name is never displaced at all: a file there is somebody's
+  pending reveal, not a stale output.
+
+### Added
+
+- **`POST /api/scan`, and a "Check for files to convert" button on the Queue
+  tab.** Walks the watched folders now instead of at the next interval, and
+  answers with what it found: how many were queued, how many are eligible, how
+  many are still settling inside `stable_seconds`, how many were skipped for
+  not being dot-hidden, and any watched folder that does not exist in the
+  container. It reports rather than just doing the work because an empty queue
+  looks identical whether there was nothing to convert or the configuration is
+  wrong, and waiting out a five-minute interval to discover which is the
+  silence this worker exists to remove. One walk at a time - a scan requested
+  while the interval's own is running is refused with a reason rather than
+  queued behind minutes of stat-ing.
+
+### Fixed
+
+- **`/healthz` reported a version that was not running, and no update could
+  move it.** The version was read from `TRANSCODEARR_VERSION` with the constant
+  in `main.py` as a fallback - two sources of truth for one fact, and the
+  environment one is the half that can go stale. Updating the live QNAP
+  container to 1.0.1 left the **old** container's explicit
+  `TRANSCODEARR_VERSION=1.0.0` in place: Container Station rebuilds a container
+  from the environment it recorded at create, and an explicit env beats the new
+  image's `ENV`. So the container ran 1.0.1 code and answered `1.0.0`, on the
+  one field somebody reads when they are already debugging the wrong build -
+  and it would have survived every future update down that path.
+
+  `main.VERSION` is now a plain constant compiled into the image, and the image
+  no longer sets `TRANSCODEARR_VERSION` at all. Nothing outside the image can
+  reach it. The release workflow still refuses a tag that disagrees with the
+  constant, the packaging test still refuses a Dockerfile that disagrees, and a
+  new test refuses either file reintroducing the environment variable.
 
 ## [1.0.1] - 2026-08-20
 

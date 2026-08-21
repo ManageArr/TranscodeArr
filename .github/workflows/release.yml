@@ -28,16 +28,17 @@ jobs:
         run: python -m unittest discover tests -v
 
       - name: Tag matches the version the image will report
-        # Reads main.VERSION the way the running container does, with
-        # TRANSCODEARR_VERSION unset so the built-in fallback is what answers.
+        # main.VERSION is a plain constant now, so this reads exactly what the
+        # running container will answer with - there is no environment variable
+        # left that could give a different answer here than in production.
         # An image tagged 0.9.1 whose /healthz says 0.9.0 turns the one field
         # that answers "what is deployed" into a liar, and it is only ever found
         # by someone debugging the wrong build.
         run: |
           tag="${GITHUB_REF_NAME#v}"
-          fallback=$(python -c "import sys; sys.path.insert(0,'app'); import main; print(main.VERSION)")
-          if [ "$tag" != "$fallback" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match app/main.py VERSION $fallback - bump the constant or fix the tag"
+          reported=$(python -c "import sys; sys.path.insert(0,'app'); import main; print(main.VERSION)")
+          if [ "$tag" != "$reported" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match app/main.py VERSION $reported - bump the constant or fix the tag"
             exit 1
           fi
 
@@ -87,8 +88,12 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          # VERSION is the tag itself, minus the v: the Dockerfile turns it into
-          # ENV TRANSCODEARR_VERSION, which is what /healthz reports. REVISION
+          # VERSION is the tag itself, minus the v: the Dockerfile stamps it
+          # into the image's org.opencontainers.image.version label. What
+          # /healthz reports is main.VERSION, checked against this tag by the
+          # step above - deliberately not an env var, because an env var
+          # survives the container being rebuilt on a newer image and pins the
+          # reported version to whatever it was first created with. REVISION
           # is the other ARG the Dockerfile declares - left unpassed it defaults
           # to "unknown" and the image's org.opencontainers.image.revision label
           # stops naming the commit anyone can check out and read, which is the

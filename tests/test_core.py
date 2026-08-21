@@ -319,6 +319,44 @@ Error opening output file /tmp/out.mp4.
 Error opening output files: Generic error in an external library""".split("\n")
 
 
+class ReplacingAnExistingTarget(unittest.TestCase):
+    """Who wins when a converted file lands on a name that is already taken.
+
+    26 files in a real library sat failing forever on "target already exists":
+    an arr had re-imported the episode, the previous conversion still sat at
+    the visible name, and nothing on disk changed between attempts so every
+    retry failed identically. The file is displaced into the trash now - but
+    only the one the job saw before it started encoding.
+    """
+
+    BEFORE = (101, 900, 5)
+    OTHER = (202, 700, 9)
+
+    def test_an_empty_target_is_always_fine(self):
+        self.assertTrue(core.may_replace_target(None, None))
+        self.assertTrue(core.may_replace_target(self.BEFORE, None))   # somebody deleted it mid-run
+
+    def test_the_file_we_planned_to_displace_may_be_displaced(self):
+        self.assertTrue(core.may_replace_target(self.BEFORE, self.BEFORE))
+
+    def test_a_file_that_arrived_during_the_encode_is_never_touched(self):
+        # An arr importing an upgrade lands on exactly this name, hours after
+        # the pre-flight check said the name was free. That file is newer than
+        # the source this job converted and has no other copy anywhere.
+        self.assertFalse(core.may_replace_target(None, self.OTHER))
+
+    def test_a_target_swapped_during_the_encode_is_never_touched(self):
+        self.assertFalse(core.may_replace_target(self.BEFORE, self.OTHER))
+
+    def test_a_rewrite_in_place_counts_as_a_different_file(self):
+        # Same inode, new bytes: an arr that wrote over the file rather than
+        # renaming onto it. Size and mtime are in the identity for this case.
+        same_inode_new_size = (self.BEFORE[0], self.BEFORE[1] + 1, self.BEFORE[2])
+        same_inode_new_mtime = (self.BEFORE[0], self.BEFORE[1], self.BEFORE[2] + 1)
+        self.assertFalse(core.may_replace_target(self.BEFORE, same_inode_new_size))
+        self.assertFalse(core.may_replace_target(self.BEFORE, same_inode_new_mtime))
+
+
 class ErrorSummary(unittest.TestCase):
     """What a failed job is allowed to say. The old tail said nothing."""
 

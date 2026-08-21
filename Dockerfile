@@ -47,16 +47,21 @@ RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
 
 # Declared down here so bumping a version does not invalidate the apt layer.
 # The release workflow passes both; the defaults keep a local build working.
-ARG VERSION=1.0.1
+ARG VERSION=1.0.2
 ARG REVISION=unknown
 
-# What /healthz reports. main.py keeps its own matching fallback for running
-# from a source checkout, but a built image must never report a version it is
-# not.
-# This default and main.VERSION are bumped together: the release workflow only
-# guards the tagged build, so a stale default here is a local or CI image whose
-# /healthz lies with nothing to catch it.
-ENV TRANSCODEARR_VERSION=${VERSION}
+# VERSION is the LABELs below and nothing else. It used to also become
+# ENV TRANSCODEARR_VERSION, which main.py preferred over its own constant -
+# and an environment variable is exactly the part of a container that survives
+# being rebuilt on a newer image. Container Station recreates a container from
+# the env it recorded at create, so that ENV froze /healthz at whatever version
+# the container was FIRST built with and no update could move it. main.VERSION
+# is now the only answer, compiled in where nothing outside the image can
+# reach it.
+#
+# This default and main.VERSION are still bumped together and a test enforces
+# it: they are what the labels and /healthz respectively report, and an image
+# whose label and /healthz disagree is the same lie in a different field.
 
 # The description is what GHCR prints on the package page, so it is the first
 # thing anyone reads about this image and it has to stand on its own: no stack,

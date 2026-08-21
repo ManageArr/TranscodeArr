@@ -201,6 +201,27 @@ def parse_ffprobe(payload: dict) -> Probe:
     )
 
 
+def may_replace_target(before: tuple | None, now: tuple | None) -> bool:
+    """Whether the file sitting at a job's visible target may be displaced.
+
+    Both arguments identify a file - (inode, size, mtime) or None for "nothing
+    there". `before` is what sat there when the job started; `now` is what sits
+    there at the moment of the replace, hours of encoding later.
+
+    Finding a file there is no longer fatal. It is usually the previous
+    conversion of an episode an arr has re-imported at better quality, and
+    refusing left those files failing every six hours forever with nothing on
+    disk changing between attempts. The displaced file goes to the trash, not
+    under os.replace, so it keeps the same 30 days every replaced source gets.
+
+    What is still fatal is finding a DIFFERENT file there than the one this job
+    decided to displace. That one arrived while the encode ran - an arr
+    importing an upgrade mid-run lands on exactly this name - so it is newer
+    than the source this job converted, and it has no other copy anywhere.
+    """
+    return now is None or now == before
+
+
 def verify_output(source: Probe, output: Probe, tolerance: float = 0.015) -> tuple[bool, str]:
     """Whether the encode may replace the source. Exit code 0 is not asked.
 
