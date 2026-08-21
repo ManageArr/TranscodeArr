@@ -17,9 +17,37 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.1.0` is the release to run. Everything in the sections below is in it and is
+`1.2.0` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.2.0] - 2026-08-21
+
+### Added
+
+- **Blocklisting a season pack is now a choice, not a consequence.** 1.1.0
+  blocklisted whatever the grab was, which meant one unreadable episode could
+  retire the release the rest of a season came from. **...even when it came
+  from a season pack** (`REPLACE_BAD_SOURCE_PACKS`, off) decides that.
+
+  The arr is asked rather than the title parsed. A grab records its own
+  `releaseType` - `SingleEpisode`, `MultiEpisode` or `SeasonPack` - and that is
+  what the switch is applied to:
+
+  | | Off (default) | On |
+  | --- | --- | --- |
+  | Single episode | blocklisted | blocklisted |
+  | Season pack or multi-episode | left alone, reported on the job | blocklisted |
+  | No release type recorded | left alone | blocklisted |
+
+  Off, a pack-sourced bad file is reported and left for a person - safe, but
+  the arr keeps offering the same pack. On is the only thing that stops that.
+  Blocklisting a pack deletes nothing and does not touch episodes already
+  imported from it; it stops the release being grabbed again.
+
+  An unclassified release is refused with the broad case rather than waved
+  through as a single episode: unknown is not the same as safe when the
+  consequence is retiring somebody's release.
 
 ## [1.1.0] - 2026-08-21
 

@@ -222,7 +222,7 @@ class ArrClient:
             return None, f"no {self.kind} title owns {arr_file}"
         return item, arr_file
 
-    def _grab_history_id(self, item: dict, arr_file: str) -> tuple[int | None, str]:
+    def _grab_history_id(self, item: dict, arr_file: str) -> tuple[int | None, str, str]:
         """The history id of the GRAB that produced this file.
 
         This is what gets marked failed, and marking a grab failed is what puts
@@ -232,46 +232,50 @@ class ArrClient:
         if self.kind == "radarr":
             movie_file = item.get("movieFile") or {}
             if not movie_file.get("id"):
-                return None, "radarr has no file recorded for this movie"
+                return None, "radarr has no file recorded for this movie", ""
             res, error = _request(
                 "GET", f"{self.base_url}/api/v3/history/movie?movieId={item.get('id')}", self.api_key)
             if error:
-                return None, error
+                return None, error, ""
             records = res or []
         else:
             res, error = _request(
                 "GET", f"{self.base_url}/api/v3/episodefile?seriesId={item.get('id')}", self.api_key)
             if error:
-                return None, error
+                return None, error, ""
             # relativePath is what the arr stores; arr_file is absolute.
             wanted = arr_file[len(str(item.get("path") or "").rstrip("/")) + 1:]
             episode_file = next((f for f in (res or []) if f.get("relativePath") == wanted), None)
             if episode_file is None:
-                return None, f"sonarr has no file recorded at {wanted}"
+                return None, f"sonarr has no file recorded at {wanted}", ""
             res, error = _request(
                 "GET",
                 f"{self.base_url}/api/v3/episode?seriesId={item.get('id')}"
                 f"&episodeFileId={episode_file.get('id')}",
                 self.api_key)
             if error:
-                return None, error
+                return None, error, ""
             episode = next((e for e in (res or []) if e.get("episodeFileId") == episode_file.get("id")), None)
             if episode is None:
-                return None, "sonarr has no episode for that file"
+                return None, "sonarr has no episode for that file", ""
             res, error = _request(
                 "GET", f"{self.base_url}/api/v3/history?episodeId={episode.get('id')}&pageSize=50",
                 self.api_key)
             if error:
-                return None, error
+                return None, error, ""
             records = (res or {}).get("records") or []
         grab = next((h for h in records if h.get("eventType") == "grabbed"), None)
         if grab is None:
             # Imported by hand, or the history has aged out. Nothing to
             # blocklist, and searching without one would grab it straight back.
-            return None, "no grab in this arr's history - nothing to blocklist"
-        return grab.get("id"), str(grab.get("sourceTitle") or "")
+            return None, "no grab in this arr's history - nothing to blocklist", ""
+        # What the arr itself recorded the release as: SingleEpisode,
+        # MultiEpisode or SeasonPack. Authoritative, where reading "S07" out of
+        # the title would be a guess about somebody's naming convention.
+        release_type = str((grab.get("data") or {}).get("releaseType") or "")
+        return grab.get("id"), str(grab.get("sourceTitle") or ""), release_type
 
-    def replace_bad_file(self, worker_file: str) -> tuple[bool, str]:
+    def replace_bad_file(self, worker_file: str, allow_packs: bool = False) -> tuple[bool, str]:
         """Blocklist the release this file came from, so a search finds another.
 
         Returns (handled, message). handled=False means "not mine" - the caller
@@ -283,24 +287,36 @@ class ArrClient:
         the loop this exists to break. The arr starts its own search off the
         back of the blocklist, so nothing here asks for one.
 
-        Note for whoever reads a surprising blocklist entry later: when the grab
-        was a season pack, this blocklists the PACK. That is deliberate - the
-        pack contains the unreadable episode, so any future grab of it brings
-        the same problem back - but it does mean one bad episode can retire a
-        release the rest of the season came from.
+        `allow_packs` is the operator's answer to the one question this cannot
+        decide for them. A grab records what it was - SingleEpisode,
+        MultiEpisode or SeasonPack - and blocklisting a pack retires the release
+        the rest of a season came from on the strength of one bad episode.
+        Off, a pack is reported and left alone; on, it is blocklisted, which is
+        the only thing that stops the arr handing that same pack straight back.
+        Radarr has no packs, so this never applies to a movie.
         """
         item, why = self._owning_item(worker_file)
         if item is None:
             return (False, why) if "not under" in why or "owns" in why else (True, why)
-        history_id, detail = self._grab_history_id(item, why)
+        history_id, detail, release_type = self._grab_history_id(item, why)
         if history_id is None:
             return True, detail
+        # SingleEpisode is the only kind that cannot cost somebody else an
+        # episode, so it is the only one allowed without an explicit opt-in.
+        # An arr that recorded nothing is refused too: unknown is not the same
+        # as safe when the consequence is retiring a release.
+        if not allow_packs and release_type != "SingleEpisode":
+            was = f"was a {release_type}" if release_type else "is a release this arr did not classify"
+            return True, (f"{self.name}: {detail or 'that release'} {was} - not blocklisting it. Turn on "
+                          "'even when it came from a season pack' to allow this, or replace the file yourself.")
         _, error = _request(
             "POST", f"{self.base_url}/api/v3/history/failed/{history_id}", self.api_key, {})
         if error:
             return True, f"could not blocklist: {error}"
         title = item.get("title", item.get("id"))
-        return True, f"{self.name}: blocklisted {detail or 'the release'} and asked for a replacement of {title}"
+        kind = f" ({release_type})" if release_type else ""
+        return True, (f"{self.name}: blocklisted {detail or 'the release'}{kind} and asked for a "
+                      f"replacement of {title}")
 
     def rescan_for(self, worker_file: str) -> tuple[bool, str]:
         """Ask this arr to re-read the title that owns `worker_file`.

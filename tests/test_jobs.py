@@ -317,21 +317,22 @@ class AskingAnArrForAReplacement(JobCase):
         super().setUp()
         self.asked = []
 
-    def ask(self, error, replace=True):
+    def ask(self, error, replace=True, packs=False):
         """Drive request_replacement with a fake arr linked; record the calls."""
         source = self.write(".Movie.mkv", "the source")
         rows = [{"id": "a1", "name": "Sonarr", "kind": "sonarr", "enabled": 1,
                  "base_url": "http://s", "api_key": "k", "arr_path": "/tv", "worker_path": self.media}]
         settings = dict(main.cfg())
         settings["replace_bad_source"] = replace
+        settings["replace_bad_source_packs"] = packs
         asked = self.asked
 
         class FakeArr:
             def __init__(self, _row):
                 pass
 
-            def replace_bad_file(self, path):
-                asked.append(path)
+            def replace_bad_file(self, path, allow_packs=False):
+                asked.append((path, allow_packs))
                 return True, "Sonarr: blocklisted Some.Release-GRP and asked for a replacement"
 
         with mock.patch.object(main.store, "list_arrs", lambda conn, redact=True: rows),                 mock.patch.object(main, "_client_for", FakeArr),                 mock.patch.object(main, "cfg", lambda: settings):
@@ -342,7 +343,13 @@ class AskingAnArrForAReplacement(JobCase):
 
     def test_a_short_output_asks_the_arr_to_blocklist_and_replace(self):
         source = self.ask(self.SHORT)
-        self.assertEqual(self.asked, [source])
+        self.assertEqual(self.asked, [(source, False)])
+
+    def test_the_season_pack_choice_is_passed_through_not_decided_here(self):
+        # main.py must not second-guess the operator: it forwards the answer
+        # and the arr applies it against what the grab actually was.
+        source = self.ask(self.SHORT, packs=True)
+        self.assertEqual(self.asked, [(source, True)])
 
     def test_a_dead_gpu_asks_nobody(self):
         # The expensive false positive. This exact text failed dozens of jobs

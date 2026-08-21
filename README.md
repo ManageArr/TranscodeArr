@@ -662,11 +662,32 @@ Three things it deliberately will not do:
 - **It asks once per file.** If the replacement is also unreadable, another
   download will not fix it, and it stops for a person to look.
 
-One consequence worth knowing before you switch it on: when the grab was a
-**season pack**, the pack is what gets blocklisted. That is the correct
-behaviour - the pack contains the unreadable episode, so any future grab of it
-brings the same problem back - but one bad episode can retire the release the
-rest of the season came from.
+#### Season packs are your call, not a guess
+
+A grab records what it was, and the arr is asked rather than the title parsed:
+`SingleEpisode`, `MultiEpisode` or `SeasonPack`. That drives a second setting,
+**...even when it came from a season pack** (`REPLACE_BAD_SOURCE_PACKS`, also
+off):
+
+| | Off (default) | On |
+| --- | --- | --- |
+| Grab was a single episode | blocklisted | blocklisted |
+| Grab was a season pack or multi-episode | **left alone**, reported on the job | blocklisted |
+| The arr recorded no release type | **left alone** | blocklisted |
+
+Off is the conservative half: one unreadable episode can never retire the
+release the rest of a season came from, and a pack shows up on the job for you
+to judge. The cost is that the arr will keep offering that same pack for this
+episode, so a pack-sourced bad file is not fixed automatically.
+
+On is the only thing that stops it. Blocklisting a pack does not delete
+anything and does not touch the episodes already imported from it - it stops
+that release being grabbed again. In theory the arr then finds a
+single-episode release instead; in practice that depends on what your indexers
+have, which is why this is a switch and not a default.
+
+An unclassified release is treated as the broad case on purpose: unknown is not
+the same as safe when the consequence is retiring somebody's release.
 
 ### When the name is already taken
 

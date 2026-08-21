@@ -134,6 +134,15 @@ SPECS: list[Spec] = [
          "replacement that is also bad stops and waits for a person. If the grab was a season pack, the "
          "PACK is blocklisted - it contains the unreadable episode, so any future grab of it brings the "
          "problem back.", "Rules"),
+    Spec("replace_bad_source_packs", "REPLACE_BAD_SOURCE_PACKS", "bool", False,
+         "...even when it came from a season pack",
+         "Only matters when the setting above is on, and only for Sonarr - movies do not come in packs. A "
+         "grab records what it was: SingleEpisode, MultiEpisode or SeasonPack. Off, only a single-episode "
+         "release is ever blocklisted, so one unreadable episode can never retire the release the rest of a "
+         "season came from - a pack is reported on the job and left for you to judge. On, the pack is "
+         "blocklisted too, which is the only way the arr will stop handing that same pack back for this "
+         "episode. Blocklisting a pack does not delete anything and does not touch the episodes already "
+         "imported from it; it stops that release being grabbed again.", "Rules"),
     Spec("trash_keep_days", "TRASH_KEEP_DAYS", "int", 7, "Keep replaced sources (days)",
          "Replaced originals are moved to trash, never deleted outright. This is how long they survive. "
          "Raise it before a large batch - a source pruned mid-run is one you cannot get back.", "General"),

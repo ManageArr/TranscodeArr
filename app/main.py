@@ -121,7 +121,7 @@ def cfg() -> dict:
 # A constant compiled into the image cannot be overridden from outside it. Bump
 # it with the image tag: the release workflow refuses a tag that disagrees with
 # it, and a test refuses a Dockerfile that does.
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -1242,8 +1242,10 @@ def request_replacement(job_id: str, source: str, error: str) -> None:
     Failures here are recorded and never raised. The job has already failed;
     an unreachable Sonarr must not turn that into a crash.
     """
-    if not cfg()["replace_bad_source"] or not core.is_bad_source_failure(error):
+    c = cfg()
+    if not c["replace_bad_source"] or not core.is_bad_source_failure(error):
         return
+    allow_packs = bool(c["replace_bad_source_packs"])
     if already_asked_for_replacement(source):
         log.info("job %s: already asked for a replacement of this file once - not asking again", job_id[:8])
         return
@@ -1253,7 +1255,7 @@ def request_replacement(job_id: str, source: str, error: str) -> None:
         if not row["enabled"]:
             continue
         try:
-            handled, message = _client_for(row).replace_bad_file(source)
+            handled, message = _client_for(row).replace_bad_file(source, allow_packs)
         except Exception as e:  # noqa: BLE001 - an arr must never take a job down
             handled, message = True, f"{row['name']}: {e}"
         if handled:
