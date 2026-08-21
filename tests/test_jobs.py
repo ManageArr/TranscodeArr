@@ -239,6 +239,99 @@ class TheGuardIsReAskedNotRemembered(JobCase):
         self.assertFalse(os.path.exists(os.path.join(self.trash, "Movies", "Movie.mp4")))
 
 
+class TheTrashCanBeUndone(JobCase):
+    """Restore and Delete act on media, and take their paths from a client."""
+
+    def trashed_one(self, name=".Movie.mkv", content="the original"):
+        """Run a real conversion so the trash holds a real, recorded file."""
+        source = self.write(name, content)
+        row = self.run_job(self.claim(source), self.encoder_that_writes("the encode"))
+        self.assertEqual(row["state"], "done", row["error"])
+        listing = main.list_trash()
+        self.assertEqual(len(listing["entries"]), 1, listing)
+        return source, listing["entries"][0]
+
+    def test_the_listing_knows_where_a_file_came_from(self):
+        source, entry = self.trashed_one()
+        self.assertEqual(entry["original"], source)
+        self.assertTrue(entry["origin_known"])
+        self.assertFalse(entry["occupied"])          # the .mkv name is free again
+        self.assertTrue(entry["reconverts"])         # a hidden .mkv would be re-queued
+
+    def test_restore_puts_it_back_and_forgets_it(self):
+        source, entry = self.trashed_one()
+        [result] = main.restore_from_trash([entry["path"]])
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.read(source), "the original")
+        self.assertFalse(os.path.exists(entry["path"]))
+        self.assertEqual(main.list_trash()["entries"], [])
+
+    def test_restore_refuses_an_occupied_name_until_told_to_replace(self):
+        source, entry = self.trashed_one()
+        self.write(".Movie.mkv", "something else arrived here")
+        [result] = main.restore_from_trash([entry["path"]])
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["occupied"])
+        self.assertEqual(self.read(source), "something else arrived here")
+        self.assertTrue(os.path.exists(entry["path"]))
+
+    def test_replacing_trashes_what_was_in_the_way_rather_than_deleting_it(self):
+        # The scenario this exists for is an upgrade that turned out worse, so
+        # the file being pushed aside is itself a restore candidate ten minutes
+        # later. Deleting it would make undoing the undo impossible.
+        source, entry = self.trashed_one()
+        self.write(".Movie.mkv", "the upgrade nobody wanted")
+        [result] = main.restore_from_trash([entry["path"]], replace=True)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.read(source), "the original")
+        self.assertTrue(result["displaced"], "the replaced file was destroyed, not trashed")
+        self.assertEqual(self.read(result["displaced"]), "the upgrade nobody wanted")
+
+    def test_delete_removes_it_for_good(self):
+        _source, entry = self.trashed_one()
+        [result] = main.delete_from_trash([entry["path"]])
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(os.path.exists(entry["path"]))
+        self.assertEqual(main.list_trash()["entries"], [])
+
+    def test_neither_will_touch_a_path_outside_the_trash(self):
+        # Both take paths straight from an HTTP body. Without containment,
+        # Delete is an arbitrary unlink and Restore is an arbitrary move.
+        keep = self.write("Precious.mp4", "somebody's media")
+        outside = [keep, os.path.join(self.media, "Movies", "..", "..", "etc", "passwd"),
+                   os.path.join(self.trash, "..", os.path.basename(keep))]
+        for path in outside:
+            [d] = main.delete_from_trash([path])
+            [r] = main.restore_from_trash([path], replace=True)
+            self.assertFalse(d["ok"], path)
+            self.assertFalse(r["ok"], path)
+        self.assertEqual(self.read(keep), "somebody's media")
+
+    def test_a_symlink_in_the_trash_cannot_reach_the_library(self):
+        # Containment is checked on the REAL path. A link inside the trash
+        # pointing at the library would otherwise pass a string check and let
+        # Delete unlink whatever it names.
+        keep = self.write("Precious.mp4", "somebody's media")
+        link = os.path.join(self.trash, "innocent.mp4")
+        os.makedirs(self.trash, exist_ok=True)
+        try:
+            os.symlink(keep, link)
+        except (OSError, NotImplementedError):
+            self.skipTest("this platform will not make symlinks without privileges")
+        [result] = main.delete_from_trash([link])
+        self.assertFalse(result["ok"], "a symlink walked out of the trash")
+        self.assertEqual(self.read(keep), "somebody's media")
+
+    def test_a_bulk_call_reports_each_path_separately(self):
+        _s1, e1 = self.trashed_one(".One.mkv", "one")
+        source2 = self.write(".Two.mkv", "two")
+        self.run_job(self.claim(source2), self.encoder_that_writes("encoded two"))
+        paths = [e["path"] for e in main.list_trash()["entries"]] + ["/not/in/the/trash.mkv"]
+        results = main.delete_from_trash(paths)
+        self.assertEqual([r["ok"] for r in results], [True, True, False])
+        self.assertEqual(main.list_trash()["entries"], [])
+
+
 class RetryCooldown(JobCase):
     """The cooldown exists to stop the WATCHER looping on a file that always
     fails. Applied to an API caller it becomes 'come back in six hours' for a

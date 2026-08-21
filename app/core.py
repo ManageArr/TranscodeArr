@@ -164,6 +164,46 @@ def trash_destination(source: str, roots: list[str], override: str = "") -> str:
                         os.path.basename(source))
 
 
+def trash_origin(trashed: str, roots: list[str], override: str = "") -> str:
+    """Where a trashed file came from, by reversing trash_destination. "" if it
+    is not under any trash root.
+
+    Only ever a FALLBACK for a file that predates the trash table - the table
+    records the real answer at the moment of the move. This cannot recover the
+    de-duplication suffix trash() adds when two files land on one relative path
+    ("Movie.1.mkv" is indistinguishable from a file genuinely named that), and
+    it deliberately does not try: returning a slightly wrong name that the user
+    can SEE in the restore dialog beats silently restoring over the wrong file.
+    """
+    for root in roots:
+        trash_root = override or os.path.join(root, TRASH_DIRNAME)
+        if is_within(trashed, [trash_root]):
+            return os.path.join(root, os.path.relpath(trashed, trash_root))
+    return ""
+
+
+def will_be_converted_again(original: str, hidden_only: bool, extensions: list[str],
+                            skip_patterns: list[str]) -> bool:
+    """Would restoring a file to this path put it straight back in the queue?
+
+    Restoring a SOURCE does: a dot-hidden .mkv is exactly what the watcher
+    exists to find, so it is converted again and trashed again, and the restore
+    undoes itself within a scan interval. Restoring a replaced OUTPUT does not -
+    a visible .mp4 is not eligible for anything.
+
+    Not prevented, because a person restoring a source may well want it
+    converted again. Reported, so nobody is surprised by it.
+    """
+    name = os.path.basename(original)
+    hidden = name.startswith(".")
+    ext = os.path.splitext(name)[1].lower()
+    if matches_skip(name, skip_patterns):
+        return False
+    if hidden_only and not hidden:
+        return False
+    return ext in {e.lower() for e in extensions} or (hidden and ext == ".mp4")
+
+
 # ---------------------------------------------------------------------------
 # Verification - the check whose absence truncated a library
 # ---------------------------------------------------------------------------

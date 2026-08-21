@@ -250,6 +250,7 @@ document.documentElement.dataset.theme=localStorage.theme||'dark'</script>
 <nav>
  <button data-tab="queue" class="on">Queue</button>
  <button data-tab="jobs">History</button>
+ <button data-tab="trash">Trash</button>
  <button data-tab="locations">Locations</button>
  <button data-tab="hardware">Encoding</button>
  <button data-tab="rules">Rules</button>
@@ -300,6 +301,32 @@ document.documentElement.dataset.theme=localStorage.theme||'dark'</script>
   <button class="ghost" onclick="refreshJobs()">Refresh</button>
  </div>
  <table id="jobtable"></table>
+</section>
+
+<section id="trash">
+ <div class="card">
+  <h2>Trash</h2>
+  <p class="hint">Every original this worker replaced, and every file a restore or a conversion displaced.
+   Nothing here was deleted - it is kept so a conversion you did not want can be undone.</p>
+  <div class="msg" id="trashmsg"></div>
+  <div class="facts" id="trashfacts"></div>
+  <div class="row" style="margin:.8rem 0">
+   <label style="width:auto;margin:0">Keep for
+    <input id="trashdays" type="number" min="0" step="1" style="width:5.5rem;margin:0 .4rem">days</label>
+   <button class="ghost" onclick="saveTrashDays(this)">Save</button>
+   <span class="hint">0 keeps nothing: files are pruned on the next scan. Raise it before a large batch -
+    an original pruned mid-run is one you cannot get back.</span>
+  </div>
+ </div>
+ <div class="card">
+  <div class="row" style="margin-bottom:.8rem">
+   <button class="ghost" onclick="refreshTrash()">Refresh</button>
+   <button class="ghost" id="trashrestore" onclick="trashAction('restore',this)">Restore selected</button>
+   <button class="ghost danger" id="trashdelete" onclick="trashAction('delete',this)">Delete selected</button>
+   <span class="hint" id="trashsel"></span>
+  </div>
+  <table id="trashtable"></table>
+ </div>
 </section>
 
 <section id="locations">
@@ -598,6 +625,7 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
  // Refresh on arrival rather than showing whatever the last poll left behind.
  if(b.dataset.tab==='queue'){refreshQueue().catch(()=>{});refreshHost().catch(()=>{});}
  if(b.dataset.tab==='jobs') refreshJobs().catch(()=>{});
+ if(b.dataset.tab==='trash') refreshTrash().catch(()=>{});
  if(b.dataset.tab==='hardware') loadProfiles().then(loadHW).catch(()=>{});
  if(b.dataset.tab==='keys'){loadKeys().catch(()=>{});loadSessions().catch(()=>{});}
 });
@@ -784,6 +812,11 @@ async function scanNow(btn){
    if(!z.scanned){say('scanmsg',z.detail);return;}
    const bits=[z.queued?`Queued ${z.queued}.`:'Nothing new to convert.'];
    bits.push(`${z.eligible} eligible file${z.eligible===1?'':'s'} in the watched folders`);
+   // Every reason a file was seen and not queued gets said. Reporting only
+   // "nothing new" about files the walk can see perfectly well is the silence
+   // this button exists to remove.
+   if(z.already_queued)bits.push(`${z.already_queued} already queued or running`);
+   if(z.cooling)bits.push(`${z.cooling} held by the retry cooldown`);
    if(z.settling)bits.push(`${z.settling} still settling (size has not held still yet)`);
    if(z.skipped_visible)bits.push(`${z.skipped_visible} skipped for not being dot-hidden`);
    if((z.missing_roots||[]).length)bits.push('watched folder missing in this container: '+z.missing_roots.join(', '));
@@ -805,12 +838,24 @@ async function refreshHealth(){
   `${esc(z.encoder)}</b> · ${z.queued} queued · ${z.running} running · v${esc(z.version)}`+
   (z.encoder==='libx264'?` <code>(${esc(z.encoder_reason)})</code>`:'');
 }
+// Signed the way a person says it: 21% smaller, or 21% larger. Never
+// "-21% smaller".
+function sizeDelta(src,out){
+ if(!src||!out)return '';
+ const pct=Math.round((1-out/src)*100);
+ if(pct===0)return 'same size';
+ return pct>0?pct+'% smaller':(-pct)+'% larger';
+}
+
 async function refreshJobs(){
  const st=$('statefilter').value;
  const j=await api('/api/jobs?limit=60'+(st?'&state='+st:''));
  $('jobtable').innerHTML='<tr><th>State</th><th>File</th><th>%</th><th>Size</th><th>Result</th><th></th></tr>'+
   (j.jobs.length?j.jobs.map(x=>{
-   const saved=(x.src_bytes&&x.out_bytes)?Math.round((1-x.out_bytes/x.src_bytes)*100)+'% smaller':'';
+   // A conversion can land BIGGER - re-encoding an already-converted file, or
+   // a low CQ on a lean source. That read "-21% smaller", which is a double
+   // negative the reader has to unpick to learn the file grew.
+   const saved=sizeDelta(x.src_bytes,x.out_bytes);
    const stop=(x.state==='queued'||x.state==='running')
      ?`<button class="ghost" data-cancel="${esc(x.id)}">Cancel</button>`:'';
    return `<tr><td class="${x.state}">${esc(x.state)}${x.kind==='reveal'?' <span class="tag">reveal</span>':''}</td>`+
@@ -818,6 +863,101 @@ async function refreshJobs(){
     `<td><code>${esc(x.error||x.warning||x.rescan||x.output||'')}</code></td><td>${stop}</td></tr>`;
   }).join(''):'<tr><td colspan="6">Nothing here yet.</td></tr>');
 }
+// ---- trash ---------------------------------------------------------------
+let TRASH={entries:[]};
+const days=n=>n===1?'1 day':n+' days';
+
+async function refreshTrash(){
+ TRASH=await api('/api/trash');
+ $('trashdays').value=TRASH.keep_days;
+ $('trashfacts').innerHTML=
+  `<div><b>${TRASH.total}</b><span>file${TRASH.total===1?'':'s'} kept</span></div>`+
+  `<div><b>${gb(TRASH.bytes)}</b><span>on disk</span></div>`+
+  `<div><b>${days(TRASH.keep_days)}</b><span>retention</span></div>`+
+  (TRASH.total>TRASH.shown?`<div><b>${TRASH.shown}</b><span>shown</span></div>`:'');
+ const now=Date.now()/1000;
+ $('trashtable').innerHTML='<tr><th></th><th>File</th><th>Goes back to</th><th>Size</th><th>Deleted in</th><th></th></tr>'+
+  (TRASH.entries.length?TRASH.entries.map((e,i)=>{
+   const left=TRASH.keep_days?Math.max(0,Math.ceil(TRASH.keep_days-(now-e.at)/86400)):0;
+   const flags=[e.occupied?'<span class="tag">name in use</span>':'',
+                e.reconverts?'<span class="tag">converts again</span>':'',
+                e.origin_known?'':'<span class="tag">origin guessed</span>'].join('');
+   return `<tr><td><input type="checkbox" data-trash="${i}" onchange="trashSel()"></td>`+
+    `<td>${esc(e.path.split('/').pop())}</td>`+
+    `<td><code>${esc(e.original||'unknown')}</code> ${flags}</td>`+
+    `<td>${e.bytes?gb(e.bytes):''}</td>`+
+    `<td>${TRASH.keep_days?days(left):'never'}</td>`+
+    `<td><button class="ghost" data-restore="${i}">Restore</button>`+
+    `<button class="ghost danger" data-del="${i}">Delete</button></td></tr>`;
+  }).join(''):'<tr><td colspan="6">The trash is empty.</td></tr>');
+ trashSel();
+}
+
+function trashSel(){
+ const n=document.querySelectorAll('[data-trash]:checked').length;
+ $('trashsel').textContent=n?`${n} selected`:'Select files, or use the buttons on a row.';
+}
+const trashPicked=()=>[...document.querySelectorAll('[data-trash]:checked')]
+ .map(c=>TRASH.entries[+c.dataset.trash]).filter(Boolean);
+
+// The confirm is the whole point of the replace path: restoring over a file
+// that is playable right now is the one action here that costs somebody
+// something, and a mass restore can do it many times without a second look.
+function confirmRestore(list){
+ const busyNames=list.filter(e=>e.occupied);
+ if(!busyNames.length) return true;
+ const shown=busyNames.slice(0,8).map(e=>'  '+e.original.split('/').pop()).join('\n');
+ return confirm(
+  `${busyNames.length} of these already have a file at the name they go back to:\n\n${shown}`+
+  (busyNames.length>8?`\n  ...and ${busyNames.length-8} more`:'')+
+  `\n\nRestoring replaces ${busyNames.length===1?'it':'them'}. What is there now is moved to this same `+
+  `trash, not deleted, so this is reversible - but it is the file your media server is serving right now.`+
+  `\n\nReplace and restore?`);
+}
+
+async function trashAction(which,btn,one){
+ const list=one!==undefined?[TRASH.entries[one]]:trashPicked();
+ if(!list.length){say('trashmsg','Nothing selected.',true);return;}
+ if(which==='delete'&&!confirm(
+   `Delete ${list.length} file${list.length===1?'':'s'} from the trash for good?\n\n`+
+   `This is the copy that exists so a conversion can be undone. There is no other one.`))return;
+ const replace=which==='restore';
+ if(replace&&!confirmRestore(list))return;
+ const reconv=which==='restore'?list.filter(e=>e.reconverts).length:0;
+ await busy(btn||$('trash'+which),which==='restore'?'Restoring...':'Deleting...',async()=>{
+  try{
+   const z=await api('/api/trash/'+which,{method:'POST',
+     body:JSON.stringify({paths:list.map(e=>e.path),replace})});
+   const failed=z.results.filter(r=>!r.ok);
+   let m=`${z.ok} ${which==='restore'?'restored':'deleted'}`+(z.failed?`, ${z.failed} failed`:'')+'.';
+   if(reconv)m+=` ${reconv} will be converted again on the next scan - they are sources, and the watcher `+
+     `finds them the same way it did the first time.`;
+   if(failed.length)m+=' '+failed.slice(0,3).map(r=>r.detail).join('; ');
+   say('trashmsg',m,z.failed>0);
+   await refreshTrash();
+  }catch(e){say('trashmsg',e.message,true);}
+ });
+}
+
+async function saveTrashDays(btn){
+ const v=parseInt($('trashdays').value,10);
+ if(!Number.isFinite(v)||v<0){say('trashmsg','Days must be 0 or more.',true);return;}
+ await busy(btn,'Saving...',async()=>{
+  try{
+   await api('/api/settings',{method:'POST',body:JSON.stringify({trash_keep_days:v})});
+   if(SET)SET.trash_keep_days=v;
+   say('trashmsg',v?`Kept for ${days(v)}.`:'Nothing is kept - the next scan prunes the trash empty.');
+   await refreshTrash();
+  }catch(e){say('trashmsg',e.message,true);}
+ });
+}
+
+document.addEventListener('click',e=>{
+ const r=e.target.dataset&&e.target.dataset.restore, d=e.target.dataset&&e.target.dataset.del;
+ if(r!==undefined&&r!=='') trashAction('restore',e.target,+r);
+ if(d!==undefined&&d!=='') trashAction('delete',e.target,+d);
+});
+
 async function cancelJob(id){
  try{await api('/api/jobs/'+id,{method:'DELETE'});await refreshQueue();await refreshJobs();}
  catch(e){alert(e.message);}

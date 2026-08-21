@@ -1340,6 +1340,31 @@ reports it as a warning naming where it went. Both copies of the episode then
 outlive the swap by the full retention window. See
 [When the name is already taken](#when-the-name-is-already-taken).
 
+### Looking in it, and getting something back
+
+The **Trash** tab lists everything in there with where it came from, its size
+and how many days it has left, and does per-row or bulk **Restore** and
+**Delete**. Retention lives on that tab too - it is the setting somebody is
+actually thinking about while looking at the list.
+
+**Restore can replace what is in the way.** That is the case it exists for: an
+arr imports an upgrade, the conversion of it replaces the previous one, and the
+upgrade turns out worse. It asks first, naming what it would replace, and the
+file it pushes aside is **trashed rather than deleted** - the thing being
+displaced by a restore is itself a restore candidate ten minutes later.
+
+Restoring a **source** puts it back in the queue, and the list says so before
+you press anything: a dot-hidden `.mkv` is exactly what the watcher finds, so
+it is converted and trashed again within a scan interval. Restoring a replaced
+**output** - a visible `.mp4` - is not eligible for anything and simply stays.
+That second one is what the button is usually for.
+
+A file trashed before 1.0.3 has no recorded origin, so its destination is
+derived by reversing the mirroring and the row is marked. That derivation
+cannot undo the `.1` a second trashing of the same relative path appends, and
+deliberately does not try - a name you can see and correct beats a silent
+restore over the wrong file.
+
 Retention is measured from **when a file was trashed**, not from its mtime.
 Imported media carries the release's own timestamp (a median of twelve years old
 in a real library), so pruning by that inherited date deleted every source older
@@ -1590,7 +1615,10 @@ The one difference is the envelope on a **single** job.
 | `GET /api/jobs/{id}` | One job, plus `log_tail`. `200 {"job": {...}}` or `404 {"error": "no such job"}`. |
 | `DELETE /api/jobs/{id}` | Cancel. `200 {"cancelled": id}` if it was still queued; `202 {"canceling": id}` if it was running (the encode is terminated and the source is untouched); `404` if there is no such job; `409 {"error": "job is done"}` if it already finished. |
 | `GET /api/queue?limit=` | The live picture, in the order it will actually happen. `limit` defaults to 100, clamped 1-500, and caps the `queued` list only. |
-| `POST /api/scan` | Walk the watched folders **now** rather than at the next interval, and report what was there. `200 {"scanned": true, "queued": n, "eligible": n, "settling": n, "skipped_visible": n, "missing_roots": [...], "at": <epoch>}`. `scanned: false` with a `detail` when a scan was already running - it is refused rather than queued behind one, because a library walk is minutes and the caller is holding an HTTP response open. `eligible` counts the files in the watched folders that this configuration would convert; `settling` are the ones whose size has not held still for `stable_seconds` yet; `skipped_visible` are the ones passed over for not being dot-hidden. An empty queue and an empty library look identical from `GET /api/queue`, which is the whole reason this answers with counts instead of just doing the work. |
+| `POST /api/scan` | Walk the watched folders **now** rather than at the next interval, and report what was there. `200 {"scanned": true, "queued": n, "eligible": n, "settling": n, "cooling": n, "already_queued": n, "skipped_visible": n, "missing_roots": [...], "at": <epoch>}`. `scanned: false` with a `detail` when a scan was already running - it is refused rather than queued behind one, because a library walk is minutes and the caller is holding an HTTP response open. `eligible` counts the files in the watched folders that this configuration would convert; `settling` are the ones whose size has not held still for `stable_seconds` yet; `skipped_visible` are the ones passed over for not being dot-hidden. **This route ignores the retry cooldown** for the same reason `POST /api/jobs` does - somebody pressing it is asking about those files now - so `cooling` is normally 0 here and non-zero only in the watcher's own scans. An empty queue and an empty library look identical from `GET /api/queue`, which is the whole reason this answers with counts instead of just doing the work. |
+| `GET /api/trash` | What is in the trash. `200 {"entries": [...], "total": n, "shown": n, "bytes": n, "keep_days": n}`, newest first, capped at 500 entries. Each entry: `path` (where it is now), `original` (where Restore returns it), `origin_known` (false when it was derived rather than recorded - see below), `bytes`, `at`, `job_id`, `occupied` (something already holds `original`), `reconverts` (restoring it would put it straight back in the queue). `occupied` and `reconverts` are computed per request, never stored: the library moves under this view and a stale "free" is what would make Restore quietly replace something. |
+| `POST /api/trash/restore` `{"paths": [...], "replace": false}` | Put files back. `200 {"results": [...], "ok": n, "failed": n}` with one result per path, because a bulk call partly succeeding is the normal case and reporting it as one verdict is how somebody concludes a file moved when it did not. Without `replace`, a path whose destination is occupied fails with `occupied: true` and nothing is touched. With it, **the file in the way is moved to the trash, not deleted** - it is itself a restore candidate ten minutes later. At most 500 paths, refused rather than truncated. |
+| `POST /api/trash/delete` `{"paths": [...]}` | Delete from the trash now instead of at retention. Same result shape and same cap. |
 
 **`cancelled` and `canceling` really are spelled differently, and neither is a
 typo.** `cancelled` is the job STATE - a stored database value and a frozen enum

@@ -121,7 +121,7 @@ def cfg() -> dict:
 # A constant compiled into the image cannot be overridden from outside it. Bump
 # it with the image tag: the release workflow refuses a tag that disagrees with
 # it, and a test refuses a Dockerfile that does.
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -178,6 +178,19 @@ def init_db() -> None:
           path TEXT PRIMARY KEY,
           size INTEGER NOT NULL,
           at REAL NOT NULL
+        );
+        -- What is in the trash and where each file came FROM. The mirroring is
+        -- reversible by arithmetic right up until two files land on one
+        -- relative path inside the retention window - trash() then appends
+        -- .1, .2, and no rule can tell that suffix apart from a file genuinely
+        -- called "Movie.1.mkv". Restore puts media back; guessing its
+        -- destination is not something to do with a heuristic.
+        CREATE TABLE IF NOT EXISTS trash (
+          path TEXT PRIMARY KEY,         -- where it is now, inside a trash root
+          original TEXT NOT NULL,        -- where it came from, where Restore returns it
+          bytes INTEGER,
+          at REAL NOT NULL,              -- when it was trashed; retention counts from here
+          job_id TEXT                    -- the job that moved it, when there was one
         );
         """
         + store.SCHEMA
@@ -790,11 +803,16 @@ def run_encode(job_id: str, source: str, names: core.JobNames, src_probe: core.P
     return False, "", error
 
 
-def trash(source: str) -> str:
+def trash(source: str, job_id: str | None = None) -> str:
     """The source is never deleted - it outlives its replacement in the trash.
 
     Mirrored under its media-root-relative path so a recovery is a move back,
     and pruned by age so the trash cannot eat the disk.
+
+    The move is also written to the trash table, because the mirroring stops
+    being reversible the moment the de-duplication below appends a .1: nothing
+    can tell that suffix apart from a file genuinely named "Movie.1.mkv", and
+    Restore puts media back where this says it came from.
     """
     dest = core.trash_destination(source, MEDIA_ROOTS, TRASH_DIR)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -819,6 +837,19 @@ def trash(source: str) -> str:
         os.utime(dest, None)
     except OSError:
         pass
+    # Recorded after the move, so a row never claims a file that is not there.
+    # Best effort on purpose: the media is already safe at this point and a
+    # bookkeeping failure must not turn a completed conversion into a crash.
+    try:
+        size = os.path.getsize(dest)
+    except OSError:
+        size = None
+    try:
+        db().execute("INSERT OR REPLACE INTO trash (path, original, bytes, at, job_id) VALUES (?,?,?,?,?)",
+                     (dest, source, size, time.time(), job_id))
+        db().commit()
+    except sqlite3.Error:
+        log.exception("could not record %s in the trash table - Restore will fall back to deriving its origin", dest)
     return dest
 
 
@@ -847,8 +878,9 @@ def displace(visible: str, expected: tuple | None) -> str:
     Never an unlink, and never left for os.replace to do silently: what is
     being displaced is somebody's episode, and unlike a source - which is only
     ever replaced by a verified encode OF that source - it has no other copy
-    anywhere. It gets the same 30 days in the trash that every replaced source
-    gets, mirrored under the same relative path, so undoing this is a move back.
+    anywhere. It gets the same retention every replaced source gets, mirrored
+    under the same relative path, so undoing this is a move back - and the
+    Trash tab is where somebody does that.
 
     Re-checks the identity it was told to expect. occupied() asked the same
     question moments ago and this is the call that actually destroys something,
@@ -882,6 +914,164 @@ def trash_roots() -> list[str]:
         roots.append(TRASH_DIR)
     roots.append(LEGACY_TRASH)
     return list(dict.fromkeys(roots))
+
+
+# A bulk restore or delete is one HTTP request that moves or destroys that many
+# files. Capped so a runaway client cannot hand the whole trash to one call, and
+# refused rather than truncated - a partial success reported as success is how
+# somebody concludes a file was deleted when it was not.
+MAX_TRASH_BATCH = 500
+
+
+def trash_entry(path: str, row: dict | None, c: dict) -> dict:
+    """One row of the trash view: where it is, where it would go back to, and
+    what restoring it would cost."""
+    original = (row["original"] if row else "") or core.trash_origin(path, MEDIA_ROOTS, TRASH_DIR)
+    try:
+        st = os.stat(path)
+        size, at = st.st_size, (row["at"] if row else st.st_mtime)
+    except OSError:
+        size, at = None, (row["at"] if row else 0)
+    return {
+        "path": path,
+        "original": original,
+        # Derived rather than recorded: a file that predates the trash table,
+        # or one whose row was lost. Surfaced because its name may carry a
+        # de-duplication suffix that no rule can strip safely - see
+        # core.trash_origin.
+        "origin_known": bool(row and row["original"]),
+        "bytes": size,
+        "at": at,
+        "job_id": row["job_id"] if row else None,
+        # Both asked at read time rather than stored: the library moves under
+        # this view, and a stale "free" is what would make Restore quietly
+        # replace something.
+        "occupied": bool(original) and os.path.exists(original),
+        "reconverts": bool(original) and core.will_be_converted_again(
+            original, c["hidden_only"], c["convert_extensions"], c["skip_patterns"]),
+    }
+
+
+def list_trash(limit: int = 500) -> dict:
+    """Everything in the trash, newest first, with its retention.
+
+    Walks the filesystem rather than the table, because the table only knows
+    about files trashed since it existed and a live deployment had 127 GB in
+    there before that. The table supplies the exact origin where it has one.
+    """
+    conn = db()
+    rows = {r["path"]: dict(r) for r in conn.execute("SELECT * FROM trash").fetchall()}
+    c = cfg()
+    entries, total_bytes, total = [], 0, 0
+    for root in trash_roots():
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                p = os.path.join(dirpath, name)
+                total += 1
+                entry = trash_entry(p, rows.get(p), c)
+                total_bytes += entry["bytes"] or 0
+                entries.append(entry)
+    entries.sort(key=lambda e: e["at"], reverse=True)
+    # Rows whose file is gone - pruned, or restored by something else. Cleaned
+    # here rather than in the prune, so the table cannot outlive the disk
+    # whichever of the two removed it.
+    for stale in set(rows) - {e["path"] for e in entries}:
+        conn.execute("DELETE FROM trash WHERE path=?", (stale,))
+    conn.commit()
+    return {"entries": entries[:limit], "total": total, "bytes": total_bytes,
+            "keep_days": c["trash_keep_days"], "shown": min(total, limit)}
+
+
+def in_trash(path: str) -> str:
+    """A caller-supplied path resolved and proven to be a file in the trash.
+
+    "" for anything else. This is the gate on two operations that delete
+    somebody's media, and the API takes paths from the client, so containment
+    is checked against the REAL path - a symlink in the trash pointing at the
+    library would otherwise make Restore and Delete reach anywhere on disk.
+    """
+    try:
+        resolved = os.path.realpath(path)
+    except OSError:
+        return ""
+    if not core.is_within(resolved, [os.path.realpath(r) for r in trash_roots()]):
+        return ""
+    return resolved if os.path.isfile(resolved) else ""
+
+
+def delete_from_trash(paths: list[str]) -> list[dict]:
+    """Delete now, rather than when retention expires."""
+    conn, results = db(), []
+    for raw in paths:
+        p = in_trash(raw)
+        if not p:
+            results.append({"path": raw, "ok": False, "detail": "not a file in the trash"})
+            continue
+        try:
+            os.unlink(p)
+        except OSError as e:
+            results.append({"path": raw, "ok": False, "detail": str(e)})
+            continue
+        conn.execute("DELETE FROM trash WHERE path=?", (p,))
+        results.append({"path": raw, "ok": True, "detail": "deleted"})
+    conn.commit()
+    return results
+
+
+def restore_from_trash(paths: list[str], replace: bool = False) -> list[dict]:
+    """Put files back where they came from.
+
+    `replace` is required when something already holds the destination, and the
+    thing it displaces is TRASHED rather than deleted. The case this exists for
+    is an upgrade that turned out worse than what it replaced - so the file in
+    the way is itself a candidate for being restored ten minutes later, and
+    deleting it outright would make undoing the undo impossible. It costs one
+    more file in the trash and buys back the whole decision.
+    """
+    conn, results = db(), []
+    for raw in paths:
+        p = in_trash(raw)
+        if not p:
+            results.append({"path": raw, "ok": False, "detail": "not a file in the trash"})
+            continue
+        row = conn.execute("SELECT * FROM trash WHERE path=?", (p,)).fetchone()
+        original = (row["original"] if row else "") or core.trash_origin(p, MEDIA_ROOTS, TRASH_DIR)
+        if not original:
+            results.append({"path": raw, "ok": False,
+                            "detail": "nothing recorded this file's origin and it cannot be derived"})
+            continue
+        # The destination is media, so it goes through the same gate every job
+        # does. A trash root pointed somewhere odd must not become a way to
+        # write anywhere on the host.
+        ok, resolved = core.validate_path(original, MEDIA_ROOTS)
+        if not ok:
+            results.append({"path": raw, "ok": False, "detail": f"refusing to restore to {original}: {resolved}"})
+            continue
+        displaced = ""
+        if os.path.exists(resolved):
+            if not replace:
+                results.append({"path": raw, "ok": False, "occupied": True,
+                                "detail": f"{os.path.basename(resolved)} already exists - restoring needs replace"})
+                continue
+            try:
+                displaced = trash(resolved)
+            except OSError as e:
+                results.append({"path": raw, "ok": False, "detail": f"could not move the file in the way: {e}"})
+                continue
+        try:
+            os.makedirs(os.path.dirname(resolved), exist_ok=True)
+            shutil.move(p, resolved)
+        except OSError as e:
+            results.append({"path": raw, "ok": False, "detail": str(e)})
+            continue
+        conn.execute("DELETE FROM trash WHERE path=?", (p,))
+        log.info("restored %s to %s%s", p, resolved, f" (replaced file trashed at {displaced})" if displaced else "")
+        results.append({"path": raw, "ok": True, "restored_to": resolved, "displaced": displaced,
+                        "detail": "restored" + (" and trashed what was in the way" if displaced else "")})
+    conn.commit()
+    return results
 
 
 def prune_trash() -> None:
@@ -1278,14 +1468,26 @@ _warned_missing: set[str] = set()
 VISIBLE_ONLY_SKIPPED = 0
 
 
-def scan_once() -> dict:
+def scan_once(force: bool = False) -> dict:
     """One walk of the watched folders. Returns what it found, for the caller
     that asked for it by hand - the interval's own scan throws the answer away.
+
+    `force` ignores the retry cooldown, and only the on-demand scan sets it.
+    The cooldown exists to stop the WATCHER re-running a permanently failing
+    file every interval forever; somebody pressing "Check for files to convert"
+    is a person asking about those files now, which is the same reason
+    POST /api/jobs has always ignored it. Without this the button answers
+    "nothing new to convert" about 23 files it can see perfectly well and is
+    simply declining to mention - the silence this worker exists to remove.
     """
     global VISIBLE_ONLY_SKIPPED  # noqa: PLW0603
     conn = db()
     now = time.time()
     queued = 0
+    # Eligible, stable, and still not queued. Split by reason, because "nothing
+    # new to convert" and "23 files are sitting out a cooldown you can override"
+    # are different answers and only one of them means there is nothing to do.
+    cooling = pending = 0
     missing: list[str] = []
     # A candidate the stability window has not finished holding yet. Worth
     # counting separately: "found nothing to do" and "found six files that are
@@ -1353,8 +1555,20 @@ def scan_once() -> dict:
                         # container instead of re-encoded.
                         protected = core.matches_skip(name, skip_patterns)
                         kind = "reveal" if (hidden and ext == ".mp4") or protected else "transcode"
-                        if enqueue(resolved, kind):
+                        if enqueue(resolved, kind, force=force):
                             queued += 1
+                        else:
+                            # enqueue says no without saying why, and the two
+                            # reasons mean opposite things to somebody reading
+                            # the answer. One indexed lookup on the index it
+                            # just used.
+                            last = conn.execute(
+                                "SELECT state FROM jobs WHERE path=? ORDER BY created DESC LIMIT 1",
+                                (resolved,)).fetchone()
+                            if last and last["state"] in ("queued", "running"):
+                                pending += 1
+                            else:
+                                cooling += 1
                 else:
                     settling += 1
             # Commit per directory. sqlite3 opens a transaction on the first
@@ -1397,8 +1611,9 @@ def scan_once() -> dict:
     # keeping every one of them forever, and it is the only sweep that runs.
     store.purge_expired_sessions(conn)
     conn.commit()
-    return {"queued": queued, "eligible": hidden_found, "settling": settling,
-            "skipped_visible": visible_skipped, "missing_roots": missing, "at": now}
+    return {"queued": queued, "eligible": hidden_found, "settling": settling, "cooling": cooling,
+            "already_queued": pending, "skipped_visible": visible_skipped,
+            "missing_roots": missing, "at": now}
 
 
 # One walk at a time. The interval's scan and an operator pressing the button
@@ -1420,7 +1635,7 @@ def scan_now() -> dict:
         # waiting on an HTTP response, and a library walk is minutes.
         return {"scanned": False, "detail": "a scan was already running - its results land in the queue"}
     try:
-        return {"scanned": True, **scan_once()}
+        return {"scanned": True, **scan_once(force=True)}
     finally:
         _scan_lock.release()
 
@@ -1961,6 +2176,8 @@ class Handler(BaseHTTPRequestHandler):
                 "audio_codecs": [{"value": v, "label": l} for v, l in store.AUDIO_CODECS],
                 "audio_channels": [{"value": v, "label": l} for v, l in store.AUDIO_CHANNELS],
             })
+        if route == "/api/trash":
+            return self._send(200, list_trash())
         if route == "/api/tokens":
             return self._send(200, {"tokens": store.list_tokens(db())})
         if route == "/api/arrs":
@@ -2238,6 +2455,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"changed": changed})
         if route == "/api/tls/selfsigned":
             return self._self_signed(body)
+
+        if route in ("/api/trash/restore", "/api/trash/delete"):
+            paths = body.get("paths")
+            if not isinstance(paths, list) or not all(isinstance(p, str) and p for p in paths):
+                return self._send(400, {"error": "paths must be a non-empty list of strings"})
+            if len(paths) > MAX_TRASH_BATCH:
+                # A bulk action over media, so the cap is an explicit refusal
+                # rather than a silent truncation that reports success for
+                # files it never touched.
+                return self._send(400, {"error": f"at most {MAX_TRASH_BATCH} paths per request"})
+            if route.endswith("delete"):
+                results = delete_from_trash(paths)
+            else:
+                results = restore_from_trash(paths, replace=bool(body.get("replace")))
+            done = sum(1 for r in results if r["ok"])
+            log.info("trash %s: %s of %s", route.rsplit("/", 1)[1], done, len(results))
+            return self._send(200, {"results": results, "ok": done, "failed": len(results) - done})
 
         if route == "/api/scan":
             # Walk the watched folders now instead of at the next interval, and

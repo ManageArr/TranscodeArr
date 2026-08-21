@@ -357,6 +357,70 @@ class ReplacingAnExistingTarget(unittest.TestCase):
         self.assertFalse(core.may_replace_target(self.BEFORE, same_inode_new_mtime))
 
 
+class TrashOrigin(unittest.TestCase):
+    """Reversing the mirroring, for files that predate the trash table."""
+
+    ROOTS = ["/media"]
+
+    def same(self, got, want):
+        # These paths are built with os.path.join, which is \ on the machine
+        # this is edited on and / on the machine it runs on. The rule being
+        # tested is the mapping, not the separator.
+        self.assertEqual(os.path.normcase(os.path.normpath(got)),
+                         os.path.normcase(os.path.normpath(want)))
+
+    def test_it_reverses_trash_destination(self):
+        source = "/media/TV/Show/Season 01/.Show - S01E01.mkv"
+        trashed = core.trash_destination(source, self.ROOTS)
+        self.same(core.trash_origin(trashed, self.ROOTS), source)
+
+    def test_it_reverses_an_overridden_trash_location(self):
+        source = "/media/Movies/Film/.Film.mkv"
+        trashed = core.trash_destination(source, self.ROOTS, "/scratch/bin")
+        self.same(core.trash_origin(trashed, self.ROOTS, "/scratch/bin"), source)
+
+    def test_a_path_outside_every_trash_root_has_no_origin(self):
+        # The guard against handing Restore an arbitrary destination.
+        self.assertEqual(core.trash_origin("/media/TV/Show/Show.mp4", self.ROOTS), "")
+        self.assertEqual(core.trash_origin("/etc/passwd", self.ROOTS), "")
+
+    def test_it_does_not_invent_a_de_duplicated_name(self):
+        # trash() appends .1 when one relative path is trashed twice, and
+        # nothing can tell that suffix from a file genuinely called
+        # "Movie.1.mkv". Returning the name as-is is wrong in a way the restore
+        # dialog SHOWS; stripping it is wrong in a way that silently restores
+        # over the wrong file. The trash table is what gets this right.
+        trashed = "/media/.transcodearr-trash/Movies/.Movie.1.mkv"
+        self.same(core.trash_origin(trashed, self.ROOTS), "/media/Movies/.Movie.1.mkv")
+
+
+class RestoringPutsItBackInTheQueue(unittest.TestCase):
+    """Restoring a SOURCE undoes itself: the watcher finds it again."""
+
+    EXTS = [".mkv", ".avi"]
+
+    def check(self, name, hidden_only=True, skips=None):
+        return core.will_be_converted_again("/media/TV/" + name, hidden_only, self.EXTS, skips or [])
+
+    def test_a_restored_hidden_source_is_converted_again(self):
+        self.assertTrue(self.check(".Show - S01E01.mkv"))
+
+    def test_a_restored_visible_output_is_not(self):
+        # The case the Restore button is actually for: an upgrade replaced a
+        # good .mp4, the upgrade was worse, put the .mp4 back. A visible .mp4
+        # is not eligible for anything, so it simply stays.
+        self.assertFalse(self.check("Show - S01E01.mp4"))
+
+    def test_a_hidden_mp4_is_eligible_because_it_still_needs_revealing(self):
+        self.assertTrue(self.check(".Show - S01E01.mp4"))
+
+    def test_a_skip_rule_still_wins(self):
+        self.assertFalse(self.check(".Show - S01E01.mkv", skips=["S01E01"]))
+
+    def test_with_hidden_only_off_a_visible_source_is_eligible_again(self):
+        self.assertTrue(self.check("Show - S01E01.mkv", hidden_only=False))
+
+
 class ErrorSummary(unittest.TestCase):
     """What a failed job is allowed to say. The old tail said nothing."""
 

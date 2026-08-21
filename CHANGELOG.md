@@ -17,9 +17,75 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.0.2` is the release to run. Everything in the sections below is in it and is
+`1.0.3` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.0.3] - 2026-08-20
+
+### Added
+
+- **A Trash tab: see what is in there, restore it, or delete it early.** The
+  trash has always been the thing that makes replacing an original safe, and
+  until now the only way to look in it was a shell. It lists every file with
+  where it came from, its size, and how many days it has left, and it does
+  per-row and bulk Restore and Delete.
+
+  **Restore can replace what is in the way**, which is the case it exists for:
+  an arr imports an "upgrade", 1.0.2 replaces the old conversion with it, and
+  the upgrade turns out worse. That needs `replace`, it confirms first - naming
+  the files and saying plainly that they are what the media server is serving
+  right now - and **the file it pushes aside is trashed, not deleted**. The
+  thing being displaced by a restore is itself a restore candidate ten minutes
+  later; deleting it would make undoing the undo impossible. It costs one more
+  file in the trash and buys back the whole decision.
+
+  Restoring a **source** is reported as putting it back in the queue, because
+  it does: a dot-hidden `.mkv` is exactly what the watcher exists to find, so
+  it is converted again and trashed again. Restoring a replaced **output** - a
+  visible `.mp4`, the case above - is not eligible for anything and simply
+  stays. The listing marks which is which before anything is pressed.
+
+  Both operations take paths from an HTTP body, so containment is checked
+  against the **real** path: a symlink inside the trash pointing at the library
+  would otherwise turn Delete into an arbitrary unlink. A bulk call is capped
+  and refused rather than truncated, because a partial success reported as
+  success is how somebody concludes a file was deleted when it was not.
+
+- **A `trash` table recording where each trashed file came from.** The
+  mirroring is reversible by arithmetic right up until two files land on one
+  relative path inside the retention window - `trash()` then appends `.1`, and
+  nothing can tell that suffix apart from a file genuinely named `Movie.1.mkv`.
+  Restore puts media back; its destination is not something to guess. Files
+  already in the trash from before this release still list and still restore,
+  from the derived origin, and are marked as derived.
+
+- **Retention is on the Trash tab.** `trash_keep_days` was only in the General
+  settings form, which is not where somebody is standing when they think about
+  how long this is kept. Same setting, same 7-day default, adjustable from the
+  view it governs.
+
+### Changed
+
+- **"Check for files to convert" now ignores the retry cooldown.** It reported
+  `Nothing new to convert` about 23 files it could see perfectly well and was
+  simply declining to mention - they were inside the six-hour cooldown after a
+  failure. The cooldown exists to stop the WATCHER re-running a permanently
+  failing file every interval; a person pressing the button is asking about
+  those files now, which is the same reason `POST /api/jobs` has always ignored
+  it. The interval's own scan still honours it.
+
+  The answer also breaks down what it did not queue: how many were already
+  queued or running, how many were held by the cooldown, how many are still
+  settling, how many were skipped for not being dot-hidden. "Nothing new" and
+  "23 files are waiting on something you can override" are different answers.
+
+### Fixed
+
+- **A conversion that grew read `-21% smaller`.** Re-encoding an
+  already-converted file can land bigger, and the double negative made the
+  reader unpick a minus sign to learn the file grew. It says `21% larger` now,
+  and `same size` at zero.
 
 ## [1.0.2] - 2026-08-20
 
