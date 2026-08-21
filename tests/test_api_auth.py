@@ -281,6 +281,52 @@ class RunControls(ApiCase):
         self.assertTrue(self.call("GET", "/healthz", token=None)[1]["auth_configured"])
 
 
+class TheQueueShowsWhatItIsWaitingFor(ApiCase):
+    """A file asked-about is not in the queue and has no job - it would simply
+    vanish from view after failing, which is the silence this worker exists to
+    remove."""
+
+    def test_the_queue_carries_the_replacements_it_is_waiting_on(self):
+        conn = main.db()
+        conn.execute("DELETE FROM replacements")
+        conn.execute(
+            "INSERT INTO replacements (path, arr_id, arr_name, kind, item_id, episode_id, release, at, note) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            ("/media/TV/Show/.Show - S01E01.mkv", "a1", "Sonarr", "sonarr", 126, 10984,
+             "Show.S01.1080p-GRP", time.time(), "blocklisted it"))
+        conn.commit()
+        main._REPLACEMENTS = (0.0, [])            # the cache must not hide a new row
+        self.addCleanup(setattr, main, "_REPLACEMENTS", (0.0, []))
+        with mock.patch.object(main.store, "list_arrs", lambda conn, redact=True: []):
+            status, body, _headers = self.call("GET", "/api/queue")
+        self.assertEqual(status, 200)
+        [waiting] = body["awaiting_replacement"]
+        self.assertEqual(waiting["name"], ".Show - S01E01.mkv")
+        self.assertEqual(waiting["release"], "Show.S01.1080p-GRP")
+        # No arr reachable, so no download to report - and that is a state, not
+        # an error: searching, nothing found, or already imported all look the
+        # same from here.
+        self.assertIsNone(waiting["download"])
+
+    def test_a_replacement_stops_being_shown_once_something_converts(self):
+        conn = main.db()
+        conn.execute("DELETE FROM replacements")
+        conn.execute("DELETE FROM jobs")
+        path = "/media/TV/Show/.Show - S01E02.mkv"
+        conn.execute(
+            "INSERT INTO replacements (path, arr_id, arr_name, kind, item_id, episode_id, release, at, note) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (path, "a1", "Sonarr", "sonarr", 126, 1, "r", time.time() - 100, "n"))
+        conn.execute("INSERT INTO jobs (id, path, state, kind, created) VALUES (?,?,?,?,?)",
+                     ("j1", path, "done", "transcode", time.time()))
+        conn.commit()
+        main._REPLACEMENTS = (0.0, [])
+        self.addCleanup(setattr, main, "_REPLACEMENTS", (0.0, []))
+        with mock.patch.object(main.store, "list_arrs", lambda conn, redact=True: []):
+            self.assertEqual(main.replacements_view(), [])
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM replacements").fetchone()[0], 0)
+
+
 class NothingIsCacheable(ApiCase):
     """The UI is one file that changes every release and carried no validator.
 

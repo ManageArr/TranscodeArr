@@ -333,7 +333,9 @@ class AskingAnArrForAReplacement(JobCase):
 
             def replace_bad_file(self, path, allow_packs=False):
                 asked.append((path, allow_packs))
-                return True, "Sonarr: blocklisted Some.Release-GRP and asked for a replacement"
+                return (True, "Sonarr: blocklisted Some.Release-GRP and asked for a replacement",
+                        {"arr_id": "a1", "arr_name": "Sonarr", "kind": "sonarr",
+                         "item_id": 126, "episode_id": 10984, "release": "Some.Release-GRP"})
 
         with mock.patch.object(main.store, "list_arrs", lambda conn, redact=True: rows),                 mock.patch.object(main, "_client_for", FakeArr),                 mock.patch.object(main, "cfg", lambda: settings):
             main.request_replacement("job1234", source, error)

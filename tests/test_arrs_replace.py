@@ -29,11 +29,17 @@ class BlocklistScope(unittest.TestCase):
         """The client with its lookups stubbed, so only the gate is under test."""
         client = self.client()
         posted = []
-        with mock.patch.object(client, "_owning_item", lambda f: (SERIES, "/tv/Criminal Minds/x.mkv")), \
-             mock.patch.object(client, "_grab_history_id",
-                               lambda item, path: (history_id, "Criminal.Minds.S07.1080p-iVy", release_type)), \
-             mock.patch.object(arrs, "_request", lambda *a, **k: (posted.append(a[1]), (None, None))[1]):
-            handled, message = client.replace_bad_file(FILE, allow_packs=allow_packs)
+        grab = None if history_id is None else {
+            "id": history_id, "release": "Criminal.Minds.S07.1080p-iVy",
+            "type": release_type, "episode_id": 10984,
+        }
+        stub_grab = lambda item, path: (grab, "" if grab else "no grab in this arr's history")  # noqa: E731
+        stub_post = lambda *a, **k: (posted.append(a[1]), (None, None))[1]  # noqa: E731
+        with mock.patch.object(client, "_owning_item", lambda f: (SERIES, "/tv/Criminal Minds/x.mkv")):
+            with mock.patch.object(client, "_grab", stub_grab):
+                with mock.patch.object(arrs, "_request", stub_post):
+                    handled, message, found = client.replace_bad_file(FILE, allow_packs=allow_packs)
+        self.found = found
         return handled, message, posted
 
     def test_a_single_episode_release_is_blocklisted_without_asking(self):

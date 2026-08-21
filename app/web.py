@@ -279,6 +279,12 @@ document.documentElement.dataset.theme=localStorage.theme||'dark'</script>
   <div class="meters" id="host"></div>
  </div>
  <div class="card now" id="nowcard"><h2>Converting now</h2><div id="now"></div></div>
+ <div class="card" id="awaitcard" style="display:none">
+  <h2>Waiting on a replacement</h2>
+  <p class="hint">These failed because the file itself is unreadable, so the release was blocklisted and the
+   arr was asked for a different one. There is nothing to convert until a new file lands.</p>
+  <table id="awaittable"></table>
+ </div>
  <div class="card">
   <h2>Up next</h2>
   <p class="hint" id="queuehint">In the order they will run - one at a time, oldest first.</p>
@@ -695,8 +701,36 @@ async function refreshHost(){
  $('host').innerHTML=out.join('');
 }
 
+// A file here has no job to show: it failed, and the next one cannot exist
+// until the arr delivers. Without this the file simply disappears from view,
+// which is the silence this worker exists to remove.
+function renderAwaiting(list){
+ const rows=list||[];
+ $('awaitcard').style.display=rows.length?'':'none';
+ if(!rows.length)return;
+ $('awaittable').innerHTML='<tr><th>File</th><th>Asked</th><th>Blocklisted</th><th>Download</th></tr>'+
+  rows.map(r=>{
+   const d=r.download;
+   let state;
+   if(!d) state='<span class="tag">searching</span>';
+   else if(d.error) state=`<span class="tag">${esc(d.status||'error')}</span> <code>${esc(d.error)}</code>`;
+   else state=`<span class="tag">${esc(d.status||'downloading')}</span> `+
+     (d.percent==null?'':`${d.percent}% `)+`<code>${esc((d.title||'').slice(0,58))}</code>`;
+   return `<tr><td>${esc(r.name)}</td><td>${esc(ago(r.asked_at))}</td>`+
+    `<td><code>${esc((r.release||'').slice(0,44))}</code></td><td>${state}</td></tr>`;
+  }).join('');
+}
+const ago=t=>{
+ const s=Math.max(0,Math.floor(Date.now()/1000-t));
+ if(s<90)return 'just now';
+ if(s<5400)return Math.round(s/60)+'m ago';
+ if(s<172800)return Math.round(s/3600)+'h ago';
+ return Math.round(s/86400)+'d ago';
+};
+
 async function refreshQueue(){
  const q=await api('/api/queue?limit=200');
+ renderAwaiting(q.awaiting_replacement);
  const r=(q.running||[])[0];
  if(r){
   const pct=Math.max(0,Math.min(100,r.progress||0));

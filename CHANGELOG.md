@@ -17,9 +17,34 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.2.0` is the release to run. Everything in the sections below is in it and is
+`1.3.0` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.3.0] - 2026-08-21
+
+### Added
+
+- **The Queue shows what it is waiting for.** A file handed to an arr for
+  replacement has no job to show - it failed, and the next job cannot exist
+  until a new file lands - so it vanished from the UI at exactly the moment
+  somebody would want to know what was happening to it. A **Waiting on a
+  replacement** card now lists each one with the release that was blocklisted,
+  when it was asked, and what the arr's own download queue says: searching,
+  downloading with a percentage, or the arr's error message.
+
+  A row clears when a later job for that path converts. That is the only
+  signal that means the replacement actually arrived and worked - the arr's
+  queue going quiet looks identical whether the download finished, never
+  started, or was rejected on import. Anything nobody delivers is dropped
+  after 14 days.
+
+  The arr's ids are recorded when the request is made rather than re-derived
+  per poll, which would be three API calls per waiting file per refresh, and
+  the whole view is cached for 20 seconds however many browser tabs are open.
+  `trackedDownloadState` is what gets shown, not `status`: the latter still
+  says "downloading" for something stalled, waiting to import, or about to be
+  retried.
 
 ## [1.2.0] - 2026-08-21
 

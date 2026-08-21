@@ -662,6 +662,24 @@ Three things it deliberately will not do:
 - **It asks once per file.** If the replacement is also unreadable, another
   download will not fix it, and it stops for a person to look.
 
+#### Watching the replacement arrive
+
+A file waiting on a replacement has no job to show - it failed, and the next
+job cannot exist until a new file lands. Without somewhere to say so it would
+simply vanish from the UI after failing, so the Queue tab grows a **Waiting on
+a replacement** card listing each one with what was blocklisted, when it was
+asked, and what the arr's own download queue says about it: searching,
+downloading with a percentage, or the arr's error.
+
+A row clears when a later job for that path finally converts, which is the only
+signal that actually means the replacement arrived and worked - the arr's queue
+going quiet looks identical whether the download finished, never started, or
+was rejected on import. Anything nobody delivers is dropped after 14 days.
+
+The arr is polled at most every 20 seconds however many browser tabs are open,
+because the answer changes at download speed and a cache miss costs somebody
+else's Sonarr a request.
+
 #### Season packs are your call, not a guess
 
 A grab records what it was, and the arr is asked rather than the title parsed:

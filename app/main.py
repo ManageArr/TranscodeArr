@@ -121,7 +121,7 @@ def cfg() -> dict:
 # A constant compiled into the image cannot be overridden from outside it. Bump
 # it with the image tag: the release workflow refuses a tag that disagrees with
 # it, and a test refuses a Dockerfile that does.
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -185,6 +185,21 @@ def init_db() -> None:
         -- .1, .2, and no rule can tell that suffix apart from a file genuinely
         -- called "Movie.1.mkv". Restore puts media back; guessing its
         -- destination is not something to do with a heuristic.
+        -- What we asked an arr to replace, and enough of the arr's own ids to
+        -- ask it later how that is going. Without this the queue view would
+        -- have to re-derive series and episode from the path on every poll,
+        -- which is three API calls per file per refresh.
+        CREATE TABLE IF NOT EXISTS replacements (
+          path TEXT PRIMARY KEY,
+          arr_id TEXT,
+          arr_name TEXT,
+          kind TEXT,                     -- sonarr | radarr
+          item_id INTEGER,               -- seriesId, or movieId
+          episode_id INTEGER,            -- sonarr only
+          release TEXT,                  -- what was blocklisted, for the UI
+          at REAL NOT NULL,
+          note TEXT
+        );
         CREATE TABLE IF NOT EXISTS trash (
           path TEXT PRIMARY KEY,         -- where it is now, inside a trash root
           original TEXT NOT NULL,        -- where it came from, where Restore returns it
@@ -1255,11 +1270,22 @@ def request_replacement(job_id: str, source: str, error: str) -> None:
         if not row["enabled"]:
             continue
         try:
-            handled, message = _client_for(row).replace_bad_file(source, allow_packs)
+            handled, message, found = _client_for(row).replace_bad_file(source, allow_packs)
         except Exception as e:  # noqa: BLE001 - an arr must never take a job down
-            handled, message = True, f"{row['name']}: {e}"
+            handled, message, found = True, f"{row['name']}: {e}", None
         if handled:
             notes.append(message)
+            if found:
+                # Recorded so the Queue can show how the replacement is going.
+                # Re-deriving series and episode from the path on every poll
+                # would be three API calls per file per refresh.
+                conn.execute(
+                    "INSERT OR REPLACE INTO replacements "
+                    "(path, arr_id, arr_name, kind, item_id, episode_id, release, at, note) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (source, found["arr_id"], found["arr_name"], found["kind"], found["item_id"],
+                     found["episode_id"], found["release"], time.time(), message))
+                conn.commit()
             break   # one arr owns the file; asking the rest would be asking about somebody else's library
     if not notes:
         notes.append("no linked arr owns this file")
@@ -1964,6 +1990,60 @@ def _metrics() -> str:
     return "\n".join(lines) + "\n"
 
 
+# Every open Queue tab polls, and each poll would otherwise be one arr request
+# per waiting file. The answer changes at download speed, so seconds of staleness
+# costs nothing and a cache miss costs somebody else's Sonarr.
+_REPLACEMENTS: tuple[float, list[dict]] = (0.0, [])
+REPLACEMENT_POLL_SECONDS = 20
+# A replacement nobody ever delivered should not sit in the queue view forever.
+REPLACEMENT_GIVE_UP_DAYS = 14
+
+
+def replacements_view() -> list[dict]:
+    """Files waiting on an arr to deliver a better copy, and how that is going.
+
+    Cleared when a later job for that path finally converts - which is the only
+    signal that actually means "a replacement arrived and worked". The arr's
+    queue going quiet does not: it looks identical whether the download
+    finished, never started, or was rejected on import.
+    """
+    global _REPLACEMENTS  # noqa: PLW0603
+    fresh, cached = _REPLACEMENTS
+    if time.time() - fresh < REPLACEMENT_POLL_SECONDS:
+        return cached
+    conn = db()
+    conn.execute("DELETE FROM replacements WHERE at < ?",
+                 (time.time() - REPLACEMENT_GIVE_UP_DAYS * 86400,))
+    # A conversion that succeeded after the request is the replacement landing.
+    conn.execute("DELETE FROM replacements WHERE path IN ("
+                 "SELECT r.path FROM replacements r JOIN jobs j ON j.path = r.path "
+                 "WHERE j.state = 'done' AND j.created > r.at)")
+    conn.commit()
+    out = []
+    for row in conn.execute("SELECT * FROM replacements ORDER BY at DESC").fetchall():
+        arr = next((a for a in store.list_arrs(conn, redact=False) if a["id"] == row["arr_id"]), None)
+        status = None
+        if arr:
+            try:
+                status = _client_for(arr).queue_status(row["item_id"], row["episode_id"])
+            except Exception:  # noqa: BLE001 - the queue view must not fail on an unreachable arr
+                log.debug("could not read %s's queue", row["arr_name"], exc_info=True)
+        out.append({
+            "path": row["path"],
+            "name": os.path.basename(row["path"]),
+            "arr": row["arr_name"],
+            "release": row["release"],
+            "asked_at": row["at"],
+            "note": row["note"],
+            # None means the arr is not downloading anything for this yet, which
+            # is a real state and not an error: searching, nothing found, or
+            # already imported and waiting for the next scan to pick it up.
+            "download": status,
+        })
+    _REPLACEMENTS = (time.time(), out)
+    return out
+
+
 def _queue_view(limit: int) -> dict:
     """What is converting now, and what is next - in the order it will happen.
 
@@ -1980,6 +2060,7 @@ def _queue_view(limit: int) -> dict:
               conn.execute("SELECT * FROM jobs WHERE state='queued' ORDER BY priority, created LIMIT ?",
                            (limit,)).fetchall()]
     total = conn.execute("SELECT COUNT(*) FROM jobs WHERE state='queued'").fetchone()[0]
+    waiting = replacements_view()
     transcodes = conn.execute(
         "SELECT COUNT(*) FROM jobs WHERE state='queued' AND kind='transcode'").fetchone()[0]
 
@@ -2003,6 +2084,11 @@ def _queue_view(limit: int) -> dict:
         "eta_seconds": round(per_job * transcodes / max(1, cfg()["max_concurrent"])) if per_job else None,
         "sampled": len(spans),
         "max_concurrent": cfg()["max_concurrent"],
+        # Files this worker has given up on and asked an arr to replace. They
+        # are not in the queue above - there is nothing to convert until a new
+        # file lands - and without this they would simply vanish from view
+        # after failing, which is the silence this worker exists to remove.
+        "awaiting_replacement": waiting,
     }
 
 
