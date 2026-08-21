@@ -322,6 +322,50 @@ class TheTrashCanBeUndone(JobCase):
         self.assertFalse(result["ok"], "a symlink walked out of the trash")
         self.assertEqual(self.read(keep), "somebody's media")
 
+    def fill_trash(self, n):
+        """n files in the trash, trashed in a known order."""
+        for i in range(n):
+            source = self.write(f".Film {i:02d}.mkv", f"original {i}")
+            row = self.run_job(self.claim(source), self.encoder_that_writes(f"encode {i}"))
+            self.assertEqual(row["state"], "done", row["error"])
+        return main.list_trash(limit=1000)["total"]
+
+    def test_paging_walks_every_file_exactly_once(self):
+        # The bug a pager has when its sort has ties: one row on two pages and
+        # another on none. Files trashed in one burst share a timestamp to the
+        # resolution that matters, so path breaks the tie.
+        total = self.fill_trash(7)
+        self.assertEqual(total, 7)
+        seen = []
+        for offset in (0, 3, 6):
+            page = main.list_trash(limit=3, offset=offset)
+            self.assertEqual(page["total"], 7)
+            self.assertEqual(page["offset"], offset)
+            seen += [e["path"] for e in page["entries"]]
+        self.assertEqual(len(seen), 7)
+        self.assertEqual(len(set(seen)), 7, "a file appeared on two pages")
+
+    def test_a_page_past_the_end_shows_the_last_page_not_a_blank_one(self):
+        # A bulk delete shortens the list under whoever ran it. Clamping to the
+        # end of the list leaves a blank table and a working Previous button.
+        self.fill_trash(5)
+        page = main.list_trash(limit=2, offset=999)
+        self.assertEqual(page["offset"], 4)
+        self.assertEqual(page["shown"], 1)
+        self.assertEqual(page["total"], 5)
+
+    def test_an_empty_trash_pages_without_complaining(self):
+        page = main.list_trash(limit=10, offset=40)
+        self.assertEqual((page["total"], page["shown"], page["offset"]), (0, 0, 0))
+
+    def test_the_totals_describe_the_whole_trash_not_the_page(self):
+        # The header count is what somebody reads before pressing Select all.
+        self.fill_trash(4)
+        page = main.list_trash(limit=1, offset=0)
+        self.assertEqual(page["shown"], 1)
+        self.assertEqual(page["total"], 4)
+        self.assertGreater(page["bytes"], page["entries"][0]["bytes"])
+
     def test_a_bulk_call_reports_each_path_separately(self):
         _s1, e1 = self.trashed_one(".One.mkv", "one")
         source2 = self.write(".Two.mkv", "two")

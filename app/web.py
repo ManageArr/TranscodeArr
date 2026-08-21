@@ -321,11 +321,18 @@ document.documentElement.dataset.theme=localStorage.theme||'dark'</script>
  <div class="card">
   <div class="row" style="margin-bottom:.8rem">
    <button class="ghost" onclick="refreshTrash()">Refresh</button>
+   <button class="ghost" id="trashall" onclick="trashSelectAll(this)">Select all</button>
+   <button class="ghost" onclick="trashClear()">Clear selection</button>
    <button class="ghost" id="trashrestore" onclick="trashAction('restore',this)">Restore selected</button>
    <button class="ghost danger" id="trashdelete" onclick="trashAction('delete',this)">Delete selected</button>
-   <span class="hint" id="trashsel"></span>
   </div>
+  <p class="hint" id="trashsel"></p>
   <table id="trashtable"></table>
+  <div class="row" style="margin-top:.8rem">
+   <button class="ghost" id="trashprev" onclick="trashPage(-1)">Previous</button>
+   <button class="ghost" id="trashnext" onclick="trashPage(1)">Next</button>
+   <span class="hint" id="trashrange"></span>
+  </div>
  </div>
 </section>
 
@@ -864,25 +871,36 @@ async function refreshJobs(){
   }).join(''):'<tr><td colspan="6">Nothing here yet.</td></tr>');
 }
 // ---- trash ---------------------------------------------------------------
-let TRASH={entries:[]};
+let TRASH={entries:[],total:0,offset:0,limit:100,keep_days:0,bytes:0,shown:0};
+// Keyed by PATH and held outside the page, so a selection survives paging -
+// without that, "mass delete" on 633 files means acting one page at a time and
+// the word mass does no work. Holding the entry too keeps the restore confirm
+// able to say what it is about to replace, on a page no longer on screen.
+let TRASHSEL=new Map();
 const days=n=>n===1?'1 day':n+' days';
 
-async function refreshTrash(){
- TRASH=await api('/api/trash');
+async function refreshTrash(offset){
+ const off=offset===undefined?(TRASH.offset||0):offset;
+ TRASH=await api(`/api/trash?limit=${TRASH.limit||100}&offset=${off}`);
  $('trashdays').value=TRASH.keep_days;
  $('trashfacts').innerHTML=
   `<div><b>${TRASH.total}</b><span>file${TRASH.total===1?'':'s'} kept</span></div>`+
   `<div><b>${gb(TRASH.bytes)}</b><span>on disk</span></div>`+
-  `<div><b>${days(TRASH.keep_days)}</b><span>retention</span></div>`+
-  (TRASH.total>TRASH.shown?`<div><b>${TRASH.shown}</b><span>shown</span></div>`:'');
+  `<div><b>${days(TRASH.keep_days)}</b><span>retention</span></div>`;
  const now=Date.now()/1000;
- $('trashtable').innerHTML='<tr><th></th><th>File</th><th>Goes back to</th><th>Size</th><th>Deleted in</th><th></th></tr>'+
+ $('trashtable').innerHTML=
+  '<tr><th><input type="checkbox" id="trashpageall" onchange="trashTogglePage(this)" '+
+  'title="Select everything on this page"></th>'+
+  '<th>File</th><th>Goes back to</th><th>Size</th><th>Deleted in</th><th></th></tr>'+
   (TRASH.entries.length?TRASH.entries.map((e,i)=>{
    const left=TRASH.keep_days?Math.max(0,Math.ceil(TRASH.keep_days-(now-e.at)/86400)):0;
    const flags=[e.occupied?'<span class="tag">name in use</span>':'',
                 e.reconverts?'<span class="tag">converts again</span>':'',
                 e.origin_known?'':'<span class="tag">origin guessed</span>'].join('');
-   return `<tr><td><input type="checkbox" data-trash="${i}" onchange="trashSel()"></td>`+
+   // The index addresses the DOM; the Map is keyed by path. A file pruned
+   // between two page loads shifts an index, and never a selection.
+   return `<tr><td><input type="checkbox" data-trash="${i}" ${TRASHSEL.has(e.path)?'checked':''} `+
+    `onchange="trashToggle(${i},this)"></td>`+
     `<td>${esc(e.path.split('/').pop())}</td>`+
     `<td><code>${esc(e.original||'unknown')}</code> ${flags}</td>`+
     `<td>${e.bytes?gb(e.bytes):''}</td>`+
@@ -890,15 +908,70 @@ async function refreshTrash(){
     `<td><button class="ghost" data-restore="${i}">Restore</button>`+
     `<button class="ghost danger" data-del="${i}">Delete</button></td></tr>`;
   }).join(''):'<tr><td colspan="6">The trash is empty.</td></tr>');
+ const first=TRASH.total?TRASH.offset+1:0, last=TRASH.offset+TRASH.shown;
+ $('trashrange').textContent=TRASH.total?`${first}-${last} of ${TRASH.total}`:'';
+ $('trashprev').disabled=TRASH.offset<=0;
+ $('trashnext').disabled=last>=TRASH.total;
+ $('trashall').textContent=TRASH.total>TRASH.shown?`Select all ${TRASH.total}`:'Select all';
  trashSel();
 }
 
-function trashSel(){
- const n=document.querySelectorAll('[data-trash]:checked').length;
- $('trashsel').textContent=n?`${n} selected`:'Select files, or use the buttons on a row.';
+function trashPage(dir){
+ const step=TRASH.limit||100;
+ const next=Math.max(0,(TRASH.offset||0)+dir*step);
+ if(next>=TRASH.total&&dir>0)return;
+ refreshTrash(next).catch(e=>say('trashmsg',e.message,true));
 }
-const trashPicked=()=>[...document.querySelectorAll('[data-trash]:checked')]
- .map(c=>TRASH.entries[+c.dataset.trash]).filter(Boolean);
+
+function trashToggle(i,el){
+ const e=TRASH.entries[i];
+ if(!e)return;
+ if(el.checked)TRASHSEL.set(e.path,e); else TRASHSEL.delete(e.path);
+ trashSel();
+}
+
+function trashTogglePage(el){
+ TRASH.entries.forEach(e=>el.checked?TRASHSEL.set(e.path,e):TRASHSEL.delete(e.path));
+ document.querySelectorAll('[data-trash]').forEach(c=>{c.checked=el.checked;});
+ trashSel();
+}
+
+function trashClear(){
+ TRASHSEL.clear();
+ document.querySelectorAll('[data-trash]').forEach(c=>{c.checked=false;});
+ const head=$('trashpageall'); if(head)head.checked=false;
+ trashSel();
+}
+
+// Walks every page rather than adding a server-side "everything" flag: one
+// request that deletes the whole trash is a request somebody sends by accident,
+// and the batch cap exists to stop exactly that. This ends up with the real
+// paths in hand, which is what the actions take anyway.
+async function trashSelectAll(btn){
+ await busy(btn,'Selecting every page...',async()=>{
+  try{
+   let off=0,total=1,guard=0;
+   while(off<total&&guard++<200){
+    const p=await api(`/api/trash?limit=500&offset=${off}`);
+    total=p.total;
+    if(!p.entries.length)break;
+    p.entries.forEach(e=>TRASHSEL.set(e.path,e));
+    off+=p.entries.length;
+   }
+   await refreshTrash(TRASH.offset);
+  }catch(e){say('trashmsg',e.message,true);}
+ });
+}
+
+function trashSel(){
+ const n=TRASHSEL.size;
+ const bytes=[...TRASHSEL.values()].reduce((a,e)=>a+(e.bytes||0),0);
+ const head=$('trashpageall');
+ if(head)head.checked=TRASH.entries.length>0&&TRASH.entries.every(e=>TRASHSEL.has(e.path));
+ $('trashsel').textContent=n
+  ?`${n} selected (${gb(bytes)})${n>TRASH.shown?' - including files on other pages':''}`
+  :'Nothing selected. Tick rows, use Select all, or use the buttons on a row.';
+}
 
 // The confirm is the whole point of the replace path: restoring over a file
 // that is playable right now is the one action here that costs somebody
@@ -915,27 +988,48 @@ function confirmRestore(list){
   `\n\nReplace and restore?`);
 }
 
+// The server caps a batch at 500 files, so a selection larger than that is sent
+// as several requests. Chunked here rather than raising the cap: the cap is
+// what stops one accidental request from moving an entire library, and the
+// per-path results come back the same either way.
+const TRASH_CHUNK=500;
+
 async function trashAction(which,btn,one){
- const list=one!==undefined?[TRASH.entries[one]]:trashPicked();
+ const list=one!==undefined?[TRASH.entries[one]]:[...TRASHSEL.values()];
  if(!list.length){say('trashmsg','Nothing selected.',true);return;}
+ const size=gb(list.reduce((a,e)=>a+(e.bytes||0),0));
  if(which==='delete'&&!confirm(
-   `Delete ${list.length} file${list.length===1?'':'s'} from the trash for good?\n\n`+
+   `Delete ${list.length} file${list.length===1?'':'s'} (${size}) from the trash for good?\n\n`+
    `This is the copy that exists so a conversion can be undone. There is no other one.`))return;
  const replace=which==='restore';
  if(replace&&!confirmRestore(list))return;
  const reconv=which==='restore'?list.filter(e=>e.reconverts).length:0;
  await busy(btn||$('trash'+which),which==='restore'?'Restoring...':'Deleting...',async()=>{
+  let ok=0,failed=0;const why=[];
   try{
-   const z=await api('/api/trash/'+which,{method:'POST',
-     body:JSON.stringify({paths:list.map(e=>e.path),replace})});
-   const failed=z.results.filter(r=>!r.ok);
-   let m=`${z.ok} ${which==='restore'?'restored':'deleted'}`+(z.failed?`, ${z.failed} failed`:'')+'.';
-   if(reconv)m+=` ${reconv} will be converted again on the next scan - they are sources, and the watcher `+
-     `finds them the same way it did the first time.`;
-   if(failed.length)m+=' '+failed.slice(0,3).map(r=>r.detail).join('; ');
-   say('trashmsg',m,z.failed>0);
-   await refreshTrash();
-  }catch(e){say('trashmsg',e.message,true);}
+   for(let i=0;i<list.length;i+=TRASH_CHUNK){
+    const batch=list.slice(i,i+TRASH_CHUNK);
+    if(list.length>TRASH_CHUNK)
+     say('trashmsg',`${which==='restore'?'Restoring':'Deleting'} ${i+1}-${i+batch.length} of ${list.length}...`);
+    const z=await api('/api/trash/'+which,{method:'POST',
+      body:JSON.stringify({paths:batch.map(e=>e.path),replace})});
+    ok+=z.ok;failed+=z.failed;
+    z.results.filter(r=>!r.ok).forEach(r=>why.push(r.detail));
+    // Dropped as each batch lands, so a failure part-way leaves a selection
+    // holding exactly what was NOT dealt with.
+    z.results.filter(r=>r.ok).forEach(r=>TRASHSEL.delete(r.path));
+   }
+  }catch(e){say('trashmsg',e.message,true);await refreshTrash(0);return;}
+  let m=`${ok} ${which==='restore'?'restored':'deleted'}`+(failed?`, ${failed} failed`:'')+'.';
+  if(reconv)m+=` ${reconv} will be converted again on the next scan - they are sources, and the watcher `+
+    `finds them the same way it did the first time.`;
+  if(why.length)m+=' '+[...new Set(why)].slice(0,3).join('; ');
+  say('trashmsg',m,failed>0);
+  // A bulk action usually empties the page it ran from, so go back to the
+  // start; a single row leaves the rest of the page intact and staying put is
+  // the whole point of having per-row buttons. Either way the server clamps an
+  // offset that has fallen off the end.
+  await refreshTrash(one!==undefined?TRASH.offset:0);
  });
 }
 

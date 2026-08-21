@@ -17,9 +17,39 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.0.4` is the release to run. Everything in the sections below is in it and is
+`1.0.5` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.0.5] - 2026-08-21
+
+### Added
+
+- **The Trash tab pages, and a selection survives paging.** 1.0.3 listed the
+  first 500 files and stopped, which on a real library of 633 meant the rest
+  were unreachable and "mass delete" was a phrase rather than a feature. It
+  pages 100 at a time now, with the totals still describing the whole trash
+  rather than the page - that count is what somebody reads before pressing
+  Select all.
+
+  Ticks are held **by path, outside the page**, so files gathered across
+  several pages can be acted on together. Without that, selection resets on
+  every Next and a bulk action can only ever mean "this page". The header
+  checkbox takes the current page, **Select all** walks every page, and
+  **Clear selection** empties it.
+
+  A selection larger than the 500-file batch cap is sent as several requests
+  rather than raising the cap: the cap is what stops one accidental request
+  from moving an entire library. Progress is reported per batch, and anything
+  that **fails stays selected**, so a partial failure leaves a selection
+  holding exactly what was not dealt with.
+
+  Two edge cases the tests found rather than the UI. The sort now breaks ties
+  on path - files trashed by one job share a timestamp, and an undefined order
+  under a pager puts one row on two pages and another on none. And an `offset`
+  past the end clamps to the **start of the last page** rather than the end of
+  the list, because a bulk delete shortens the list under whoever ran it and
+  the alternative is a blank table with a working Previous button.
 
 ## [1.0.4] - 2026-08-21
 

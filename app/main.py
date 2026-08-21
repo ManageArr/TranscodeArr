@@ -121,7 +121,7 @@ def cfg() -> dict:
 # A constant compiled into the image cannot be overridden from outside it. Bump
 # it with the image tag: the release workflow refuses a tag that disagrees with
 # it, and a test refuses a Dockerfile that does.
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -952,12 +952,20 @@ def trash_entry(path: str, row: dict | None, c: dict) -> dict:
     }
 
 
-def list_trash(limit: int = 500) -> dict:
-    """Everything in the trash, newest first, with its retention.
+def list_trash(limit: int = 100, offset: int = 0) -> dict:
+    """One page of the trash, newest first, with its retention.
 
     Walks the filesystem rather than the table, because the table only knows
     about files trashed since it existed and a live deployment had 127 GB in
     there before that. The table supplies the exact origin where it has one.
+
+    Paged by offset rather than by a cursor, which is the opposite of the job
+    history next door - and safe here for a reason that does not hold there.
+    The whole list is rebuilt and re-sorted on every request anyway (the walk
+    is what costs, not the slice), and every operation is addressed by PATH.
+    A file pruned between two page loads can therefore shift a row, but it
+    cannot make a delete land on the wrong file: the worst it does is report
+    "not a file in the trash" for something already gone.
     """
     conn = db()
     rows = {r["path"]: dict(r) for r in conn.execute("SELECT * FROM trash").fetchall()}
@@ -973,15 +981,29 @@ def list_trash(limit: int = 500) -> dict:
                 entry = trash_entry(p, rows.get(p), c)
                 total_bytes += entry["bytes"] or 0
                 entries.append(entry)
-    entries.sort(key=lambda e: e["at"], reverse=True)
+    # Path breaks the tie, or the order is undefined between two files trashed
+    # by one job - and an undefined order under a pager is a row that appears
+    # on two pages and another that appears on none.
+    entries.sort(key=lambda e: (-e["at"], e["path"]))
     # Rows whose file is gone - pruned, or restored by something else. Cleaned
     # here rather than in the prune, so the table cannot outlive the disk
     # whichever of the two removed it.
     for stale in set(rows) - {e["path"] for e in entries}:
         conn.execute("DELETE FROM trash WHERE path=?", (stale,))
     conn.commit()
-    return {"entries": entries[:limit], "total": total, "bytes": total_bytes,
-            "keep_days": c["trash_keep_days"], "shown": min(total, limit)}
+    # Clamped to the START of the last page, never to the end of the list. A
+    # bulk delete shortens this list under whoever ran it, and an offset that
+    # has fallen off the end must show the last page rather than a blank table
+    # with a working Previous button and no clue why.
+    if not entries:
+        offset = 0
+    elif offset >= len(entries):
+        offset = ((len(entries) - 1) // limit) * limit
+    offset = max(0, offset)
+    page = entries[offset:offset + limit]
+    return {"entries": page, "total": total, "bytes": total_bytes,
+            "keep_days": c["trash_keep_days"], "shown": len(page),
+            "offset": offset, "limit": limit}
 
 
 def in_trash(path: str) -> str:
@@ -2188,7 +2210,19 @@ class Handler(BaseHTTPRequestHandler):
                 "audio_channels": [{"value": v, "label": l} for v, l in store.AUDIO_CHANNELS],
             })
         if route == "/api/trash":
-            return self._send(200, list_trash())
+            q = _query(self.path)
+            # Clamped rather than refused: a pager is a URL people edit, and a
+            # 400 for limit=1000 helps nobody. The ceiling is the batch cap, so
+            # a page can always be acted on in one request.
+            try:
+                limit = min(max(int(q.get("limit", "100")), 1), MAX_TRASH_BATCH)
+            except ValueError:
+                limit = 100
+            try:
+                offset = max(int(q.get("offset", "0")), 0)
+            except ValueError:
+                offset = 0
+            return self._send(200, list_trash(limit, offset))
         if route == "/api/tokens":
             return self._send(200, {"tokens": store.list_tokens(db())})
         if route == "/api/arrs":
