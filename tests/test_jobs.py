@@ -279,6 +279,18 @@ class PageCacheIsHandedBack(JobCase):
         self.assertEqual(row["state"], "done", row["error"])
         self.assertEqual(order[:2], ["release", "trash"], order)
 
+    def test_a_job_that_fails_verification_still_hands_its_source_back(self):
+        source = self.write(".Movie.mkv", "the original")
+        seen = []
+        short = core.Probe(duration=10.0, video_streams=1, audio_streams=1, subtitle_streams=0)
+
+        def probe(path):
+            return short if path.endswith(core.PART_MARKER + ".mp4") else WHOLE
+
+        with mock.patch.object(main, "release_page_cache", lambda *p: seen.append([x for x in p if x])),              mock.patch.object(main, "ffprobe", probe),              mock.patch.object(main, "run_encode", self.encoder_that_writes("a short encode")):
+            main.process(self.claim(source))
+        self.assertIn([source], seen, "a failed job kept its source in page cache")
+
     def test_releasing_never_damages_or_removes_the_file(self):
         # It is an advisory call about cache, not about content. If this ever
         # became destructive it would do so silently and on every job.

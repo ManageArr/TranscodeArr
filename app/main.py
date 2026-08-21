@@ -121,7 +121,7 @@ def cfg() -> dict:
 # A constant compiled into the image cannot be overridden from outside it. Bump
 # it with the image tag: the release workflow refuses a tag that disagrees with
 # it, and a test refuses a Dockerfile that does.
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -1464,6 +1464,17 @@ def process(job: dict) -> None:
     except Exception as e:  # noqa: BLE001
         log.exception("job %s crashed", job_id[:8])
         finish("failed", error=f"internal: {e}")
+    finally:
+        # The success path hands back the output and both trashed files above.
+        # This is the other eight exits - a failed verification, a source that
+        # changed mid-encode, an encoder that would not start - every one of
+        # which has already READ the whole source into page cache and then
+        # returns without giving it back. Failures are exactly when that
+        # matters: a batch that fails fast fails often, and the fragmentation
+        # this exists to avoid is what makes encoders stop starting in the
+        # first place. A no-op on the success path, where the source has
+        # already moved to the trash under a different name.
+        release_page_cache(source)
 
 
 def worker_loop() -> None:

@@ -47,7 +47,7 @@ RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
 
 # Declared down here so bumping a version does not invalidate the apt layer.
 # The release workflow passes both; the defaults keep a local build working.
-ARG VERSION=1.0.6
+ARG VERSION=1.0.7
 ARG REVISION=unknown
 
 # VERSION is the LABELs below and nothing else. It used to also become

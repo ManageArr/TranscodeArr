@@ -17,9 +17,30 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.0.6` is the release to run. Everything in the sections below is in it and is
+`1.0.7` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.0.7] - 2026-08-21
+
+### Fixed
+
+- **A job that FAILED kept its whole source in page cache.** 1.0.6 handed pages
+  back on the success path only, and `process()` has eight other exits - a
+  failed verification, a source that changed mid-encode, an encoder that would
+  not start. Every one of them has already read the entire source before it
+  returns, and every one of them returned without giving it back.
+
+  Failures are exactly when this matters. A batch that fails fails fast, so it
+  fails often, and the fragmentation this whole mechanism exists to avoid is
+  what makes encoders stop starting in the first place - a GPU outage would
+  have filled the cache faster than a working queue and made itself worse.
+  Found by measuring 1.0.6 on a real box, where the file chosen to test it
+  happened to fail verification and released nothing.
+
+  The release moved into a `finally`, so it covers every exit including the
+  crash handler, and is a no-op on the success path where the source has
+  already moved to the trash under another name.
 
 ## [1.0.6] - 2026-08-21
 
