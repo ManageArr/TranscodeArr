@@ -612,6 +612,18 @@ every scan and burned a whole encode attempt every few minutes forever. Queueing
 it from the API ignores the wait entirely: somebody asking for a file by name is
 not the loop this exists to stop.
 
+**A 10-bit source is not one of those files**, though it used to be. H.264
+NVENC cannot encode 10 bits, and handed a `yuv420p10le` source it exits `-22
+(Invalid argument)` before the first frame rather than converting - ffmpeg does
+not catch it either, because NVENC advertises one shared pixel-format list for
+H.264 and HEVC. Since 1.0.1 the picture is narrowed to 8-bit with `-pix_fmt
+yuv420p` whenever the source carries more bits than the chosen profile can, so
+an arr upgrading a season to 10-bit HEVC releases no longer parks it in the
+retry loop forever. The `main10` profile is exempt: it exists to keep those
+bits. The narrowing is a CPU filter, so those jobs decode on the GPU and hand
+frames back to system RAM rather than staying on the card end to end; 8-bit
+sources are unaffected and still run the fully-on-GPU path.
+
 An encode that reports **no progress** for `stall_timeout_minutes` (30 by
 default) is killed and its job failed. ffmpeg reports progress roughly twice a
 second however slow the encode itself is, so silence means the process is

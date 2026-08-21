@@ -110,7 +110,7 @@ def cfg() -> dict:
 # image tag - the release workflow refuses a tag that disagrees with it, and
 # /healthz reporting a version that is not the running build makes the one
 # field whose job is "what is deployed" a liar.
-VERSION = os.environ.get("TRANSCODEARR_VERSION") or "1.0.0"
+VERSION = os.environ.get("TRANSCODEARR_VERSION") or "1.0.1"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -622,19 +622,25 @@ def encoding_profile() -> dict:
 
 
 def profile_args(p: dict, source: str, part: str, with_subs: bool, audio_codec: str | None = None,
-                 hardware_decode: bool = True) -> list[str]:
+                 hardware_decode: bool = True, source_pix_fmt: str = "") -> list[str]:
     """The exact argv one profile produces. Shared by real jobs and the test
     encode, so what gets validated is what gets run - a test that builds its
     command differently is a test of something else."""
     encoder = p["encoder"] if p["encoder"] in core.DEFAULT_TEMPLATES else ENCODER
+    profile = core.valid_option(encoder, "profiles", p.get("profile", ""))
+    # Decided once and handed to both halves of the command: narrowing the
+    # picture is a CPU filter, so it also decides whether the decoder may keep
+    # frames in GPU memory. Splitting that decision is how they disagree.
+    pix_fmt = core.output_pix_fmt(profile, source_pix_fmt)
     return core.build_ffmpeg_args(
         core.DEFAULT_TEMPLATES[encoder], source, part, p["quality"], with_subs,
         preset=core.valid_option(encoder, "presets", p.get("preset", "")),
-        profile=core.valid_option(encoder, "profiles", p.get("profile", "")),
+        profile=profile,
         max_height=p.get("max_height", 0),
         audio=core.audio_args(audio_codec or p.get("audio_codec", "aac"),
                               p.get("audio_bitrate", 192), p.get("audio_channels", 2)),
-        hwaccel=core.hwaccel_args(encoder, p.get("max_height", 0), hardware_decode),
+        pix_fmt=pix_fmt,
+        hwaccel=core.hwaccel_args(encoder, p.get("max_height", 0), hardware_decode, pix_fmt),
         # Decided from the resolved encoder, not from the template: the cap is
         # meaningless on NVENC and QSV, where the work is not on the CPU, and a
         # setting that only appears to do something is worse than no setting.
@@ -680,7 +686,8 @@ def run_encode(job_id: str, source: str, names: core.JobNames, src_probe: core.P
         # Prefixed before it is recorded, not after: log_tail's whole job is to
         # say what actually ran, and a throttled encode that logs the unthrottled
         # command is a field that lies in exactly the case somebody is reading it.
-        args = throttle + profile_args(prof, source, names.part, with_subs, audio_codec, hardware_decode)
+        args = throttle + profile_args(prof, source, names.part, with_subs, audio_codec, hardware_decode,
+                                       src_probe.pix_fmt)
         conn.execute("UPDATE jobs SET log_tail=? WHERE id=?", (" ".join(args), job_id))
         conn.commit()
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -751,8 +758,11 @@ def run_encode(job_id: str, source: str, names: core.JobNames, src_probe: core.P
             # gone away will not come back between attempts, and each rung would
             # hold this worker for another whole timeout to find that out.
             return False, "", f"no progress for {stall_minutes} minutes - encode killed (is the share still mounted?)"
-        tail = "\n".join(stderr_tail[-8:])
-        error = f"ffmpeg exited {proc.returncode}: {tail[-400:]}"
+        # The gate and the recorded message read the same text on purpose: a
+        # rung that retries on words nobody is ever shown is a rung nobody can
+        # explain from the job list.
+        tail = core.error_summary(stderr_tail)
+        error = f"ffmpeg exited {proc.returncode}: {tail}"
         if not FALLBACK_WORTHY.search(tail):
             # A full disk, a share that went away, an unreadable source: none of
             # those change because the next rung drops subtitles, so retrying

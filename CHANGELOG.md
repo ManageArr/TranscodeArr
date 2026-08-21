@@ -17,9 +17,58 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.0.0` is the release to run. Everything in the `0.9.1` section below is in it
-and is still true; that section is kept because the reasoning behind each rule
-is the point of this file, and 1.0.0 changed almost none of it.
+`1.0.1` is the release to run. Everything in the sections below is in it and is
+still true; those sections are kept because the reasoning behind each rule is
+the point of this file, and neither 1.0.0 nor 1.0.1 changed much of it.
+
+## [1.0.1] - 2026-08-20
+
+A patch release from five days on a real library: 2609 jobs, 714 files, 643
+converted, and 44 that could never convert no matter how many times they were
+retried. Nothing about the API, the settings or the storage format changes.
+
+### Fixed
+
+- **A 10-bit source into an 8-bit profile failed forever, and the fallback
+  ladder could not save it.** H.264 NVENC cannot encode 10 bits. Handed a
+  `yuv420p10le` source it answers `10 bit encode not supported` / `No capable
+  devices found` and exits `-22 (Invalid argument)` with `frame= 0`, and ffmpeg
+  does not rescue it on its own: NVENC advertises **one shared pixel-format
+  list for H.264 and HEVC**, so `p010` is accepted during format negotiation
+  and only refused at encoder init. No rung of the fallback ladder changes the
+  encoder or the picture, so every retry failed identically. On the library
+  this was found in, 41 files - whole seasons that an arr had upgraded from
+  8-bit to 10-bit HEVC releases - had been retrying every six hours for five
+  days, and 44% of the entire job history was those retries.
+
+  A profile is a promise about bit depth, and nothing was keeping it. Now
+  `output_pix_fmt` narrows the picture with `-pix_fmt yuv420p` when the source
+  carries more bits than the chosen profile can, for every encoder rather than
+  the one that was noticed. `main10` is left alone, because that profile
+  exists to keep those bits.
+
+  **8-bit sources are byte-identical to 1.0.0**, which is the point of doing
+  this from the probe rather than always: a pixel conversion is a CPU filter,
+  and a CPU filter cannot read frames that stayed in GPU memory, so the flag
+  costs the fully-on-GPU decode path wherever it appears. Measured on the
+  T1000 this was found on, against a 1080p 10-bit HEVC episode: hand the frames
+  back to system RAM and narrow them there, 2.5x realtime; keep them on the GPU
+  with `scale_cuda=format=nv12`, 0.6x. `scale_cuda` also breaks outright the
+  moment ffmpeg falls back to software decoding, which is the case this has to
+  survive, so the slower-looking option is the only correct one.
+
+- **Every ffmpeg failure was recorded as the same sentence.** The stored error
+  was the last 400 characters of the last 8 stderr lines, and ffmpeg spends
+  those lines restating one errno through every layer on the way out. Both of
+  the failures above reduce to `-22 (Invalid argument)` there, so a card that
+  cannot encode 10-bit and a driver that never initialised were indistinguishable
+  in the job list - and the line that named the cause had been cut before the
+  truncation even ran. `error_summary` now keeps the lines that say something:
+  the indented input dump is dropped, the restatements and the stats epilogue
+  are dropped, and address pointers are stripped so one fault reads as one
+  fault instead of a different string on every attempt. The fallback ladder is
+  gated on the same text it shows, because a rung that retries on words nobody
+  is ever shown is a rung nobody can explain from the job list.
 
 ## [1.0.0] - 2026-08-16
 

@@ -289,5 +289,70 @@ class FfmpegArgs(unittest.TestCase):
         self.assertEqual(core.parse_progress("out_time_us=999999999999", 60.0), 99)  # capped
 
 
+# Both blocks are verbatim ffmpeg 7.1 output from the deployment where this was
+# found, indentation included. They are the two failures a person most needs
+# told apart, and the recorded error used to be the same text for both.
+TEN_BIT = """\
+        _STATISTICS_TAGS: BPS DURATION NUMBER_OF_FRAMES NUMBER_OF_BYTES
+Stream mapping:
+  Stream #0:0 -> #0:0 (hevc (native) -> h264 (h264_nvenc))
+  Stream #0:1 -> #0:1 (eac3 (native) -> aac (native))
+[h264_nvenc @ 0x5644eb5e12c0] 10 bit encode not supported
+[h264_nvenc @ 0x5644eb5e12c0] No capable devices found
+[vost#0:0/h264_nvenc @ 0x5644eb5f4fc0] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.
+[vf#0:0 @ 0x5644eb5f8dc0] Error sending frames to consumers: Generic error in an external library
+[vf#0:0 @ 0x5644eb5f8dc0] Task finished with error code: -542398533 (Generic error in an external library)
+[vf#0:0 @ 0x5644eb5f8dc0] Terminating thread with return code -542398533 (Generic error in an external library)
+[vost#0:0/h264_nvenc @ 0x5644eb5f4fc0] Could not open encoder before EOF
+[vost#0:0/h264_nvenc @ 0x5644eb5f4fc0] Task finished with error code: -22 (Invalid argument)
+[vost#0:0/h264_nvenc @ 0x5644eb5f4fc0] Terminating thread with return code -22 (Invalid argument)
+[out#0/mp4 @ 0x5644eb617b00] Nothing was written into output file, because at least one of its streams received no packets.
+frame=    0 fps=0.0 q=0.0 Lsize=       0KiB time=N/A bitrate=N/A speed=N/A
+[aac @ 0x5644ebdfaa80] Qavg: 64525.016
+[aac @ 0x5644ebec53c0] Qavg: 64525.016
+Conversion failed!""".split("\n")
+
+NO_CUDA = """\
+[AVHWDeviceContext @ 0x561634917880] cu->cuInit(0) failed -> CUDA_ERROR_NOT_INITIALIZED: initialization error
+[vist#0:0/hevc @ 0x56163491bb00] [dec:hevc @ 0x5616348e2a40] Hardware device setup failed for decoder: Generic error in an external library
+Error opening output file /tmp/out.mp4.
+Error opening output files: Generic error in an external library""".split("\n")
+
+
+class ErrorSummary(unittest.TestCase):
+    """What a failed job is allowed to say. The old tail said nothing."""
+
+    def test_it_keeps_the_line_that_names_the_cause(self):
+        self.assertIn("10 bit encode not supported", core.error_summary(TEN_BIT))
+        self.assertIn("CUDA_ERROR_NOT_INITIALIZED", core.error_summary(NO_CUDA))
+
+    def test_the_two_failures_no_longer_read_the_same(self):
+        # Both end in "-22 (Invalid argument)". Keeping the raw tail is what
+        # made forty files failing for one reason look like forty reasons.
+        self.assertNotEqual(core.error_summary(TEN_BIT), core.error_summary(NO_CUDA))
+
+    def test_restatements_and_stats_are_dropped(self):
+        summary = core.error_summary(TEN_BIT)
+        for noise in ("Terminating thread", "Task finished", "Qavg", "frame=", "Conversion failed!"):
+            self.assertNotIn(noise, summary, noise)
+
+    def test_the_input_dump_is_dropped(self):
+        # Indented lines are the metadata ffmpeg prints under Input #0. They
+        # are what pushed the real diagnostics out of the window.
+        self.assertNotIn("_STATISTICS_TAGS", core.error_summary(TEN_BIT))
+
+    def test_pointers_are_stripped_so_one_fault_reads_as_one_fault(self):
+        summary = core.error_summary(TEN_BIT)
+        self.assertNotIn("0x5644eb", summary)
+        self.assertIn("[h264_nvenc]", summary)
+
+    def test_it_stays_within_its_width(self):
+        self.assertLessEqual(len(core.error_summary(TEN_BIT * 10, width=200)), 200)
+
+    def test_output_that_is_nothing_but_noise_still_says_something(self):
+        # An empty error field is the silence this worker exists to remove.
+        self.assertTrue(core.error_summary(["frame=    1 fps=0.0", "Conversion failed!"]).strip())
+
+
 if __name__ == "__main__":
     unittest.main()

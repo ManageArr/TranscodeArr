@@ -296,6 +296,64 @@ class HardwareDecode(unittest.TestCase):
                                       23, False, hwaccel=["-hwaccel", "cuda"])
         self.assertLess(args.index("-hwaccel"), args.index("-i"))
 
+    def test_narrowing_the_picture_also_brings_frames_back(self):
+        # Same reason as the resolution cap: -pix_fmt is a CPU filter. Left on
+        # the GPU, ffmpeg says "Impossible to convert between the formats" and
+        # the encoder dies with the same -22 the narrowing exists to prevent.
+        self.assertEqual(core.hwaccel_args("h264_nvenc", 0, pix_fmt="yuv420p"), ["-hwaccel", "cuda"])
+
+
+class BitDepth(unittest.TestCase):
+    """A profile is a promise about bit depth. Nothing used to keep it.
+
+    41 files in a real library sat failing for five days: 10-bit HEVC into
+    h264_nvenc, which answers "10 bit encode not supported / No capable devices
+    found" and exits -22 with frame=0. No rung of the fallback ladder changes
+    the encoder or the picture, so every retry failed identically forever.
+    """
+
+    def test_a_ten_bit_source_is_narrowed_for_an_eight_bit_profile(self):
+        for fmt in ("yuv420p10le", "yuv422p10le", "yuv444p10le", "p010le", "yuv420p12le", "gray16le"):
+            self.assertEqual(core.output_pix_fmt("high", fmt), "yuv420p", fmt)
+
+    def test_an_eight_bit_source_is_left_alone(self):
+        # Not a no-op: a -pix_fmt here would cost the fully-on-GPU decode path
+        # for every ordinary file, which is the common case.
+        for fmt in ("yuv420p", "nv12", "yuvj420p"):
+            self.assertEqual(core.output_pix_fmt("high", fmt), "", fmt)
+
+    def test_four_one_zero_and_four_one_one_are_not_ten_bit(self):
+        # The depth lives in the SUFFIX. A substring test for "10" reads
+        # yuv410p as ten-bit and silently re-samples every frame.
+        for fmt in ("yuv410p", "yuv411p"):
+            self.assertEqual(core.output_pix_fmt("high", fmt), "", fmt)
+
+    def test_a_ten_bit_profile_keeps_its_ten_bits(self):
+        self.assertEqual(core.output_pix_fmt("main10", "yuv420p10le"), "")
+
+    def test_an_unreadable_source_format_changes_nothing(self):
+        # Unknown is not "8-bit": guessing here would narrow a Main 10 source
+        # nobody asked to narrow, and lose the GPU decode path doing it.
+        self.assertEqual(core.output_pix_fmt("high", ""), "")
+
+    def test_the_flag_is_an_output_option(self):
+        args = core.build_ffmpeg_args(core.DEFAULT_TEMPLATES["h264_nvenc"], "/m/x.mkv", "/m/.x.tapart.mp4",
+                                      24, False, pix_fmt="yuv420p")
+        self.assertEqual(args[args.index("-pix_fmt") + 1], "yuv420p")
+        self.assertGreater(args.index("-pix_fmt"), args.index("-i"))   # before -i it sets the DECODER
+        self.assertLess(args.index("-pix_fmt"), len(args) - 1)         # and never after the output path
+
+    def test_no_narrowing_asked_for_means_no_flag_at_all(self):
+        args = core.build_ffmpeg_args(core.DEFAULT_TEMPLATES["h264_nvenc"], "/m/x.mkv", "/m/.x.tapart.mp4", 24, False)
+        self.assertNotIn("-pix_fmt", args)
+
+    def test_the_ten_bit_profiles_are_ones_the_ui_actually_offers(self):
+        # A name here that no profile list contains would be a rule that never
+        # fires, and the bug it guards against comes back silently.
+        offered = {value for _, options in core.ENCODER_OPTIONS.items()
+                   for value, _label in options["profiles"]}
+        self.assertTrue(core.TEN_BIT_PROFILES <= offered, core.TEN_BIT_PROFILES - offered)
+
 
 class Audio(unittest.TestCase):
     def test_copy_keeps_the_original_track(self):

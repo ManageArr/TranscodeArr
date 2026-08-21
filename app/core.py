@@ -175,6 +175,11 @@ class Probe:
     video_streams: int
     audio_streams: int
     subtitle_streams: int
+    # The FIRST video stream's pixel format, because -map 0:v:0 is what gets
+    # encoded. Defaulted so a Probe built by hand stays a four-field call, and
+    # so an ffprobe that does not say reads as "unknown" rather than "8-bit" -
+    # see output_pix_fmt, where unknown means "change nothing".
+    pix_fmt: str = ""
 
 
 def parse_ffprobe(payload: dict) -> Probe:
@@ -186,11 +191,13 @@ def parse_ffprobe(payload: dict) -> Probe:
     except (TypeError, ValueError):
         pass
     count = lambda kind: sum(1 for s in streams if s.get("codec_type") == kind)  # noqa: E731
+    video = [s for s in streams if s.get("codec_type") == "video"]
     return Probe(
         duration=duration,
         video_streams=count("video"),
         audio_streams=count("audio"),
         subtitle_streams=count("subtitle"),
+        pix_fmt=str(video[0].get("pix_fmt") or "") if video else "",
     )
 
 
@@ -450,7 +457,7 @@ RESOLUTIONS = [
 ]
 
 
-def hwaccel_args(encoder: str, max_height: int, enabled: bool = True) -> list[str]:
+def hwaccel_args(encoder: str, max_height: int, enabled: bool = True, pix_fmt: str = "") -> list[str]:
     """Decoder-side arguments, which go BEFORE -i.
 
     The encoder was always on the GPU; the decoder was not, and decoding 1080p
@@ -460,20 +467,26 @@ def hwaccel_args(encoder: str, max_height: int, enabled: bool = True) -> list[st
 
     Two modes, because the frames have to live somewhere:
 
-    * No resolution cap - the default - means no filter, so frames can stay in
-      GPU memory end to end (`-hwaccel_output_format cuda`). Fastest.
-    * With a cap, the scale filter runs on the CPU and cannot read GPU memory,
-      so frames are decoded on the GPU and handed back to system RAM. Still
-      about a third of the original CPU cost. (`scale_cuda` would keep them on
-      the GPU, but it breaks precisely when ffmpeg falls back to software
-      decoding, which is the case this has to survive.)
+    * No CPU-side filter - the default - means frames can stay in GPU memory
+      end to end (`-hwaccel_output_format cuda`). Fastest.
+    * With one, the filter cannot read GPU memory, so frames are decoded on the
+      GPU and handed back to system RAM. Still about a third of the original
+      CPU cost. (`scale_cuda` would keep them on the GPU, but it breaks
+      precisely when ffmpeg falls back to software decoding, which is the case
+      this has to survive - measured, it also ran a 10-bit 1080p source at
+      0.6x against 2.5x for the hand-back below.)
+
+    Both a height cap and a pixel-format narrowing are CPU-side filters, and
+    passing `-pix_fmt` while frames are still in GPU memory does not fail
+    loudly - ffmpeg reports "Impossible to convert between the formats" and the
+    encoder thread dies with the same -22 the narrowing exists to prevent.
 
     Verified safe on a codec NVDEC cannot decode: ffmpeg silently falls back to
     software decoding rather than failing, so this needs no per-file logic.
     """
     if not enabled or not encoder.endswith("_nvenc"):
         return []
-    if max_height:
+    if max_height or pix_fmt:
         return ["-hwaccel", "cuda"]
     return ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
 
@@ -508,6 +521,39 @@ def valid_option(encoder: str, kind: str, value: str) -> str:
     allowed = [v for v, _ in opts.get(kind, [])]
     default = opts.get("default_preset" if kind == "presets" else "default_profile", "")
     return value if value in allowed else default
+
+
+# A pixel format wider than 8 bits, read off the depth suffix ffprobe reports:
+# yuv420p10le, p010le, gray16le. Deliberately not a substring test for "10" -
+# yuv410p and yuv411p are both 8-bit and would match one.
+HIGH_DEPTH_PIX_FMT = re.compile(r"(10|12|14|16)(le|be)$")
+
+# The profiles this worker offers that can carry more than 8 bits. Every other
+# profile is a promise about bit depth that nothing was enforcing, and on a
+# 10-bit source h264_nvenc answers "10 bit encode not supported / No capable
+# devices found" and exits -22 before the first frame. ffmpeg does not rescue
+# it: NVENC advertises one shared pixel-format list for H.264 and HEVC, so p010
+# is accepted during format negotiation and only refused at encoder init.
+#
+# Only what ENCODER_OPTIONS actually lists belongs here - valid_option means
+# nothing else ever reaches output_pix_fmt, so H.264's high10 would be a rule
+# that never fires. A test holds that invariant, so adding high10 to the UI
+# without adding it here fails loudly rather than re-opening this bug.
+TEN_BIT_PROFILES = {"main10"}
+
+
+def output_pix_fmt(profile: str, source_pix_fmt: str) -> str:
+    """The -pix_fmt this encode needs, or "" to leave ffmpeg's negotiation alone.
+
+    Only ever NARROWS, and only when the source is wider than the profile can
+    hold. An 8-bit source needs no flag, and setting one anyway would cost the
+    fully-on-GPU decode path in hwaccel_args for nothing - a pixel conversion
+    is a CPU filter, and a CPU filter cannot read frames that stayed in GPU
+    memory. An unreadable source format is left alone for the same reason.
+    """
+    if not source_pix_fmt or profile in TEN_BIT_PROFILES:
+        return ""
+    return "yuv420p" if HIGH_DEPTH_PIX_FMT.search(source_pix_fmt) else ""
 
 
 def scale_filter(max_height: int) -> str:
@@ -671,6 +717,7 @@ def build_ffmpeg_args(
     audio: str = "-c:a aac -b:a 192k -ac 2",
     hwaccel: list[str] | None = None,
     threads: list[str] | None = None,
+    pix_fmt: str = "",
 ) -> list[str]:
     """argv for one encode attempt.
 
@@ -694,6 +741,11 @@ def build_ffmpeg_args(
         *(hwaccel or []),
         "-i", source,
         *rendered.split(),
+        # Given by the caller as output_pix_fmt(profile, source) exactly as
+        # hwaccel is, and empty for almost every job: it only appears when the
+        # source carries more bits than the chosen profile can, which the
+        # encoder would otherwise refuse at init rather than convert.
+        *(["-pix_fmt", pix_fmt] if pix_fmt else []),
         # Given by the caller as thread_args(encoder, n) exactly as hwaccel is,
         # because the encoder name is what decides whether it means anything and
         # this function is handed a template rather than an encoder. It sits
@@ -714,3 +766,38 @@ def parse_progress(line: str, duration: float | None) -> int | None:
     if not m or not duration or duration <= 0:
         return None
     return min(99, int((int(m.group(1)) / 1_000_000) / duration * 100))
+
+
+# Everything ffmpeg says on the way out that is not a reason. One layer says
+# what went wrong; every layer above it restates the same errno, and then the
+# stats epilogue runs. Keeping the raw tail kept only the restatements, so a
+# card that cannot encode 10-bit and a driver that never initialised both
+# reduced to "-22 (Invalid argument)" - identical text for the two failures a
+# person reading a failed job most needs told apart.
+_RESTATEMENT = re.compile(
+    r"(Task finished with error code|Terminating thread with return code"
+    r"|Last message repeated|Qavg:|^frame=|^\s*$|^Conversion failed!)")
+_POINTER = re.compile(r" @ 0x[0-9a-f]+")
+
+
+def error_summary(lines: list[str], keep: int = 6, width: int = 600) -> str:
+    """What an ffmpeg failure actually said, oldest line first.
+
+    The other half of the noise is the input dump, which is what pushed the
+    real diagnostics out of an eight-line window in the first place. It is
+    dropped by indentation: ffmpeg prints stream metadata indented under its
+    "Input #0" header and its own diagnostics hard against column 0, and that
+    is the only structural separator between the two - but it is stable across
+    every codec, which a keyword list would not be.
+
+    Address pointers are stripped: they carry nothing, they eat the width, and
+    leaving them in gave the same failure a different error string on every
+    attempt, which is what stopped the job list from showing that forty files
+    were failing for one reason.
+
+    Falls back to the raw lines if filtering leaves nothing, because an empty
+    error field is the silence this worker exists to remove.
+    """
+    said = [_POINTER.sub("", ln).rstrip() for ln in lines
+            if ln[:1] not in (" ", "\t") and not _RESTATEMENT.search(ln)]
+    return "\n".join((said or [ln.rstrip() for ln in lines])[-keep:])[:width]

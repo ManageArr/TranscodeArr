@@ -47,11 +47,12 @@ RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
 
 # Declared down here so bumping a version does not invalidate the apt layer.
 # The release workflow passes both; the defaults keep a local build working.
-ARG VERSION=1.0.0
+ARG VERSION=1.0.1
 ARG REVISION=unknown
 
-# What /healthz reports. main.py keeps its own 1.0.0 fallback for running from
-# a source checkout, but a built image must never report a version it is not.
+# What /healthz reports. main.py keeps its own matching fallback for running
+# from a source checkout, but a built image must never report a version it is
+# not.
 # This default and main.VERSION are bumped together: the release workflow only
 # guards the tagged build, so a stale default here is a local or CI image whose
 # /healthz lies with nothing to catch it.
