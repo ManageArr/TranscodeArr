@@ -51,11 +51,28 @@ class PageText(unittest.TestCase):
             self.assertNotIn(entity, page_without_comments)
 
 
+def handler_bodies():
+    """The source of each do_VERB, so a route can be checked against the VERB
+    that carries it and not merely against the file."""
+    parts = re.split(r"\n    def do_(GET|PUT|POST|DELETE)\(", MAIN)
+    return {parts[i]: parts[i + 1] for i in range(1, len(parts), 2)}
+
+
+def calls():
+    """(method, path) for every api()/fetch() in the page. A call with no
+    method is a GET, the same as the browser's default."""
+    found = set()
+    for m in re.finditer(r"(?:fetch|api)\('(/[^']*)'(.{0,60})", web.PAGE, re.S):
+        method = re.search(r"method:'([A-Z]+)'", m.group(2))
+        found.add((method.group(1) if method else "GET", m.group(1)))
+    return found
+
+
 class Routes(unittest.TestCase):
     def test_every_route_the_page_calls_exists_in_main(self):
         import main
 
-        called = set(re.findall(r"(?:fetch|api)\('(/[^']*)'", web.PAGE))
+        called = {path for _method, path in calls()}
         self.assertIn("/api/login", called)   # the regex still finds anything
         self.assertIn("/healthz", called)
         for raw in sorted(called):
@@ -63,6 +80,26 @@ class Routes(unittest.TestCase):
             # Trailing slash because the page builds /api/sessions/ + an id; the
             # handler matches that with a regex containing the same prefix.
             self.assertIn(route.rstrip("/"), MAIN, f"the page calls {raw} and main.py has no such route")
+
+    def test_every_route_is_called_with_a_method_that_handles_it(self):
+        """The path existing somewhere in main.py is not the question.
+
+        /api/settings has a GET and a PUT and no POST. The trash tab posted to
+        it, fell through do_POST to the catch-all, and answered "Not Found" at
+        somebody who had just typed a number into a box - while the older test
+        here passed, because the string /api/settings is certainly in main.py.
+        """
+        import main
+
+        bodies = handler_bodies()
+        self.assertEqual(set(bodies), {"GET", "PUT", "POST", "DELETE"}, "the handler split stopped working")
+        for method, raw in sorted(calls()):
+            route, _api = main._route(raw)
+            # assertTrue, not assertIn: assertIn prints the haystack, and the
+            # haystack here is an entire request handler.
+            self.assertTrue(route.rstrip("/") in bodies[method],
+                            f"the page sends {method} {raw}, and do_{method} has no such route "
+                            f"- it falls through to the catch-all 404")
 
 
 class Elements(unittest.TestCase):

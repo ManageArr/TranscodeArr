@@ -944,7 +944,10 @@ async function saveTrashDays(btn){
  if(!Number.isFinite(v)||v<0){say('trashmsg','Days must be 0 or more.',true);return;}
  await busy(btn,'Saving...',async()=>{
   try{
-   await api('/api/settings',{method:'POST',body:JSON.stringify({trash_keep_days:v})});
+   // PUT, not POST: /api/settings has a GET and a PUT and no POST at all, so
+   // posting to it fell through to the catch-all 404 and reported "Not Found"
+   // at somebody who had just typed a number into a box.
+   await api('/api/settings',{method:'PUT',body:JSON.stringify({trash_keep_days:v})});
    if(SET)SET.trash_keep_days=v;
    say('trashmsg',v?`Kept for ${days(v)}.`:'Nothing is kept - the next scan prunes the trash empty.');
    await refreshTrash();

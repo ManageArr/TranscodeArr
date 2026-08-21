@@ -281,6 +281,39 @@ class RunControls(ApiCase):
         self.assertTrue(self.call("GET", "/healthz", token=None)[1]["auth_configured"])
 
 
+class NothingIsCacheable(ApiCase):
+    """The UI is one file that changes every release and carried no validator.
+
+    A Trash tab shipped, deployed and verified on the running container, and
+    was simply not on screen: the browser had a copy from before the update,
+    nothing to revalidate it against, and no reason to ask. The API bodies
+    matter for the same reason from the other side - they are a live view of a
+    queue, where a cached answer is a lie with a timestamp on it.
+    """
+
+    def test_the_page_says_not_to_cache_it(self):
+        _status, _body, headers = self.call("GET", "/", token=None)
+        self.assertEqual(headers.get("Cache-Control"), "no-store")
+
+    def test_so_does_every_api_answer(self):
+        for path in ("/healthz", "/api/queue", "/api/settings", "/api/trash"):
+            _status, _body, headers = self.call("GET", path)
+            self.assertEqual(headers.get("Cache-Control"), "no-store", path)
+
+    def test_a_caller_that_sets_its_own_still_wins(self):
+        # The backoff sends Retry-After with its own headers dict; that path
+        # must keep working, and must not end up with two Cache-Control lines.
+        self.make_admin()
+        for _ in range(12):
+            status, _body, headers = self.call("POST", "/api/login",
+                                               {"username": "lou", "password": "wrong"}, token=None)
+            if status == 429:
+                break
+        self.assertEqual(status, 429)
+        self.assertIn("Retry-After", headers)
+        self.assertEqual(headers.get("Cache-Control"), "no-store")
+
+
 class Metrics(ApiCase):
     def test_the_format_is_the_one_prometheus_parses(self):
         conn = main.db()

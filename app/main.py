@@ -121,7 +121,7 @@ def cfg() -> dict:
 # A constant compiled into the image cannot be overridden from outside it. Bump
 # it with the image tag: the release workflow refuses a tag that disagrees with
 # it, and a test refuses a Dockerfile that does.
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -2023,6 +2023,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        # Nothing here was cacheable and nothing said so. The UI is one 80KB
+        # file that changes every release and carried no Cache-Control, no
+        # ETag and no Last-Modified, so a browser had nothing to validate
+        # against and served the previous version after an update - a new tab
+        # shipped, deployed and verified, and simply absent on screen until
+        # somebody thought to hard-reload. The API bodies are worse: they are a
+        # live view of a queue, where a cached answer is a lie with a timestamp
+        # on it. Overridable, because the caller that sets its own is the one
+        # that means it.
+        if "Cache-Control" not in (headers or {}):
+            self.send_header("Cache-Control", "no-store")
         for name, value in (headers or {}).items():
             self.send_header(name, value)
         self.end_headers()

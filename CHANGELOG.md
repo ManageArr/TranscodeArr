@@ -17,9 +17,40 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.0.3` is the release to run. Everything in the sections below is in it and is
+`1.0.4` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.0.4] - 2026-08-21
+
+Both of these were found by 1.0.3's own new tab failing to appear and then
+failing to save, on a real box, within ten minutes of shipping.
+
+### Fixed
+
+- **Nothing this server sends was cacheable and nothing said so.** The UI is a
+  single 80KB file that changes every release, and it went out with no
+  `Cache-Control`, no `ETag` and no `Last-Modified` - so a browser had nothing
+  to revalidate against and no reason to ask. 1.0.3's Trash tab was built,
+  shipped, deployed and confirmed present in the served HTML, and was still not
+  on screen: the browser had the previous version and only a hard reload moved
+  it. That is every future UI change, not one tab.
+
+  Every response now carries `Cache-Control: no-store`. The API bodies need it
+  for the opposite reason: they are a live view of a queue, and a cached answer
+  there is a lie with a timestamp on it. A caller that sets its own header - the
+  login backoff, with its `Retry-After` - still wins.
+
+- **Saving the trash retention answered "Not Found".** The new control sent
+  `POST /api/settings`; that route has a `GET` and a `PUT` and no `POST`, so it
+  fell through `do_POST` to the catch-all 404 and reported it at somebody who
+  had just typed a number into a box.
+
+  `test_web_page.py` exists to catch exactly this - "a route the page calls
+  that the server never had" - and it passed, because it only asked whether the
+  path appears anywhere in `main.py`. It does; under two other verbs. It now
+  splits `main.py` by handler and checks the **(method, route)** pair, which
+  fails on the bug as written.
 
 ## [1.0.3] - 2026-08-20
 
