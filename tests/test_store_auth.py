@@ -87,9 +87,18 @@ class NewSettingBounds(unittest.TestCase):
         self.bad("session_days", 400)
         self.assertEqual(store.parse_value(store.SPEC_BY_KEY["encode_nice"], "19"), 19)
         self.assertEqual(store.parse_value(store.SPEC_BY_KEY["encode_threads"], "0"), 0)
+        self.bad("encoder_retry_attempts", 11)
+        self.bad("encoder_retry_seconds", 601)
+        self.bad("encoder_retry_cooldown_minutes", 1441)
+        self.assertEqual(store.parse_value(store.SPEC_BY_KEY["encoder_retry_attempts"], "0"), 0)
 
     def test_paths_and_urls_are_shaped(self):
         self.bad("webhook_url", "example.com/hook")
+        self.bad("jellyfin_url", "jellyfin:8096")
+        self.bad("jellyfin_path_map", "/media")      # no Jellyfin side to the pair
+        self.assertEqual(store.parse_value(store.SPEC_BY_KEY["jellyfin_url"], "http://jellyfin:8096/"),
+                         "http://jellyfin:8096/")
+        self.assertEqual(store.parse_value(store.SPEC_BY_KEY["jellyfin_path_map"], "/media=/data"), "/media=/data")
         self.bad("tls_cert", "cert.pem")
         self.assertEqual(store.parse_value(store.SPEC_BY_KEY["tls_key"], "/config/key.pem"), "/config/key.pem")
 

@@ -118,6 +118,18 @@ SPECS: list[Spec] = [
          "How long the watcher leaves a file alone after a job for it failed. Without a wait, a file that "
          "cannot be converted at all is queued again on every scan and burns a whole encode attempt every "
          "few minutes forever. 0 retries on the next scan; queueing a file from the API ignores this.", "Rules"),
+    Spec("encoder_retry_attempts", "ENCODER_RETRY_ATTEMPTS", "int", 3, "Retry an unavailable encoder (times)",
+         "How many times an encode whose GPU encoder refused to initialize is started again, unchanged, before "
+         "the job fails. On a busy NAS the card is gone for a moment and back a minute later - a real job list "
+         "showed cuInit failures minutes apart from encodes that went through - and the fallback ladder cannot "
+         "help, because every rung keeps the same encoder. 0 fails the job on the first refusal.", "Rules"),
+    Spec("encoder_retry_seconds", "ENCODER_RETRY_SECONDS", "int", 20, "...waiting between tries (seconds)",
+         "How long to wait between those attempts. The worker slot is held while it waits.", "Rules"),
+    Spec("encoder_retry_cooldown_minutes", "ENCODER_RETRY_COOLDOWN_MINUTES", "int", 15,
+         "Retry after an unavailable encoder (minutes)",
+         "The watcher's wait for a file whose job failed with 'encoder unavailable', in place of the hours "
+         "above. The file is fine; the card was not, and it comes back long before six hours are up. 0 retries "
+         "on the next scan.", "Rules"),
     Spec("stall_timeout_minutes", "STALL_TIMEOUT_MINUTES", "int", 30, "Stall timeout (minutes)",
          "An encode that reports no progress for this long is killed and its job is failed. ffmpeg reports "
          "progress about twice a second however slow the encode is, so silence means it is wedged - usually "
@@ -173,6 +185,17 @@ SPECS: list[Spec] = [
          "Optional. When set, each call carries an HMAC-SHA256 of the exact body it sent, so the receiver can "
          "tell a real notification from anyone who guessed the URL. Never shown again once saved.",
          "Notifications", secret=True),
+    Spec("jellyfin_url", "JELLYFIN_URL", "text", "", "Jellyfin URL",
+         "Base URL of the Jellyfin server, e.g. http://jellyfin:8096. When set, every file a job finalizes is "
+         "reported to Jellyfin as created, so it re-reads a same-name replacement it would otherwise never "
+         "notice. Empty disables it. Like the webhook, it can never fail a job or slow one down.", "Notifications"),
+    Spec("jellyfin_api_key", "JELLYFIN_API_KEY", "text", "", "Jellyfin API key",
+         "From Dashboard > API Keys in Jellyfin. Never shown again once saved.", "Notifications", secret=True),
+    Spec("jellyfin_path_map", "JELLYFIN_PATH_MAP", "text", "", "Jellyfin path map",
+         "worker_prefix=jellyfin_prefix pairs, comma separated, e.g. /media=/data. Jellyfin is told the path IT "
+         "mounts the library at, which is this container's path only when both compose files agree - write "
+         "/media=/media in that case. The longest matching prefix wins; a file under no prefix is not sent, "
+         "and the job says so.", "Notifications"),
     Spec("encode_nice", "ENCODE_NICE", "int", 0, "Encoder CPU priority (nice)",
          "0 is normal, 19 is 'only take a core nobody else wants'. On a CPU-only box a libx265 job pins every "
          "core, and the first anyone hears about it is playback stuttering while their own library is being "
@@ -296,6 +319,15 @@ def parse_value(spec: Spec, raw: Any, roots: list[str] | None = None) -> Any:
             # A watchdog shorter than the gap between progress lines would kill
             # healthy encodes, which is worse than the stall it guards against.
             raise ValueError("Stall timeout must be 0 (off) or between 1 and 1440 minutes")
+        if spec.key == "encoder_retry_attempts" and n > 10:
+            # Ten tries at the ceiling below is close to two hours of a held
+            # worker slot for one job; past that the watcher's cooldown is the
+            # right tool, not this loop.
+            raise ValueError("Retry an unavailable encoder must be at most 10 times")
+        if spec.key == "encoder_retry_seconds" and n > 600:
+            raise ValueError("The wait between encoder retries must be at most 600 seconds")
+        if spec.key == "encoder_retry_cooldown_minutes" and n > 1440:
+            raise ValueError("Retry after an unavailable encoder must be at most 1440 minutes (a day)")
         if spec.key == "encode_nice" and n > 19:
             # nice(1) tops out at 19; anything higher is silently clamped by the
             # kernel, which would leave a saved 30 meaning something it does not.
@@ -343,8 +375,10 @@ def parse_value(spec: Spec, raw: Any, roots: list[str] | None = None) -> Any:
         # belongs at the moment of sending, exactly as the arr client does it:
         # parse_value runs on every cfg() read, so resolving a name here would
         # be a DNS lookup per scan, per job and per page poll.
-        if spec.key == "webhook_url" and not re.match(r"^https?://", text):
-            raise ValueError("Webhook URL must start with http:// or https://")
+        if spec.key in ("webhook_url", "jellyfin_url") and not re.match(r"^https?://", text):
+            raise ValueError(f"{spec.label} must start with http:// or https://")
+        if spec.key == "jellyfin_path_map":
+            core.parse_path_map(text)  # raises with the message the UI shows
         if spec.key in ("tls_cert", "tls_key") and not text.startswith("/"):
             # Relative to what? The daemon's working directory is not something
             # anyone typing this can see, and a certificate that silently is not

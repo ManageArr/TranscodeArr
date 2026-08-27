@@ -456,8 +456,9 @@ document.documentElement.dataset.theme=localStorage.theme||'dark'</script>
   <p class="hint">Applies to the next job started, not the one running now.</p>
   <div id="perfform"></div>
   <button class="act" onclick="saveSettings('perfform','sysmsg')">Save</button></div>
- <div class="card"><h2>Webhook</h2>
-  <p class="hint">One POST per finished job, done or failed. Nothing about it can fail a job or slow one down.</p>
+ <div class="card"><h2>Notifications</h2>
+  <p class="hint">A webhook POST per finished job, done or failed, and a Jellyfin library refresh for each file a
+   job finalizes. Nothing about either can fail a job or slow one down; how each went is noted on the job.</p>
   <div id="hookform"></div>
   <button class="act" onclick="saveSettings('hookform','sysmsg')">Save</button></div>
  <div class="card"><h2>Security</h2>
@@ -473,8 +474,8 @@ document.documentElement.dataset.theme=localStorage.theme||'dark'</script>
    <button class="ghost" onclick="selfSign(this)">Generate</button></div>
   <div class="keyout" id="tlsout"></div></div>
  <div class="card"><h2>Backup and restore</h2>
-  <p class="hint">Settings, profiles and connections as one file. Secrets never leave: no arr API keys, no webhook
-   signing secret, no password or token hashes. Job history and the trash are not configuration and are not in it.</p>
+  <p class="hint">Settings, profiles and connections as one file. Secrets never leave: no arr or Jellyfin API keys, no
+   webhook signing secret, no password or token hashes. Job history and the trash are not configuration and are not in it.</p>
   <div class="row">
    <button class="act" onclick="downloadBackup(this)">Download backup</button>
    <input type="file" id="restorefile" accept=".json,application/json" style="max-width:18rem">

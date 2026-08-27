@@ -266,6 +266,38 @@ def is_bad_source_failure(error: str) -> bool:
     return bool(error) and bool(_BAD_SOURCE.search(error))
 
 
+# What the encoder says when the GPU is not there for it at that moment: the
+# CUDA runtime refusing to initialize, no device, the driver libraries not
+# loading. Every rung of the fallback ladder keeps the same video encoder, so
+# walking it cannot help - on a real box eighteen jobs failed inside three
+# seconds this way, minutes apart from encodes that went through, and each one
+# then sat in the six-hour cooldown for a card that was back in one.
+# ponytail: substring match on ffmpeg's stderr, like FALLBACK_WORTHY. Add a
+# phrase here when a real refusal is missed rather than widening any term.
+_ENCODER_UNAVAILABLE = re.compile(
+    r"cuInit"
+    r"|CUDA_ERROR_[A-Z_]+"
+    r"|No capable devices found"
+    r"|Cannot load (libcuda|libnvidia-encode)"
+    r"|\[\w*nvenc\b[^\]]*\][^\n]*\binit", re.I)   # "[h264_nvenc] Cannot init CUDA", "Failed to initialize"
+
+# The prefix a job's error carries when the retries above ran out, which is
+# what the watcher reads to pick the short cooldown over the long one.
+ENCODER_UNAVAILABLE = "encoder unavailable"
+
+
+def is_encoder_unavailable(text: str) -> bool:
+    """Whether ffmpeg failed because the hardware encoder was not there.
+
+    A condition of the host and the minute, never of the file: the right
+    answer is to try the same command again shortly, not the next rung of the
+    ladder and not a six-hour wait. "10 bit encode not supported" and a
+    decoder with no CUDA device are deliberately NOT in here - the first is
+    the profile's fault and the second is what the CPU-decode rung fixes.
+    """
+    return bool(text) and bool(_ENCODER_UNAVAILABLE.search(text))
+
+
 def may_replace_target(before: tuple | None, now: tuple | None) -> bool:
     """Whether the file sitting at a job's visible target may be displaced.
 
@@ -362,6 +394,20 @@ def in_retry_cooldown(last_failure_at: float | None, now: float, cooldown_hours:
     if not cooldown_hours or last_failure_at is None:
         return False
     return now - last_failure_at < cooldown_hours * 3600
+
+
+def retry_cooldown_hours(error: str | None, failed_hours: float, encoder_minutes: float) -> float:
+    """Which wait the watcher applies to a path whose last job failed.
+
+    A file that cannot be converted earns the long one. A job that failed
+    because the GPU was not there for it that minute is not that file: the
+    card was back within minutes every time it was watched, and parking a good
+    release for six hours over it is what an operator reads as "converting
+    stopped". 0 minutes retries on the next scan, exactly as 0 hours does.
+    """
+    if (error or "").startswith(ENCODER_UNAVAILABLE):
+        return encoder_minutes / 60
+    return failed_hours
 
 
 def is_stalled(seconds_since_progress: float, timeout_minutes: float) -> bool:
@@ -887,3 +933,47 @@ def error_summary(lines: list[str], keep: int = 6, width: int = 600) -> str:
     said = [_POINTER.sub("", ln).rstrip() for ln in lines
             if ln[:1] not in (" ", "\t") and not _RESTATEMENT.search(ln)]
     return "\n".join((said or [ln.rstrip() for ln in lines])[-keep:])[:width]
+
+
+# ---------------------------------------------------------------------------
+# Media server path map
+# ---------------------------------------------------------------------------
+# Jellyfin is told about a file by the path IT mounts the library at, which is
+# this container's path for the same bytes only when both compose files happen
+# to agree. Pairs are "worker_prefix=jellyfin_prefix".
+
+
+def parse_path_map(text: str) -> list[tuple[str, str]]:
+    """'worker_prefix=jellyfin_prefix' pairs, newline or comma separated.
+
+    Raises ValueError with the message the settings UI shows.
+    """
+    pairs = []
+    for item in re.split(r"[\n,]", text or ""):
+        item = item.strip()
+        if not item:
+            continue
+        ours, sep, theirs = (part.strip() for part in item.partition("="))
+        if not sep or not ours or not theirs:
+            raise ValueError(f"{item!r} is not a worker_prefix=jellyfin_prefix pair")
+        pairs.append((ours, theirs))
+    return pairs
+
+
+def map_path(path: str, pairs: list[tuple[str, str]]) -> str | None:
+    """Rewrite a worker path for the media server. None when no prefix matches.
+
+    The longest matching prefix wins, so "/media" and "/media/4k" can both be
+    listed and the deeper one takes its own files. A prefix matches only at a
+    path component boundary: "/media" must not claim "/media2/Film.mp4", which
+    would send Jellyfin to scan a folder that is not there.
+    """
+    best = None
+    for ours, theirs in pairs:
+        root = ours.rstrip("/")
+        if (path == ours or path.startswith(root + "/")) and (best is None or len(root) > len(best[0])):
+            best = (root, theirs.rstrip("/"))
+    if best is None:
+        return None
+    root, target = best
+    return target + path[len(root):]

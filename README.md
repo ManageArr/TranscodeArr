@@ -612,6 +612,37 @@ every scan and burned a whole encode attempt every few minutes forever. Queueing
 it from the API ignores the wait entirely: somebody asking for a file by name is
 not the loop this exists to stop.
 
+### An encoder that was not there
+
+Nor is a file whose encode failed because the GPU refused to initialize:
+`[h264_nvenc] dl_fn->cuda_dl->cuInit(0) failed -> CUDA_ERROR_NOT_INITIALIZED`.
+On a real box eighteen jobs failed that way inside three seconds each over a
+few evenings, minutes apart from encodes that went through fine, with nothing
+else using the card. The file is fine; the card was not, for a moment.
+
+Two things used to make that worse. `cuda` is one of the words the fallback
+ladder retries on, so a refusal walked every rung - none of which changes the
+video encoder - in three seconds, and then the failed file sat in the six-hour
+cooldown for a card that was back in one. Since 1.4.0 an encode whose stderr
+says the encoder was unavailable (`cuInit`, `CUDA_ERROR_*`, `No capable
+devices found`, `Cannot load libcuda`, an `nvenc` init failure) is **started
+again unchanged**, `encoder_retry_attempts` times (3) with
+`encoder_retry_seconds` (20) between tries, and only then fails with an error
+starting `encoder unavailable`. The watcher reads that prefix and waits
+`encoder_retry_cooldown_minutes` (15) for the file instead of the hours above.
+Before the first retry the log gets one line of `nvidia-smi
+--query-gpu=name,persistence_mode,pstate` and `ls -l /dev/nvidia*`, which is
+what you want to have in the log when you come to read about it. None of this
+ever asks an arr to replace the file: `is_bad_source_failure` has never matched
+these strings, and a test pins that.
+
+A probe that never answers is treated the same way. `ffprobe` timing out on a
+slow share or failing to run at all is reported as `source probe failed
+(timeout or I/O error) - will retry` or `output probe failed (timeout or I/O
+error)`, neither of which the arr replacement rule believes. Before 1.4.0 both
+were reported as "found no video stream", which it does believe, so a slow
+mount could blocklist a good release.
+
 **A 10-bit source is not one of those files**, though it used to be. H.264
 NVENC cannot encode 10 bits, and handed a `yuv420p10le` source it exits `-22
 (Invalid argument)` before the first frame rather than converting - ffmpeg does
@@ -1294,6 +1325,9 @@ newlines. Booleans accept `1`, `true`, `yes`, `on` (any case).
 | Decode on the GPU too | `HARDWARE_DECODE` | `true` | The encoder was always on the GPU; the decoder was not, and decoding 1080p in software is what actually pins a NAS CPU. Measured on a real episode: 21.3s of CPU became 3.9s and the job ran 45% faster, for a byte-identical file. NVIDIA encoders only; ffmpeg falls back to CPU decoding by itself for anything the card cannot decode. |
 | Convert at once | `MAX_CONCURRENT` | `1` | 1 to 8. One at a time suits a NAS: a single set of spindles behind a single network link turns two encodes into two slow ones. Takes effect on the next job, no restart needed. |
 | Retry failed files after (hours) | `RETRY_FAILED_AFTER_HOURS` | `6` | How long the watcher leaves a file alone after a job for it failed. `0` retries on the next scan. Queueing a file from the API ignores this. |
+| Retry an unavailable encoder (times) | `ENCODER_RETRY_ATTEMPTS` | `3` | 0 to 10. How many times an encode whose GPU encoder refused to initialize (`cuInit`, `CUDA_ERROR_*`, no capable device) is started again, unchanged, before the job fails with `encoder unavailable`. The fallback ladder is not walked for these. See [An encoder that was not there](#an-encoder-that-was-not-there). |
+| ...waiting between tries (seconds) | `ENCODER_RETRY_SECONDS` | `20` | 0 to 600. The wait between those attempts; the worker slot is held meanwhile. |
+| Retry after an unavailable encoder (minutes) | `ENCODER_RETRY_COOLDOWN_MINUTES` | `15` | 0 to 1440. The watcher's wait for a file whose job failed with `encoder unavailable`, in place of the hours above. `0` retries on the next scan. |
 | Stall timeout (minutes) | `STALL_TIMEOUT_MINUTES` | `30` | An encode reporting no progress for this long is killed and its job failed. `0` turns the watchdog off, and a stalled job then holds its worker slot for the life of the container. Any other value must be 1 to 1440 - a watchdog shorter than the progress interval would kill healthy encodes. |
 | Keep replaced sources (days) | `TRASH_KEEP_DAYS` | `7` | How long a replaced original survives in the trash. Raise it before a large batch. |
 | Keep job history (days) | `KEEP_HISTORY_DAYS` | `30` | Done, failed and cancelled rows older than this are deleted on the next scan. `0` keeps every row forever. |
@@ -1301,6 +1335,9 @@ newlines. Booleans accept `1`, `true`, `yes`, `on` (any case).
 | Only convert between | `CONVERT_WINDOW` | (empty, meaning always) | One daily range, `HH:MM-HH:MM`. Spans midnight (`22:00-06:00`). **Read in the container's timezone**, which is UTC unless you set `TZ`. Only new work is gated; the encode in flight always finishes and the watcher keeps queueing. See [The convert window](#the-convert-window). |
 | Webhook URL | `WEBHOOK_URL` | (empty) | POSTed a JSON summary when a job finishes, done or failed. Must start `http://` or `https://`. See [Job webhook](#job-webhook). |
 | Webhook signing secret | `WEBHOOK_SECRET` | (empty) | Optional. When set, each call carries an HMAC-SHA256 signature header. **Secret**: it is masked in the API and the UI and is never in a backup. |
+| Jellyfin URL | `JELLYFIN_URL` | (empty) | Base URL of the Jellyfin server, e.g. `http://jellyfin:8096`. When set, every file a job finalizes is reported to Jellyfin as created. Must start `http://` or `https://`. See [Jellyfin](#jellyfin). |
+| Jellyfin API key | `JELLYFIN_API_KEY` | (empty) | From Dashboard > API Keys in Jellyfin. **Secret**, like the webhook signing secret. |
+| Jellyfin path map | `JELLYFIN_PATH_MAP` | (empty) | `worker_prefix=jellyfin_prefix` pairs, comma or newline separated, e.g. `/media=/data`. Write `/media=/media` when both containers mount the library at the same path. A file under no prefix is not sent, and the job says so. |
 | Encoder CPU priority (nice) | `ENCODE_NICE` | `0` | 0 to 19. See [Throttling ffmpeg](#throttling-ffmpeg). |
 | Encode at idle disk priority | `ENCODE_IDLE_IO` | `false` | `ionice -c 3` on the ffmpeg process. |
 | Encoder threads | `ENCODE_THREADS` | `0` | 0 to 64. `0` lets ffmpeg take every core. Software encoders only. |
@@ -1632,6 +1669,33 @@ loopback receivers are reachable by design, because that is where they live. See
 Webhook threads are daemons, so a call in flight is lost if the container stops
 in that same second. The job row is already correct and durable; only the
 notification is dropped.
+
+### Jellyfin
+
+Jellyfin does not notice a same-name in-place replacement (jellyfin#13565),
+and the arr rescan above only reaches it through an arr that is linked here and
+wired to Jellyfin. Set `jellyfin_url` and `jellyfin_api_key` and every file a
+job finalizes is reported directly, right after the arrs:
+
+```
+POST {jellyfin_url}/Library/Media/Updated
+Authorization: MediaBrowser Token="<key>"     (X-Emby-Token carries it too)
+{"Updates": [{"Path": "/data/Movies/Film (2026)/Film (2026).mp4", "UpdateType": "Created"}]}
+```
+
+`Path` is the path **Jellyfin** mounts the library at, which is this
+container's path only when both compose files agree - so `jellyfin_path_map`
+translates it: `worker_prefix=jellyfin_prefix` pairs, comma or newline
+separated, longest matching prefix wins, and a prefix matches only at a path
+component boundary (`/media` does not claim `/media2`). When the mounts do
+agree, write `/media=/media`. A file under no prefix is not sent, because
+Jellyfin would scan a folder it does not have and report nothing.
+
+The outcome is appended to the job's `rescan` field: `| jellyfin: ok`,
+`| jellyfin: no path map for <path>`, or `| jellyfin: <error>`. It runs under
+the webhook's rule - after the media is correct on disk, on a daemon thread,
+with the same 10 second timeout, through the same link-local guard and
+redirect-refusing opener - and nothing it does can fail a job.
 
 ## API
 

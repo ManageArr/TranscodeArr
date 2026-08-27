@@ -501,5 +501,96 @@ class ErrorSummary(unittest.TestCase):
         self.assertTrue(core.error_summary(["frame=    1 fps=0.0", "Conversion failed!"]).strip())
 
 
+class EncoderUnavailable(unittest.TestCase):
+    """Which ffmpeg failures mean the GPU was not there for the encoder - a
+    condition of the minute, answered by trying the same command again shortly
+    rather than by walking the fallback ladder or waiting six hours."""
+
+    REAL = ("ffmpeg exited 171: [h264_nvenc] dl_fn->cuda_dl->cuInit(0) failed -> "
+            "CUDA_ERROR_NOT_INITIALIZED: initialization error")
+
+    def test_the_refusal_that_failed_eighteen_jobs_is_recognized(self):
+        # The exact stderr line from the QNAP from 2026-08-21 on: 18 jobs dead
+        # inside three seconds each, minutes apart from encodes that worked.
+        self.assertTrue(core.is_encoder_unavailable(self.REAL))
+
+    def test_the_other_ways_a_card_goes_missing_are_too(self):
+        for text in [
+            "[hevc_nvenc @ 0x5581] No capable devices found",
+            "[h264_nvenc @ 0x5581] Cannot load libcuda.so.1",
+            "[h264_nvenc @ 0x5581] Cannot load libnvidia-encode.so.1",
+            "[h264_nvenc @ 0x5581] Cannot init CUDA",
+            "[hevc_nvenc] Failed to initialize the encoder session",
+            "CUDA_ERROR_NO_DEVICE",
+        ]:
+            self.assertTrue(core.is_encoder_unavailable(text), text)
+
+    def test_a_profile_or_file_problem_is_not_a_missing_card(self):
+        # The decoder line is what the CPU-decode rung of the ladder fixes, and
+        # 10-bit is the profile's fault: retrying either unchanged gains nothing.
+        for text in [
+            "ffmpeg exited 171: [h264_nvenc] 10 bit encode not supported",
+            "ffmpeg exited 187: No device available for decoder: device type cuda needed for codec h264",
+            "output failed verification: duration mismatch: source 2724s, output 2624s (3.7% off)",
+            "Error: mov_text encoder not found",
+            "No space left on device",
+            "",
+        ]:
+            self.assertFalse(core.is_encoder_unavailable(text), text)
+
+    def test_neither_a_missing_card_nor_a_silent_probe_is_ever_the_sources_fault(self):
+        # The strings run_encode and process record for these. Each one either
+        # was, or replaced, a sentence the arr replacement rule believed.
+        for recorded in [
+            f"{core.ENCODER_UNAVAILABLE}: [h264_nvenc] dl_fn->cuda_dl->cuInit(0) failed -> "
+            "CUDA_ERROR_NOT_INITIALIZED: initialization error",
+            "source probe failed (timeout or I/O error) - will retry",
+            "output probe failed (timeout or I/O error)",
+        ]:
+            self.assertFalse(core.is_bad_source_failure(recorded), recorded)
+
+    def test_the_watcher_waits_minutes_for_a_card_and_hours_for_a_file(self):
+        self.assertEqual(core.retry_cooldown_hours(f"{core.ENCODER_UNAVAILABLE}: cuInit failed", 6, 15), 0.25)
+        self.assertEqual(core.retry_cooldown_hours("output failed verification: output has no video stream", 6, 15), 6)
+        self.assertEqual(core.retry_cooldown_hours(None, 6, 15), 6)
+        # The short wait feeds the same gate as the long one, and 0 means "next scan" for both.
+        self.assertTrue(core.in_retry_cooldown(1000.0, 1000.0 + 14 * 60, 0.25))
+        self.assertFalse(core.in_retry_cooldown(1000.0, 1000.0 + 16 * 60, 0.25))
+        self.assertFalse(core.in_retry_cooldown(1000.0, 1000.0 + 1,
+                                                core.retry_cooldown_hours(core.ENCODER_UNAVAILABLE, 6, 0)))
+
+
+class JellyfinPathMap(unittest.TestCase):
+    """Jellyfin is told the path IT mounts the library at, not this container's."""
+
+    def test_pairs_come_newline_or_comma_separated(self):
+        self.assertEqual(core.parse_path_map("/media=/data,/truenas/media=/truenas/media"),
+                         [("/media", "/data"), ("/truenas/media", "/truenas/media")])
+        self.assertEqual(core.parse_path_map(" /media = /data \n\n"), [("/media", "/data")])
+        self.assertEqual(core.parse_path_map(""), [])
+
+    def test_a_pair_without_both_halves_is_refused_when_saved(self):
+        for bad in ["/media", "/media=", "=/data", "/media=/data,junk"]:
+            with self.assertRaises(ValueError, msg=bad):
+                core.parse_path_map(bad)
+
+    def test_the_longest_matching_prefix_wins(self):
+        pairs = core.parse_path_map("/media=/data,/media/4k=/uhd")
+        self.assertEqual(core.map_path("/media/4k/Film/Film.mp4", pairs), "/uhd/Film/Film.mp4")
+        self.assertEqual(core.map_path("/media/Movies/Film.mp4", pairs), "/data/Movies/Film.mp4")
+
+    def test_a_prefix_matches_whole_components_only(self):
+        # "/media" claiming "/media2/..." would send Jellyfin to scan a folder it does not have.
+        pairs = core.parse_path_map("/media=/data")
+        self.assertIsNone(core.map_path("/media2/Film.mp4", pairs))
+        self.assertIsNone(core.map_path("/other/Film.mp4", pairs))
+        self.assertIsNone(core.map_path("/media/Film.mp4", []))
+
+    def test_trailing_slashes_and_identical_mounts_are_fine(self):
+        self.assertEqual(core.map_path("/media/Film.mp4", core.parse_path_map("/media/=/data/")), "/data/Film.mp4")
+        self.assertEqual(core.map_path("/media/Film.mp4", core.parse_path_map("/media=/media")), "/media/Film.mp4")
+        self.assertEqual(core.map_path("/media/Film.mp4", core.parse_path_map("/=/")), "/media/Film.mp4")
+
+
 if __name__ == "__main__":
     unittest.main()

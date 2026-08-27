@@ -546,6 +546,16 @@ class RetryCooldown(JobCase):
         self.assertIsNotNone(main.enqueue(path, "transcode", force=True),
                              "an explicit enqueue was refused by the cooldown")
 
+    def test_a_missing_card_earns_minutes_not_hours(self):
+        path = self.write(".Movie.mkv", "the source")
+        main.db().execute(
+            "INSERT INTO jobs (id, path, state, kind, created, finished, error) VALUES (?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), path, "failed", "transcode", time.time(), time.time() - 20 * 60,
+             core.ENCODER_UNAVAILABLE + ": [h264_nvenc] cuInit(0) failed"))
+        main.db().commit()
+        # Twenty minutes ago: inside the six-hour wait, past the fifteen-minute one.
+        self.assertIsNotNone(main.enqueue(path, "transcode"), "the watcher waited hours for a card that was back")
+
 
 class BootCleanup(JobCase):
     """Anything left 'running' died with the previous process, and the restart
@@ -677,6 +687,103 @@ class FallbackLadder(JobCase):
         self.assertFalse(ok)
         self.assertEqual(error, "cancelled")
         self.assertEqual(len(fake.calls), 1)
+
+    CUINIT = ("[h264_nvenc @ 0x55d0] dl_fn->cuda_dl->cuInit(0) failed -> "
+              "CUDA_ERROR_NOT_INITIALIZED: initialization error")
+
+    def quick_retries(self, attempts):
+        """The encoder retry loop with no wait and no nvidia-smi call."""
+        main.store.save_settings(main.db(), {"encoder_retry_attempts": attempts, "encoder_retry_seconds": 0})
+        self.addCleanup(lambda: (main.db().execute("DELETE FROM settings"), main.db().commit()))
+        p = mock.patch.object(main, "log_encoder_diagnostics", lambda job_id: None)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_a_missing_card_retries_the_same_command_not_the_next_rung(self):
+        # "cuda" is a fallback word, so before this a cuInit refusal walked all
+        # four rungs in three seconds - none of them changes the video encoder.
+        self.quick_retries(3)
+        fake, (ok, warning, error) = self.attempt([(171, self.CUINIT), (171, self.CUINIT), (0, "")])
+        self.assertTrue(ok, error)
+        self.assertEqual(len(fake.calls), 3)
+        self.assertEqual(fake.calls[0], fake.calls[1])
+        self.assertEqual(fake.calls[1], fake.calls[2])
+        self.assertEqual(warning, "")   # nothing was dropped to get there
+
+    def test_a_card_that_stays_missing_fails_by_name_after_the_retries(self):
+        self.quick_retries(2)
+        fake, (ok, _warning, error) = self.attempt([(171, self.CUINIT)])
+        self.assertFalse(ok)
+        self.assertEqual(len(fake.calls), 3)   # the first try and two retries, no rungs
+        self.assertTrue(error.startswith(core.ENCODER_UNAVAILABLE + ": "), error)
+        self.assertIn("cuInit", error)
+        self.assertFalse(core.is_bad_source_failure(error))
+
+    def test_the_diagnostics_line_is_logged_once_before_the_first_retry(self):
+        self.quick_retries(2)
+        seen = []
+        with mock.patch.object(main, "log_encoder_diagnostics", seen.append):
+            self.attempt([(171, self.CUINIT)])
+        self.assertEqual(len(seen), 1)
+
+    def test_the_diagnostics_never_raise_on_a_box_without_a_card(self):
+        # No nvidia-smi and no /dev/nvidia* is a warning line, not a crash
+        # between two encode attempts on the worker.
+        with mock.patch.object(main.subprocess, "run", side_effect=OSError("no such tool")), \
+                self.assertLogs(main.log, level="WARNING") as logged:
+            main.log_encoder_diagnostics("abcdef12")
+        self.assertIn("nvidia-smi", logged.output[0])
+        self.assertIn("no such tool", logged.output[0])
+
+
+class ProbeThatNeverAnswered(JobCase):
+    """ffprobe timing out on a slow share is not ffprobe finding no video
+    stream - and the second sentence is one the arr replacement rule acts on."""
+
+    def test_ffprobe_tells_a_timeout_apart_from_an_unreadable_file(self):
+        with mock.patch.object(main.subprocess, "run",
+                               side_effect=main.subprocess.TimeoutExpired("ffprobe", 120)):
+            with self.assertRaises(main.ProbeUnavailable):
+                main.ffprobe("/media/Film.mkv")
+        with mock.patch.object(main.subprocess, "run", side_effect=OSError("stale file handle")):
+            with self.assertRaises(main.ProbeUnavailable):
+                main.ffprobe("/media/Film.mkv")
+        with mock.patch.object(main.subprocess, "run", return_value=mock.Mock(returncode=1, stdout="")):
+            self.assertIsNone(main.ffprobe("/media/Film.mkv"))
+
+    def test_a_source_probe_that_hangs_fails_the_job_without_blaming_the_file(self):
+        source = self.write(".Movie.mkv", "the source")
+        job = self.claim(source)
+
+        def hung(path):
+            raise main.ProbeUnavailable("Command 'ffprobe' timed out after 120 seconds")
+
+        with mock.patch.object(main, "ffprobe", hung):
+            main.process(job)
+        row = self.row(job["id"])
+        self.assertEqual(row["state"], "failed")
+        self.assertEqual(row["error"], "source probe failed (timeout or I/O error) - will retry")
+        self.assertFalse(core.is_bad_source_failure(row["error"]))
+        self.assertEqual(self.read(source), "the source")
+
+    def test_an_output_probe_that_hangs_fails_the_job_and_keeps_the_source(self):
+        source = self.write(".Movie.mkv", "the source")
+        job = self.claim(source)
+
+        def probe(path):
+            if path == source:
+                return WHOLE
+            raise main.ProbeUnavailable("stale file handle")
+
+        with mock.patch.object(main, "ffprobe", probe), \
+                mock.patch.object(main, "run_encode", self.encoder_that_writes("the encode")):
+            main.process(job)
+        row = self.row(job["id"])
+        self.assertEqual(row["state"], "failed")
+        self.assertEqual(row["error"], "output probe failed (timeout or I/O error)")
+        self.assertFalse(core.is_bad_source_failure(row["error"]))
+        self.assertEqual(self.read(source), "the source")
+        self.assertFalse(os.path.exists(core.plan_names(source).part))
 
 
 if __name__ == "__main__":

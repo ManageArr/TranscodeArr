@@ -463,5 +463,106 @@ class Webhook(RunStateCase):
         self.assertEqual(posted, [])
 
 
+class JellyfinRefresh(RunStateCase):
+    """The Jellyfin call lives under the webhook's rule: after the media is
+    correct on disk, on a thread, and its outcome is a note on the job."""
+
+    def done_job(self, rescan=None):
+        job_id = str(uuid.uuid4())
+        conn = main.db()
+        conn.execute("INSERT INTO jobs (id, path, state, kind, created, output, rescan) VALUES (?,?,?,?,?,?,?)",
+                     (job_id, "/media/Movies/Film.mkv", "done", "transcode", time.time(),
+                      "/media/Movies/Film.mp4", rescan))
+        conn.commit()
+        return job_id
+
+    def rescan(self, job_id):
+        return main.db().execute("SELECT rescan FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
+
+    def test_the_api_key_is_a_secret(self):
+        self.assertIn("jellyfin_api_key", store.SECRET_KEYS)
+
+    def test_nothing_happens_without_a_url(self):
+        job_id = self.done_job()
+        with mock.patch.object(main, "notify_arrs", lambda path: None), \
+                mock.patch.object(main, "_post_jellyfin", side_effect=AssertionError("posted")):
+            main.rescan_after(job_id, "/media/Movies/Film.mp4")
+        self.assertIsNone(self.rescan(job_id))
+
+    def test_a_file_under_no_mapped_prefix_is_said_not_guessed(self):
+        store.save_settings(main.db(), {"jellyfin_url": "http://jellyfin:8096",
+                                        "jellyfin_path_map": "/tv=/data/tv"})
+        job_id = self.done_job()
+        with mock.patch.object(main, "notify_arrs", lambda path: "Radarr: rescanning"), \
+                mock.patch.object(main, "_post_jellyfin", side_effect=AssertionError("posted")):
+            main.rescan_after(job_id, "/media/Movies/Film.mp4")
+        self.assertEqual(self.rescan(job_id),
+                         "Radarr: rescanning | jellyfin: no path map for /media/Movies/Film.mp4")
+
+    def test_the_translated_path_goes_out_on_a_thread_after_the_arrs(self):
+        store.save_settings(main.db(), {"jellyfin_url": "http://jellyfin:8096/", "jellyfin_api_key": "k3y",
+                                        "jellyfin_path_map": "/media=/data"})
+        sent, delivered = [], threading.Event()
+
+        def record(url, api_key, path, job_id):
+            sent.append((url, api_key, path, job_id))
+            delivered.set()
+
+        job_id = self.done_job()
+        with mock.patch.object(main, "notify_arrs", lambda path: None), \
+                mock.patch.object(main, "_post_jellyfin", record):
+            main.rescan_after(job_id, "/media/Movies/Film.mp4")
+            delivered.wait(5.0)
+        self.assertEqual(sent, [("http://jellyfin:8096", "k3y", "/data/Movies/Film.mp4", job_id)])
+
+    def test_the_request_is_what_jellyfin_documents_and_the_outcome_lands_on_the_job(self):
+        import json
+        posted = []
+
+        class FakeOpener:
+            def open(self, req, timeout=None):
+                posted.append((req, timeout))
+                return mock.MagicMock(__enter__=lambda s: s, __exit__=lambda *a: False)
+
+        job_id = self.done_job(rescan="Radarr: rescanning")
+        with mock.patch.object(main.arr_client, "_opener", FakeOpener()), \
+                mock.patch.object(main.arr_client, "blocked_reason", lambda url: None):
+            main._post_jellyfin("http://jellyfin:8096", "k3y", "/data/Movies/Film.mp4", job_id)
+        [(req, timeout)] = posted
+        self.assertEqual(req.full_url, "http://jellyfin:8096/Library/Media/Updated")
+        self.assertEqual(req.get_method(), "POST")
+        self.assertEqual(timeout, main.WEBHOOK_TIMEOUT)
+        self.assertEqual(json.loads(req.data),
+                         {"Updates": [{"Path": "/data/Movies/Film.mp4", "UpdateType": "Created"}]})
+        self.assertEqual(req.get_header("Authorization"), 'MediaBrowser Token="k3y"')
+        self.assertEqual(req.get_header("X-emby-token"), "k3y")
+        # Appended, not overwritten: the arr's answer is still there.
+        self.assertEqual(self.rescan(job_id), "Radarr: rescanning | jellyfin: ok")
+
+    def test_an_unreachable_jellyfin_is_a_note_and_never_a_failed_job(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            dead_port = probe.getsockname()[1]
+        job_id = self.done_job()
+        with self.assertLogs(main.log, level="WARNING"):
+            main._post_jellyfin("http://127.0.0.1:%d" % dead_port, "k3y", "/data/Film.mp4", job_id)  # must not raise
+        self.assertTrue(self.rescan(job_id).startswith("jellyfin: "), self.rescan(job_id))
+        self.assertNotEqual(self.rescan(job_id), "jellyfin: ok")
+        self.assertEqual(main.db().execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()[0], "done")
+
+    def test_a_link_local_jellyfin_is_refused(self):
+        posted = []
+
+        class FakeOpener:
+            def open(self, req, timeout=None):
+                posted.append(req)
+
+        job_id = self.done_job()
+        with mock.patch.object(main.arr_client, "_opener", FakeOpener()):
+            main._post_jellyfin("http://169.254.169.254", "k3y", "/data/Film.mp4", job_id)
+        self.assertEqual(posted, [])
+        self.assertTrue(self.rescan(job_id).startswith("jellyfin: "), self.rescan(job_id))
+
+
 if __name__ == "__main__":
     unittest.main()

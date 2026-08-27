@@ -121,7 +121,7 @@ def cfg() -> dict:
 # A constant compiled into the image cannot be overridden from outside it. Bump
 # it with the image tag: the release workflow refuses a tag that disagrees with
 # it, and a test refuses a Dockerfile that does.
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -315,11 +315,13 @@ def enqueue(path: str, kind: str, force: bool = False) -> dict | None:
         return None
     if not force:
         last = conn.execute(
-            "SELECT state, finished FROM jobs WHERE path=? ORDER BY created DESC LIMIT 1", (path,)
+            "SELECT state, finished, error FROM jobs WHERE path=? ORDER BY created DESC LIMIT 1", (path,)
         ).fetchone()
-        if last and last["state"] == "failed" and core.in_retry_cooldown(
-                last["finished"], time.time(), cfg()["retry_failed_after_hours"]):
-            return None
+        if last and last["state"] == "failed":
+            c = cfg()
+            if core.in_retry_cooldown(last["finished"], time.time(), core.retry_cooldown_hours(
+                    last["error"], c["retry_failed_after_hours"], c["encoder_retry_cooldown_minutes"])):
+                return None
     job_id = str(uuid.uuid4())
     try:
         conn.execute(
@@ -340,12 +342,26 @@ def enqueue(path: str, kind: str, force: bool = False) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
+class ProbeUnavailable(Exception):
+    """ffprobe never delivered a verdict: it timed out or could not be run.
+
+    Kept apart from None, which means "ran, and found nothing it could read".
+    A probe that hung for two minutes on a slow share used to be reported as
+    'ffprobe found no video stream', and that is a sentence
+    core.is_bad_source_failure believes - so a good release could be
+    blocklisted for a mount that was busy.
+    """
+
+
 def ffprobe(path: str) -> core.Probe | None:
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", path],
             capture_output=True, text=True, timeout=120,
         )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise ProbeUnavailable(str(e) or type(e).__name__) from e
+    try:
         if out.returncode != 0:
             return None
         return core.parse_ffprobe(json.loads(out.stdout))
@@ -721,7 +737,9 @@ def run_encode(job_id: str, source: str, names: core.JobNames, src_probe: core.P
         attempts.append((False, "aac", False, "hardware decoding failed - decoded on the CPU instead"))
 
     error = "no encode attempt ran"
-    for with_subs, audio_codec, hardware_decode, warning in attempts:
+    encoder_retries = 0
+    while attempts:
+        with_subs, audio_codec, hardware_decode, warning = attempts[0]
         # Prefixed before it is recorded, not after: log_tail's whole job is to
         # say what actually ran, and a throttled encode that logs the unthrottled
         # command is a field that lies in exactly the case somebody is reading it.
@@ -802,6 +820,27 @@ def run_encode(job_id: str, source: str, names: core.JobNames, src_probe: core.P
         # explain from the job list.
         tail = core.error_summary(stderr_tail)
         error = f"ffmpeg exited {proc.returncode}: {tail}"
+        try:
+            os.unlink(names.part)
+        except OSError:
+            pass
+        if core.is_encoder_unavailable(tail):
+            # The ladder cannot help: every rung keeps the video encoder, and
+            # the encoder is what is missing. "cuda" is in FALLBACK_WORTHY, so
+            # before this gate a cuInit refusal walked all four rungs in three
+            # seconds and then parked the file for six hours. What does help is
+            # the same command a little later - on a real box the card was
+            # back within minutes of every refusal.
+            if encoder_retries == 0:
+                log_encoder_diagnostics(job_id)
+            if encoder_retries >= c["encoder_retry_attempts"]:
+                said = next((ln for ln in tail.splitlines() if core.is_encoder_unavailable(ln)), tail)
+                return False, "", f"{core.ENCODER_UNAVAILABLE}: {said}"
+            encoder_retries += 1
+            log.warning("job %s: encoder unavailable - retry %d of %d in %ds", job_id[:8],
+                        encoder_retries, c["encoder_retry_attempts"], c["encoder_retry_seconds"])
+            time.sleep(c["encoder_retry_seconds"])
+            continue
         if not FALLBACK_WORTHY.search(tail):
             # A full disk, a share that went away, an unreadable source: none of
             # those change because the next rung drops subtitles, so retrying
@@ -811,11 +850,28 @@ def run_encode(job_id: str, source: str, names: core.JobNames, src_probe: core.P
         # ever has, so every rung after it returned immediately and the AAC and
         # CPU-decode rungs were unreachable: a subtitled DTS remux with copy
         # audio failed on the rung above the one that would have worked.
-        try:
-            os.unlink(names.part)
-        except OSError:
-            pass
+        attempts.pop(0)
     return False, "", error
+
+
+def log_encoder_diagnostics(job_id: str) -> None:
+    """One line of what the host says about the GPU at the moment it refused.
+
+    nvidia-smi answering while cuInit fails is the pattern this exists to catch
+    (see the ops notes in the README); the device nodes are for the other one,
+    a container whose /dev/nvidia* went missing. Never raises and never waits
+    long: this runs on the worker, between two encode attempts.
+    """
+    said = []
+    for cmd in ("nvidia-smi --query-gpu=name,persistence_mode,pstate --format=csv,noheader",
+                "ls -l /dev/nvidia*"):
+        try:
+            # shell=True for the glob; the command is a literal, not input.
+            run = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+            said.append((run.stdout or run.stderr).strip().replace("\n", "; ") or f"exit {run.returncode}")
+        except Exception as e:  # noqa: BLE001 - a diagnostic never fails the job it describes
+            said.append(f"{cmd.split()[0]}: {e}")
+    log.warning("job %s: encoder unavailable - nvidia-smi: %s | /dev/nvidia*: %s", job_id[:8], said[0], said[1])
 
 
 def trash(source: str, job_id: str | None = None) -> str:
@@ -1299,7 +1355,7 @@ def request_replacement(job_id: str, source: str, error: str) -> None:
 
 
 def rescan_after(job_id: str, visible_path: str) -> None:
-    """Notify the arrs once the job is already recorded as done."""
+    """Notify the arrs, then Jellyfin, once the job is already recorded as done."""
     try:
         rescan = notify_arrs(visible_path)
     except Exception as e:  # noqa: BLE001
@@ -1312,6 +1368,70 @@ def rescan_after(job_id: str, visible_path: str) -> None:
             conn.commit()
         except sqlite3.Error:
             log.warning("could not record rescan result for %s", job_id[:8])
+    try:
+        jellyfin_after(job_id, visible_path)
+    except Exception:  # noqa: BLE001 - a media server never fails a job that is done
+        log.exception("jellyfin refresh after %s failed", job_id[:8])
+
+
+def jellyfin_after(job_id: str, visible_path: str) -> None:
+    """Tell Jellyfin a file appeared at this path, in the background.
+
+    Jellyfin never notices a same-name in-place replacement on its own
+    (jellyfin#13565), and the arr rescan above only reaches it through an arr
+    that is linked and wired to it. This asks directly, by the path Jellyfin
+    mounts the library at, under the webhook's rule: after the media is
+    already correct on disk, on a thread, with one short timeout, and the
+    outcome is a note on the job rather than anything that could fail it.
+    """
+    c = cfg()
+    url = c["jellyfin_url"].strip().rstrip("/")
+    if not url:
+        return
+    mapped = core.map_path(visible_path, core.parse_path_map(c["jellyfin_path_map"]))
+    if mapped is None:
+        # Said on the job rather than guessed: sending our own path would have
+        # Jellyfin scan a folder it does not have and report nothing at all.
+        append_rescan_note(job_id, f"jellyfin: no path map for {visible_path}")
+        return
+    threading.Thread(target=_post_jellyfin, args=(url, c["jellyfin_api_key"], mapped, job_id),
+                     daemon=True).start()
+
+
+def _post_jellyfin(url: str, api_key: str, path: str, job_id: str) -> None:
+    try:
+        # The same egress guard and redirect-refusing opener as the webhook,
+        # for the same reason: this URL is operator-supplied.
+        blocked = arr_client.blocked_reason(url)
+        if blocked:
+            raise ValueError(blocked)
+        body = json.dumps({"Updates": [{"Path": path, "UpdateType": "Created"}]}).encode()
+        req = urllib.request.Request(url + "/Library/Media/Updated", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("User-Agent", arr_client.USER_AGENT)
+        # Both spellings: the MediaBrowser scheme is what Jellyfin documents,
+        # X-Emby-Token is what older builds and some proxies in front still read.
+        req.add_header("Authorization", f'MediaBrowser Token="{api_key}"')
+        req.add_header("X-Emby-Token", api_key)
+        with arr_client._opener.open(req, timeout=WEBHOOK_TIMEOUT):  # noqa: SLF001
+            pass
+        note = "jellyfin: ok"
+    except Exception as e:  # noqa: BLE001 - an unreachable Jellyfin is not a failed job
+        note = f"jellyfin: {e}"
+        log.warning("jellyfin refresh for job %s failed: %s", job_id[:8], e)
+    append_rescan_note(job_id, note)
+
+
+def append_rescan_note(job_id: str, note: str) -> None:
+    """Add to jobs.rescan without losing what notify_arrs already wrote there."""
+    try:
+        conn = db()
+        conn.execute(
+            "UPDATE jobs SET rescan=CASE WHEN rescan IS NULL OR rescan='' THEN ? ELSE rescan || ' | ' || ? END "
+            "WHERE id=?", (note, note, job_id))
+        conn.commit()
+    except sqlite3.Error:
+        log.warning("could not record %r for %s", note, job_id[:8])
 
 
 # Short on purpose. A receiver that hangs holds a thread and nothing else, but
@@ -1453,7 +1573,13 @@ def process(job: dict) -> None:
         if taken:
             return finish("failed", error=taken)
 
-        src_probe = ffprobe(source)
+        try:
+            src_probe = ffprobe(source)
+        except ProbeUnavailable as e:
+            # Not a verdict on the file, so not a sentence is_bad_source_failure
+            # may act on: the share was slow or gone, and the file is fine.
+            log.warning("job %s: source probe failed: %s", job_id[:8], e)
+            return finish("failed", error="source probe failed (timeout or I/O error) - will retry")
         if src_probe is None or src_probe.video_streams < 1:
             return finish("failed", error="source is not a readable video (ffprobe found no video stream)")
         src_bytes = os.path.getsize(source)
@@ -1487,7 +1613,15 @@ def process(job: dict) -> None:
             return finish("cancelled" if error == "cancelled" else "failed", error=error)
 
         # The check whose absence truncated a library: never trust exit 0.
-        out_probe = ffprobe(names.part)
+        try:
+            out_probe = ffprobe(names.part)
+        except ProbeUnavailable as e:
+            log.warning("job %s: output probe failed: %s", job_id[:8], e)
+            try:
+                os.unlink(names.part)
+            except OSError:
+                pass
+            return finish("failed", error="output probe failed (timeout or I/O error)")
         try:
             tolerance = float(cfg()["verify_duration_tolerance"])
         except ValueError:

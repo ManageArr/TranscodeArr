@@ -17,9 +17,42 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.3.1` is the release to run. Everything in the sections below is in it and is
+`1.4.0` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.4.0] - 2026-08-27
+
+### Added
+
+- **Jellyfin is told about every finalized file.** Three settings under
+  Notifications: `JELLYFIN_URL`, `JELLYFIN_API_KEY` and `JELLYFIN_PATH_MAP`
+  (`worker_prefix=jellyfin_prefix` pairs, longest prefix wins, matched only on
+  a path component boundary). After the arr rescan, each finished job POSTs
+  `/Library/Media/Updated` for the visible path, on a thread, with the
+  webhook's egress guard and ten-second timeout, and notes the outcome on the
+  job. A library on a mount Jellyfin cannot watch (NFS, SMB) otherwise learns
+  about a conversion only at its next scheduled scan. Off until a URL is set.
+- **An encoder that is not there is retried, not walked down the ladder.**
+  `cuInit` refusals, `CUDA_ERROR_*`, a driver library that will not load: the
+  same command is started again `ENCODER_RETRY_ATTEMPTS` times (default 3),
+  `ENCODER_RETRY_SECONDS` apart (default 20), with one diagnostics line from
+  `nvidia-smi` and `/dev/nvidia*` before the first retry. When they run out the
+  job fails as `encoder unavailable: ...` and the watcher tries the file again
+  after `ENCODER_RETRY_COOLDOWN_MINUTES` (default 15) instead of the six-hour
+  wait for a file that cannot convert. Every rung of the fallback ladder keeps
+  the video encoder, so the ladder never helped here: on a real box eighteen
+  jobs failed inside three seconds each, minutes apart from encodes that went
+  through.
+
+### Fixed
+
+- **A probe that never answered is no longer a verdict on the file.** An
+  `ffprobe` that timed out or could not run was reported as "found no video
+  stream", which the replacement rule believes, so a slow or flapping share
+  could get a good release blocklisted. Both probes now fail the job as
+  `source probe failed (timeout or I/O error)` / `output probe failed (timeout
+  or I/O error)`, neither of which asks an arr for anything.
 
 ## [1.3.1] - 2026-08-21
 
