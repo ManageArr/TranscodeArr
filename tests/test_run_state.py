@@ -297,6 +297,27 @@ class WatcherKeepsQueueing(RunStateCase):
         self.assertIsNotNone(self.queued_for(visible),
                              "a visible file must be eligible by default")
 
+    def test_a_subtitle_sidecar_is_never_mistaken_for_something_to_convert(self):
+        """The worker must not eat what it just wrote.
+
+        Extraction leaves .srt and .ass files in a watched folder, hidden until
+        the reveal - and a hidden file is exactly what the watcher is looking
+        for. They stay out of the queue because they are not video extensions,
+        which is a rule that lives in a setting somebody can edit, so it is
+        asserted here rather than assumed.
+        """
+        store.save_settings(main.db(), {"hidden_only": True})
+        hidden = [self.settled_file(n) for n in (".Dark.eng.srt", ".Dark.jpn.ass", ".Dark.eng.forced.srt")]
+        visible = [self.settled_file(n) for n in ("Dark.eng.srt", "Dark.jpn.ass")]
+        film = self.settled_file(".Dark.mkv")
+        main.scan_once()
+        for path in hidden + visible:
+            self.assertIsNone(self.queued_for(path), f"the watcher queued {os.path.basename(path)}")
+        self.assertIsNotNone(self.queued_for(film), "the film beside them stopped being eligible")
+        # And the API refuses one by hand, so nobody can queue it past the walk.
+        for path in hidden + visible:
+            self.assertFalse(core.validate_path(path, [self.media])[0])
+
     def test_hidden_only_says_why_it_skipped_instead_of_scanning_in_silence(self):
         """The other mode, and the silence it must not fall back into.
 
@@ -358,7 +379,7 @@ class Throttle(RunStateCase):
                                         "max_height": 0, "audio_codec": "aac", "audio_bitrate": 192,
                                         "audio_channels": 2}), \
                 mock.patch.object(main.subprocess, "Popen", fake_popen):
-            ok, _warning, _error = main.run_encode(job_id, names.source, names, core.Probe(60.0, 1, 1, 0))
+            ok, _warning, _error = main.run_encode(job_id, names.source, names, core.Probe(60.0, 1, 1, 0), False)
         self.assertTrue(ok)
         self.assertEqual(seen[0][:7], ["ionice", "-t", "-c", "3", "nice", "-n", "10"])
         self.assertEqual(seen[0][7], "ffmpeg")

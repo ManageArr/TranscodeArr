@@ -9,7 +9,10 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: read
+  # write, not read: the last step turns the tag into a GitHub Release, so the
+  # changelog entry lands somewhere a person browsing the repo can actually see
+  # it. Twelve tags had shipped images with only one Release to show for them.
+  contents: write
   packages: write
 
 jobs:
@@ -103,3 +106,27 @@ jobs:
             REVISION=${{ github.sha }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      # The image is the artifact; this is the announcement. Body comes from the
+      # section CHANGELOG.md already carries for this version, so the release
+      # notes and the file in the repo cannot drift apart. A tag with no matching
+      # section still publishes, with a pointer instead of an empty release.
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          VERSION="${TAG#v}"
+          # Plain prefix matching, not a regex: the heading contains [ and ]
+          # and every attempt to escape those through YAML, then the shell,
+          # then awk produces a character class that quietly matches nothing.
+          awk -v hdr="## [$VERSION]" '
+            index($0, hdr) == 1 { inside = 1; next }
+            inside && index($0, "## [") == 1 { exit }
+            inside { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "No CHANGELOG.md section for $VERSION - see the file for details." > notes.md
+          fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "TranscodeArr $VERSION" --notes-file notes.md

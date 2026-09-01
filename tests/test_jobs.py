@@ -28,6 +28,7 @@ os.environ["TRASH_DIR"] = os.path.join(_TMP, "trash")
 
 import core  # noqa: E402
 import main  # noqa: E402
+import store  # noqa: E402
 
 WHOLE = core.Probe(duration=3600.0, video_streams=1, audio_streams=1, subtitle_streams=0)
 
@@ -77,7 +78,7 @@ class JobCase(unittest.TestCase):
 
     def encoder_that_writes(self, content, then=None):
         """A stand-in for run_encode that produces a plausible .part file."""
-        def fake(job_id, source, names, src_probe):
+        def fake(job_id, source, names, src_probe, extract_subtitles=False):
             with open(names.part, "w", encoding="utf-8") as f:
                 f.write(content)
             if then is not None:
@@ -237,6 +238,36 @@ class TheGuardIsReAskedNotRemembered(JobCase):
         self.assertEqual(self.read(visible), "an upgrade that landed mid-encode")
         self.assertEqual(self.read(source), "the source")
         self.assertFalse(os.path.exists(os.path.join(self.trash, "Movies", "Movie.mp4")))
+
+    def test_a_file_that_arrives_while_the_source_is_trashed_is_not_clobbered(self):
+        # The last guard, and the one the reveal never had. Between the check
+        # after the encode and the reveal itself sit an fsync of the whole
+        # output and a trash move that is a byte copy across filesystems -
+        # minutes, on the NFS mount this runs against - and displace() answers
+        # "" both for "nothing was there" and for "a stranger is there and I
+        # refuse to move it", so the reveal read its own refusal as consent.
+        source = self.write(".Movie.mkv", "the source")
+        visible = os.path.join(self.media, "Movies", "Movie.mp4")
+        real = main.release_page_cache
+
+        def import_during_the_flush(*paths):
+            if paths and paths[0].endswith(os.path.join("Movies", ".Movie.mp4")):
+                with open(visible, "w", encoding="utf-8") as f:
+                    f.write("an import that landed while the source was being trashed")
+            return real(*paths)
+
+        with mock.patch.object(main, "release_page_cache", import_during_the_flush):
+            row = self.run_job(self.claim(source), self.encoder_that_writes("the encode"))
+        self.assertEqual(row["state"], "failed")
+        self.assertIn("written by something else while this job ran", row["error"])
+        self.assertEqual(self.read(visible), "an import that landed while the source was being trashed")
+        self.assertFalse(os.path.exists(os.path.join(self.trash, "Movies", "Movie.mp4")))
+        # The source is already gone by then, so the error has to say where both
+        # copies are: the output stays staged rather than being thrown away.
+        self.assertEqual(self.read(os.path.join(self.media, "Movies", ".Movie.mp4")), "the encode")
+        self.assertEqual(self.read(os.path.join(self.trash, "Movies", ".Movie.mkv")), "the source")
+        self.assertIn(os.path.join("Movies", ".Movie.mp4"), row["error"])
+        self.assertIn(os.path.join("Movies", ".Movie.mkv"), row["error"])
 
 
 class PageCacheIsHandedBack(JobCase):
@@ -570,6 +601,33 @@ class BootCleanup(JobCase):
         self.assertEqual(self.read(source), "the original")
         self.assertEqual(self.row(job["id"])["state"], "failed")
 
+    def test_an_interrupted_extraction_loses_its_hidden_sidecars(self):
+        # Same rule as the .part beside them: the source is still there, so
+        # nothing in them is lost and the retry re-extracts them. Left behind
+        # they are invisible to the media server and ineligible for the watcher,
+        # so nothing cleans them up - one per attempt, forever.
+        source = self.write(".Movie.mkv", "the original")
+        part = self.write(".Movie.tapart.mp4", "half an encode")
+        stale = self.write(".Movie.eng.srt", "extracted before the process died")
+        self.claim(source)
+        main.init_db()
+        self.assertFalse(os.path.exists(stale), "a hidden sidecar survived the restart")
+        self.assertFalse(os.path.exists(part))
+        self.assertEqual(self.read(source), "the original")
+
+    def test_hidden_sidecars_survive_a_restart_once_the_source_is_trashed(self):
+        # Died between the trash and the reveal: the source is gone, so these
+        # are the only copy of those tracks - the same reason hidden_final is
+        # left alone here, and the same guard decides both.
+        source = os.path.join(self.media, "Movies", ".Movie.mkv")
+        os.makedirs(os.path.dirname(source), exist_ok=True)
+        hidden_final = self.write(".Movie.mp4", "the finished encode")
+        kept = self.write(".Movie.eng.srt", "the only copy of the english track")
+        self.claim(source)
+        main.init_db()
+        self.assertTrue(os.path.exists(kept), "boot cleanup deleted the only copy of a subtitle")
+        self.assertTrue(os.path.exists(hidden_final))
+
     def test_an_interrupted_reveal_does_not_delete_the_file_it_was_revealing(self):
         # For a reveal, hidden_final IS the source and there is no trash copy,
         # because nothing was replaced. A boot sweep of stranded hidden_final
@@ -612,6 +670,464 @@ class TrashDestination(JobCase):
         self.assertEqual(self.read(b), "the 2019 remake")
 
 
+class SubtitlesBesideTheFile(JobCase):
+    """Extraction writes new files into somebody's library, so it obeys the same
+    dot convention the video does.
+
+    The failure it exists to prevent is not a lost subtitle - it is a media
+    server scanning a half-written .srt, or one named for a file that is about
+    to be replaced, and remembering it. Jellyfin caches an external subtitle it
+    has seen; correcting that afterwards means editing the library by hand.
+    """
+
+    SUBS = (core.SubtitleStream("subrip", "eng", False),
+            core.SubtitleStream("ass", "jpn", False))
+    CUE = "1\n00:00:01,000 --> 00:00:02,000\nhello\n"
+
+    def extractor(self, content=CUE, returncode=0):
+        """Stands in for the extraction pass, writing every output path it is
+        handed. build_extract_args puts each one straight after its -c:s value."""
+        calls = []
+
+        def run(args, **_kwargs):
+            calls.append(args)
+            for i in range(2, len(args)):
+                if args[i - 2] == "-c:s":
+                    with open(args[i], "w", encoding="utf-8") as f:
+                        f.write(content)
+            return mock.Mock(returncode=returncode, stderr="[srt] nothing to write\n")
+
+        run.calls = calls
+        return run
+
+    def convert(self, source, subtitles=SUBS, extract=True, extractor=None, encode=None):
+        probe = core.Probe(3600.0, 1, 1, len(subtitles), subtitles=tuple(subtitles))
+        # Kept on the case so a test can toggle the setting from inside the
+        # encode, which is the whole point of one of them.
+        self.settings = dict(main.cfg())
+        self.settings["extract_subtitles"] = extract
+        job = self.claim(source)
+        self.job_id = job["id"]
+        self.ffmpeg = extractor or self.extractor()
+        with mock.patch.object(main, "ffprobe", lambda path: probe), \
+                mock.patch.object(main, "cfg", lambda: self.settings), \
+                mock.patch.object(main, "run_encode",
+                                  encode or self.encoder_that_writes("the encode")), \
+                mock.patch.object(main.subprocess, "run", self.ffmpeg):
+            main.process(job)
+        return self.row(job["id"])
+
+    def beside(self, *names):
+        """What is actually on disk next to the film, hidden files included."""
+        folder = os.path.join(self.media, "Movies")
+        found = sorted(os.listdir(folder))
+        return [n for n in found if not names or n in names]
+
+    def test_the_subtitles_become_visible_in_the_same_breath_as_the_film(self):
+        source = self.write(".Dark - S01E01.mkv", "the source")
+        row = self.convert(source)
+        self.assertEqual(row["state"], "done", row["error"])
+        self.assertEqual(self.beside(),
+                         ["Dark - S01E01.eng.srt", "Dark - S01E01.jpn.ass", "Dark - S01E01.mp4"])
+        self.assertEqual(self.read(os.path.join(self.media, "Movies", "Dark - S01E01.eng.srt")), self.CUE)
+        self.assertIn("extracted 2 subtitle files", row["warning"])
+
+    def test_the_film_is_never_visible_before_its_subtitles(self):
+        # This used to assert the window rather than close it: the video was
+        # revealed first, so a scan landing in between cached the film with no
+        # subtitles and correcting that afterwards means editing the library by
+        # hand. The subtitles go first now - one beside a film that is not there
+        # yet is offered to nobody.
+        source = self.write(".Dark.mkv", "the source")
+        seen = []
+
+        def watch(sidecars, expected):
+            seen.append(sorted(os.listdir(os.path.join(self.media, "Movies"))))
+            return main_reveal(sidecars, expected)
+
+        main_reveal = main.reveal_sidecars
+        with mock.patch.object(main, "reveal_sidecars", watch):
+            row = self.convert(source)
+        self.assertEqual(row["state"], "done", row["error"])
+        # Every subtitle written, and the film itself still hidden.
+        self.assertEqual(seen[0], [".Dark.eng.srt", ".Dark.jpn.ass", ".Dark.mp4"])
+        self.assertEqual(self.beside(), ["Dark.eng.srt", "Dark.jpn.ass", "Dark.mp4"])
+
+    def test_ass_is_extracted_as_ass_so_the_styling_survives(self):
+        # The anime case, and the reason the default is not "everything to srt".
+        # Karaoke, sign typesetting and positioning live in the ASS itself; the
+        # mov_text an mp4 would force keeps none of it, and the styled original
+        # goes to the trash with the source.
+        source = self.write(".Anime - S01E01.mkv", "the source")
+        self.assertEqual(self.convert(source)["state"], "done")
+        [command] = self.ffmpeg.calls
+        self.assertEqual(command[command.index("0:s:1") + 1: command.index("0:s:1") + 3], ["-c:s", "copy"])
+        self.assertIn("Anime - S01E01.jpn.ass", self.beside())
+
+    def test_nothing_is_left_hidden_when_the_job_dies_after_extracting(self):
+        # A hidden .srt is invisible to the media server and ineligible for the
+        # watcher, so nothing breaks loudly - which is exactly why it would
+        # accumulate, one per attempt, for a file that fails every six hours.
+        source = self.write(".Dark.mkv", "the source")
+
+        def boom(path, job_id=None):
+            raise OSError("the share went away between the encode and the swap")
+
+        with mock.patch.object(main, "trash", boom):
+            row = self.convert(source)
+        self.assertEqual(row["state"], "failed")
+        self.assertIn("share went away", row["error"])
+        self.assertEqual([n for n in self.beside() if n.endswith((".srt", ".ass"))], [])
+
+    def test_a_failed_encode_never_gets_as_far_as_writing_a_subtitle(self):
+        source = self.write(".Dark.mkv", "the source")
+        row = self.convert(source, encode=lambda *a: (False, "", "ffmpeg exited 1: No space left on device"))
+        self.assertEqual(row["state"], "failed")
+        self.assertEqual(self.ffmpeg.calls, [])
+        self.assertEqual([n for n in self.beside() if n.endswith((".srt", ".ass"))], [])
+
+    def test_a_subtitle_that_will_not_come_out_fails_the_conversion(self):
+        # It used to be a warning on a job that reported done - but the mp4 was
+        # built with -sn BECAUSE these tracks were going to sidecars, so that
+        # shipped a file with no subtitles anywhere and trashed the only copy
+        # that had them. Failing leaves the source alone for the next attempt.
+        source = self.write(".Dark.mkv", "the source")
+        row = self.convert(source, extractor=self.extractor(returncode=1))
+        self.assertEqual(row["state"], "failed")
+        self.assertIn("subtitles could not be extracted", row["error"])
+        self.assertEqual(self.read(source), "the source")
+        self.assertEqual(self.beside(), [".Dark.mkv"])
+
+    def test_an_ffmpeg_that_says_zero_and_writes_nothing_fails_the_job_too(self):
+        # Never trust exit 0 is the rule this repo exists for. The tracks are
+        # not in the mp4 either - it was built with -sn - so a job that reported
+        # done here would have lost them with the trashed source.
+        def wrote_nothing(args, **_kwargs):
+            self.ffmpeg.calls.append(args)
+            return mock.Mock(returncode=0, stderr="")
+
+        wrote_nothing.calls = []
+        source = self.write(".Dark.mkv", "the source")
+        row = self.convert(source, extractor=wrote_nothing)
+        self.assertEqual(row["state"], "failed")
+        self.assertIn("nothing was written for", row["error"])
+        self.assertEqual(self.read(source), "the source")
+        self.assertEqual(self.beside(), [".Dark.mkv"])
+
+    def test_a_source_with_no_text_subtitles_at_all_still_succeeds(self):
+        # The other half of the rule above: nothing came out because there was
+        # nothing in there, which is not a failure of anything.
+        source = self.write(".Dark.mkv", "the source")
+        row = self.convert(source, subtitles=())
+        self.assertEqual(row["state"], "done", row["error"])
+        self.assertEqual(self.beside(), ["Dark.mp4"])
+        self.assertEqual(self.ffmpeg.calls, [])
+
+    def test_a_hidden_sidecar_name_already_taken_is_never_overwritten(self):
+        # `ffmpeg -y` overwrites whatever is at these names, and the video's own
+        # staging name is explicitly guarded against exactly that. A hidden .srt
+        # sitting here is another job's work in flight or somebody else's file.
+        # It is moved aside rather than overwritten - and rather than refused
+        # forever, which is what it used to be: nothing ever cleared the file,
+        # so one transient error poisoned that filename's conversions for good.
+        source = self.write(".Dark.mkv", "the source")
+        held = self.write(".Dark.eng.srt", "a leftover from an earlier attempt")
+        row = self.convert(source)
+        self.assertEqual(row["state"], "done", row["error"])
+        self.assertFalse(os.path.exists(held), "the leftover was left to poison the name again")
+        self.assertEqual(self.read(os.path.join(self.trash, "Movies", ".Dark.eng.srt")),
+                         "a leftover from an earlier attempt")
+        self.assertIn("leftover hidden subtitle", row["warning"])
+        # And the extraction ran, at a name that is now free.
+        self.assertEqual(self.read(os.path.join(self.media, "Movies", "Dark.eng.srt")), self.CUE)
+
+    def test_a_hidden_sidecar_of_a_job_still_in_flight_is_left_alone(self):
+        # The one thing the self-heal above must never clear. Two sources plan
+        # the same targets - ".Dark.mkv" and "Dark.avi" both become "Dark.mp4" -
+        # and up to WORKER_POOL jobs run at once, so a hidden .srt at one of
+        # these names can be another job's extraction in progress.
+        source = self.write(".Dark.mkv", "the source")
+        held = self.write(".Dark.eng.srt", "the other job's extraction, in progress")
+        self.claim(os.path.join(self.media, "Movies", "Dark.avi"))   # still 'running'
+        row = self.convert(source)
+        self.assertEqual(row["state"], "failed")
+        self.assertIn("taken by a job in flight", row["error"])
+        self.assertEqual(self.read(held), "the other job's extraction, in progress")
+        self.assertEqual(self.read(source), "the source")
+        self.assertEqual(self.ffmpeg.calls, [], "ffmpeg ran at a name it was not allowed to write")
+
+    def test_a_sidecar_that_cannot_be_read_back_is_not_reported_as_extracted(self):
+        # ESTALE or EIO on a NAS: ffmpeg wrote the file and we cannot read it.
+        # It landed in neither list, so the loud branch never fired, the job
+        # reported success and trashed the source - and the mp4 was built with
+        # -sn, so that track was neither embedded nor on disk. A directory is
+        # the portable way to make open() raise here.
+        source = self.write(".Dark.mkv", "the source")
+        hidden = os.path.join(self.media, "Movies", ".Dark.eng.srt")
+
+        def wrote_then_unreadable(args, **kwargs):
+            result = base(args, **kwargs)
+            os.unlink(hidden)
+            os.mkdir(hidden)
+            return result
+
+        base = self.extractor()
+        row = self.convert(source, extractor=wrote_then_unreadable)
+        self.assertEqual(row["state"], "failed")
+        self.assertIn(".Dark.eng.srt", row["error"])
+        self.assertEqual(self.read(source), "the source")
+        self.assertFalse(os.path.exists(os.path.join(self.media, "Movies", "Dark.mp4")),
+                         "a job shipped an mp4 built with -sn and no subtitle beside it")
+        # Every planned sidecar is cleaned up, readable or not.
+        self.assertFalse(os.path.exists(os.path.join(self.media, "Movies", ".Dark.jpn.ass")))
+
+    def test_a_subtitle_that_could_not_be_revealed_says_where_it_is(self):
+        # It is not unlinked: the source is in the trash by then, so this hidden
+        # file is the only copy of that track outside it. What it must not be is
+        # unreferenced - the note names it, and the staging guard clears it on
+        # the next conversion of that name, when the source is back on disk.
+        source = self.write(".Dark.mkv", "the source")
+        real = os.replace
+
+        def flaky(src, dst):
+            if str(dst).endswith("Dark.jpn.ass"):
+                raise OSError("read-only file system")
+            return real(src, dst)
+
+        with mock.patch.object(main.os, "replace", flaky):
+            row = self.convert(source)
+        self.assertEqual(row["state"], "done", row["error"])
+        self.assertIn(".Dark.jpn.ass", row["warning"], "the leftover is named nowhere")
+        self.assertTrue(os.path.exists(os.path.join(self.media, "Movies", ".Dark.jpn.ass")))
+
+    def test_the_setting_is_read_once_and_never_again_after_the_encode(self):
+        # Two reads separated by a whole encode: run_encode built the mp4 with
+        # -sn because extraction was on, and the second read - hours later -
+        # found it off and skipped the extraction. Every subtitle gone, and the
+        # job said done.
+        source = self.write(".Dark.mkv", "the source")
+
+        def encode_then_toggle(job_id, src, names, probe, extract_subtitles):
+            self.assertTrue(extract_subtitles, "run_encode was not told what the caller decided")
+            with open(names.part, "w", encoding="utf-8") as f:
+                f.write("an mp4 built with -sn")
+            self.settings["extract_subtitles"] = False   # turned off mid-encode
+            return True, "", ""
+
+        row = self.convert(source, encode=encode_then_toggle)
+        self.assertEqual(row["state"], "done", row["error"])
+        self.assertEqual(self.beside(), ["Dark.eng.srt", "Dark.jpn.ass", "Dark.mp4"])
+
+    def test_a_file_that_arrives_during_the_extraction_is_not_destroyed(self):
+        # The worst of them. Extraction is a full demux of the source and runs
+        # for up to SUBTITLE_TIMEOUT over a NAS, and it sat between the guard
+        # and the two os.replace calls - so an arr importing the upgrade inside
+        # that window had its file destroyed, with no trash copy, by a job that
+        # then reported done.
+        source = self.write(".Dark.mkv", "the source")
+
+        def extract_then_import(args, **kwargs):
+            result = base(args, **kwargs)
+            self.write("Dark.mp4", "the upgrade an arr just imported")
+            return result
+
+        base = self.extractor()
+        row = self.convert(source, extractor=extract_then_import)
+        self.assertEqual(row["state"], "failed")
+        self.assertIn("written by something else", row["error"])
+        self.assertEqual(self.read(os.path.join(self.media, "Movies", "Dark.mp4")),
+                         "the upgrade an arr just imported")
+        self.assertEqual(self.read(source), "the source")
+        # Nothing half-done left behind: no .part, and no hidden sidecars.
+        self.assertEqual(self.beside(), [".Dark.mkv", "Dark.mp4"])
+
+    def test_a_staging_name_taken_during_the_extraction_is_not_overwritten(self):
+        # The same window, the other name: a hidden import waiting for its own
+        # reveal job is not a stale output, and displacing it eats somebody
+        # else's pending work.
+        source = self.write(".Dark.mkv", "the source")
+
+        def extract_then_import(args, **kwargs):
+            result = base(args, **kwargs)
+            self.write(".Dark.mp4", "a hidden import waiting for its reveal")
+            return result
+
+        base = self.extractor()
+        row = self.convert(source, extractor=extract_then_import)
+        self.assertEqual(row["state"], "failed")
+        self.assertIn("staging name is taken", row["error"])
+        self.assertEqual(self.read(os.path.join(self.media, "Movies", ".Dark.mp4")),
+                         "a hidden import waiting for its reveal")
+        self.assertEqual(self.beside(), [".Dark.mkv", ".Dark.mp4"])
+
+    def test_cancel_is_honoured_after_the_extraction(self):
+        # Cancel was a no-op for the whole extraction window, and the job then
+        # trashed the source and replaced the file anyway.
+        source = self.write(".Dark.mkv", "the source")
+
+        def extract_then_cancel(args, **kwargs):
+            result = base(args, **kwargs)
+            with main._jobs_lock:
+                main._running[self.job_id] = {"cancel": True, "proc": None}
+            return result
+
+        base = self.extractor()
+        self.addCleanup(main._running.clear)
+        row = self.convert(source, extractor=extract_then_cancel)
+        self.assertEqual(row["state"], "cancelled")
+        self.assertEqual(self.read(source), "the source")
+        self.assertEqual(self.beside(), [".Dark.mkv"])
+
+    def test_the_subtitles_are_revealed_once_the_source_is_in_the_trash(self):
+        # After the trash, these hidden files are the only copy of those tracks
+        # anywhere. The crash handler used to unlink them on exactly this path,
+        # then merely kept them - hidden, and referenced by nothing. The watcher
+        # re-queues the staged .Dark.mp4 as a reveal job and unhides the film
+        # WITHOUT them, so keeping them stranded them invisible for good.
+        source = self.write(".Dark.mkv", "the source")
+
+        def boom(visible, expected):
+            raise OSError("the share went away between the trash and the reveal")
+
+        with mock.patch.object(main, "displace", boom):
+            row = self.convert(source)
+        self.assertEqual(row["state"], "failed")
+        self.assertEqual([n for n in self.beside() if n.endswith((".srt", ".ass"))],
+                         ["Dark.eng.srt", "Dark.jpn.ass"])
+        self.assertEqual(self.read(os.path.join(self.media, "Movies", "Dark.eng.srt")), self.CUE)
+        # The film is still hidden, waiting for its own reveal job - a subtitle
+        # beside a film that is not there yet is offered to nobody.
+        self.assertIn(".Dark.mp4", self.beside())
+
+    def test_a_subtitle_that_arrived_while_the_job_ran_is_left_alone(self):
+        # Bazarr downloading one mid-encode is the ordinary case. It used to be
+        # trashed with no identity check and named nowhere, so it was gone for
+        # good after trash_keep_days and nobody knew to restore it.
+        source = self.write(".Dark.mkv", "the source")
+
+        def extract_then_bazarr(args, **kwargs):
+            result = base(args, **kwargs)
+            self.write("Dark.eng.srt", "the one Bazarr just downloaded")
+            return result
+
+        base = self.extractor()
+        row = self.convert(source, extractor=extract_then_bazarr)
+        self.assertEqual(row["state"], "done", row["error"])
+        self.assertEqual(self.read(os.path.join(self.media, "Movies", "Dark.eng.srt")),
+                         "the one Bazarr just downloaded")
+        self.assertFalse(os.path.exists(os.path.join(self.trash, "Movies", "Dark.eng.srt")))
+        self.assertIn("Dark.eng.srt was written by something else", row["warning"])
+
+    def test_the_count_is_what_landed_not_what_was_written(self):
+        # The count was computed before any reveal happened, so the job claimed
+        # files nobody has. A reveal that fails is reported now, not swallowed.
+        source = self.write(".Dark.mkv", "the source")
+        real = os.replace
+
+        def flaky(src, dst):
+            if str(dst).endswith(".jpn.ass"):
+                raise OSError("read-only file system")
+            return real(src, dst)
+
+        with mock.patch.object(main.os, "replace", flaky):
+            row = self.convert(source)
+        self.assertEqual(row["state"], "done", row["error"])
+        self.assertIn("extracted 1 subtitle file", row["warning"])
+        self.assertIn("could not be revealed", row["warning"])
+        self.assertIn("Dark.eng.srt", self.beside())
+
+    def test_the_replaced_files_subtitles_go_to_the_trash_with_it(self):
+        # A subtitle left behind is not an orphan - it reattaches to whatever
+        # takes that name next. The previous conversion's German track beside a
+        # new file with no German in it is worse than a missing subtitle,
+        # because nothing about it looks wrong.
+        self.write("Dark.mp4", "the previous conversion")
+        stale = self.write("Dark.ger.srt", "the previous conversion's german track")
+        # A different film whose name merely starts the same way. The sweep is
+        # a prefix rule, so this is the direction that would quietly move
+        # somebody else's subtitle.
+        neighbour = self.write("Dark Knight.eng.srt", "another film's subtitle")
+        source = self.write(".Dark.mkv", "the re-imported source")
+        row = self.convert(source, subtitles=(core.SubtitleStream("subrip", "eng", False),))
+        self.assertEqual(row["state"], "done", row["error"])
+        self.assertFalse(os.path.exists(stale), "a stale subtitle reattached to the new film")
+        self.assertEqual(self.read(os.path.join(self.trash, "Movies", "Dark.ger.srt")),
+                         "the previous conversion's german track")
+        self.assertIn("Dark.ger.srt went with it", row["warning"])
+        self.assertEqual(self.read(neighbour), "another film's subtitle")
+        self.assertEqual(self.beside(), ["Dark Knight.eng.srt", "Dark.eng.srt", "Dark.mp4"])
+
+    ASS_HEADER = "[Script Info]\nScriptType: v4.00+\n\n[Events]\nFormat: Layer, Start, End, Text\n"
+
+    def test_a_track_with_no_events_is_dropped_even_though_its_file_is_not_empty(self):
+        # "size > 0" never fired for an .ass: the muxer always writes the
+        # [Script Info] and [Events] header, so an empty track shipped as a
+        # subtitle the media server offers and that plays nothing.
+        source = self.write(".Dark.mkv", "the source")
+        row = self.convert(source, extractor=self.extractor(content=self.ASS_HEADER))
+        self.assertEqual(row["state"], "done", row["error"])
+        self.assertEqual(self.beside(), ["Dark.mp4"])
+        self.assertIn("extracted 0 subtitle files", row["warning"])
+
+    def test_an_empty_track_is_dropped_rather_than_offered(self):
+        # ffmpeg writes a header for a stream with no cues in it. Revealed, that
+        # is a subtitle Jellyfin offers and that plays nothing, which reads as a
+        # broken file rather than as an absent track.
+        source = self.write(".Dark.mkv", "the source")
+        row = self.convert(source, extractor=self.extractor(content=""))
+        self.assertEqual(row["state"], "done", row["error"])
+        self.assertEqual(self.beside(), ["Dark.mp4"])
+        self.assertIn("extracted 0 subtitle files", row["warning"])
+
+    def test_image_subtitles_are_named_on_the_job_rather_than_dropped_in_silence(self):
+        # A Blu-ray remux whose only subtitles are PGS finishes with no sidecars
+        # at all. That is the format's answer - a bitmap is not a text file and
+        # OCR is not something this worker runs unattended over a library - so
+        # the job says which codecs stayed behind instead of leaving somebody to
+        # work out why the subtitles they could see in the source are gone.
+        source = self.write(".Film.mkv", "the source")
+        row = self.convert(source, subtitles=(core.SubtitleStream("hdmv_pgs_subtitle", "eng", False),))
+        self.assertEqual(row["state"], "done", row["error"])
+        self.assertIn("image subtitles cannot become text files", row["warning"])
+        self.assertIn("hdmv_pgs_subtitle", row["warning"])
+        self.assertEqual(self.ffmpeg.calls, [], "ffmpeg was run for a track it cannot extract")
+        # The source keeps them, and the source is in the trash for the window.
+        self.assertTrue(os.path.exists(os.path.join(self.trash, "Movies", ".Film.mkv")))
+
+    def test_it_is_off_by_default_and_changes_nothing(self):
+        # The default has to stay off: this alters what an existing library
+        # looks like on disk, and nobody upgrading asked for that.
+        self.assertFalse(store.SPEC_BY_KEY["extract_subtitles"].default)
+        self.assertFalse(main.cfg()["extract_subtitles"])
+        source = self.write(".Dark.mkv", "the source")
+        row = self.convert(source, extract=False)
+        self.assertEqual(row["state"], "done", row["error"])
+        self.assertEqual(self.beside(), ["Dark.mp4"])
+        self.assertEqual(self.ffmpeg.calls, [])
+
+    def test_a_subtitle_already_at_that_name_is_displaced_not_destroyed(self):
+        # Very likely the previous conversion's own sidecar - but it could just
+        # as easily be one Bazarr downloaded or somebody typed, and this worker
+        # does not unlink a file it did not write. Same trash, same retention.
+        self.write("Dark.eng.srt", "the one Bazarr downloaded")
+        source = self.write(".Dark.mkv", "the source")
+        row = self.convert(source)
+        self.assertEqual(row["state"], "done", row["error"])
+        self.assertEqual(self.read(os.path.join(self.media, "Movies", "Dark.eng.srt")), self.CUE)
+        self.assertEqual(self.read(os.path.join(self.trash, "Movies", "Dark.eng.srt")),
+                         "the one Bazarr downloaded")
+
+    def test_a_reveal_only_job_is_left_alone(self):
+        # A hidden .mp4 is somebody's import waiting to be unhidden. Nothing is
+        # re-encoded, nothing is trashed, and there is no conversion to attach a
+        # subtitle to.
+        source = self.write(".Dark.mp4", "already the right container")
+        row = self.convert(source)
+        self.assertEqual(row["state"], "done", row["error"])
+        self.assertEqual(self.beside(), ["Dark.mp4"])
+        self.assertEqual(self.ffmpeg.calls, [])
+
+
 class FakeFfmpeg:
     """Enough of Popen for run_encode: records argv, returns a chosen exit code.
 
@@ -650,7 +1166,7 @@ class FallbackLadder(JobCase):
     failed job - but a retry loop that cannot tell the difference between
     'this stream does not fit' and 'someone pressed cancel' is worse."""
 
-    def attempt(self, plan, subtitle_streams=1, cancelled=False):
+    def attempt(self, plan, subtitle_streams=1, cancelled=False, extract=False):
         job_id = str(uuid.uuid4())
         names = core.plan_names(os.path.join(self.media, "Movies", ".Movie.mkv"))
         fake = FakeFfmpeg(plan)
@@ -659,7 +1175,7 @@ class FallbackLadder(JobCase):
         self.addCleanup(main._running.clear)
         probe = core.Probe(3600.0, 1, 1, subtitle_streams)
         with mock.patch.object(main.subprocess, "Popen", fake):
-            return fake, main.run_encode(job_id, names.source, names, probe)
+            return fake, main.run_encode(job_id, names.source, names, probe, extract)
 
     def test_a_subtitle_failure_retries_without_subtitles(self):
         fake, (ok, warning, error) = self.attempt([(1, "Error: mov_text encoder not found"), (0, "")])
@@ -670,6 +1186,20 @@ class FallbackLadder(JobCase):
         self.assertNotIn("mov_text", fake.calls[1])
         # A dropped subtitle track is recorded, never silently lost.
         self.assertIn("subtitle", warning)
+
+    def test_extraction_takes_the_subtitles_out_of_the_mp4_and_off_the_ladder(self):
+        # Carrying the same tracks inside the file as well would offer every
+        # language twice in Jellyfin, with the mov_text copy - stripped of the
+        # styling the sidecar exists to keep - as one of the two. And the rung
+        # below the first would then only ever repeat it.
+        # Passed in rather than read here: process() decides it once, before
+        # the encode, and uses that same answer again afterwards.
+        fake, (ok, warning, error) = self.attempt([(0, "")], subtitle_streams=5, extract=True)
+        self.assertTrue(ok, error)
+        self.assertEqual(len(fake.calls), 1)
+        self.assertIn("-sn", fake.calls[0])
+        self.assertNotIn("mov_text", fake.calls[0])
+        self.assertEqual(warning, "")   # nothing was dropped - they went to sidecars
 
     def test_an_unrelated_failure_is_reported_rather_than_retried(self):
         # Retrying a full disk or an unreadable share just burns the queue.

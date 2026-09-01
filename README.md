@@ -31,7 +31,9 @@ rule below exists to make that class of loss impossible:
   upgraded it mid-run), the encode is discarded, never the newer source.
 - **Text subtitles are carried** into MP4 as `mov_text`; when a source's
   subtitles cannot be (PGS and friends), the job retries without them and says
-  so in a warning rather than silently dropping them.
+  so in a warning rather than silently dropping them. Or turn on
+  [Subtitles](#subtitles) and they are written beside the file instead - which
+  is what keeps an anime library's ASS styling, since `mov_text` cannot.
 
 Said as plainly as it deserves: **this tool re-encodes your files and replaces
 them.** A conversion is lossy, the new MP4 takes the source's place, and the
@@ -702,10 +704,32 @@ a replacement** card listing each one with what was blocklisted, when it was
 asked, and what the arr's own download queue says about it: searching,
 downloading with a percentage, or the arr's error.
 
+Each row carries the file name, the folder it was in, which connection was
+asked, the whole release that was blocklisted and the arr's own sentence about
+it - which names the series or the film. That is enough to find the item in
+Sonarr or Radarr without going back through the logs.
+
 A row clears when a later job for that path finally converts, which is the only
 signal that actually means the replacement arrived and worked - the arr's queue
 going quiet looks identical whether the download finished, never started, or
 was rejected on import. Anything nobody delivers is dropped after 14 days.
+
+Two more rows clear themselves, because that signal can never arrive for them:
+
+- **The arr connection was deleted.** Nothing can report on that download any
+  more and nothing can deliver it, so the row is a permanent "searching".
+- **The file is gone from where it was AND a file of that exact name has since
+  converted successfully somewhere else.** The media moved libraries and
+  landed. Both halves are required: a missing path on its own is an unmounted
+  share, and a same-named conversion on its own is a second copy of the episode
+  in another library while this one is still genuinely waiting.
+
+Anything else, press **Dismiss** on the row. It stops this worker watching for
+that file and changes nothing on the arr - the release stays blocklisted, and a
+download the arr has already started keeps going. That is the way out of a row
+whose media moved somewhere this worker was never told about: a media root that
+was deleted, a library it does not watch. Such a row used to read "searching"
+forever with nothing on the page to press.
 
 The arr is polled at most every 20 seconds however many browser tabs are open,
 because the answer changes at download speed and a cache miss costs somebody
@@ -752,13 +776,24 @@ between attempts, so the same file failed every `retry_failed_after_hours`
 forever. A real library had 26 of them.
 
 What is still refused, and always will be, is a **different** file appearing at
-that name after the job started. The check runs twice - once before the encode
-and once immediately before the replace - and the second one compares inode,
-size and mtime against the first. An arr finishing an import during a two-hour
-encode lands on exactly this name, and that file is newer than the source this
-job converted; the encode is the disposable side of that trade. It fails with
-`was written by something else while this job ran`, which is deliberately not
-the same sentence as the old one.
+that name after the job started. The check compares inode, size and mtime
+against what was there at pre-flight, and it is re-asked at every step that can
+still act on the answer: before the encode, after it, on the far side of the
+subtitle extraction, and once more immediately before the reveal. An arr
+finishing an import during a two-hour encode lands on exactly this name, and
+that file is newer than the source this job converted; the encode is the
+disposable side of that trade. It fails with `was written by something else
+while this job ran`, which is deliberately not the same sentence as the old one.
+
+**The last of those checks runs past the point of no return**, and it is the one
+that matters most. By then the verified output has been flushed to disk and the
+source has been moved to the trash, and both of those take real time on a NAS -
+an fsync of a 20GB file, then a move that is a full byte copy whenever the trash
+is on another filesystem. A file arriving at the visible name inside that window
+used to be replaced anyway. Now the job fails there, touches nothing, and leaves
+the converted file at its hidden staging name: the error names both that path
+and the trashed source, because the source is already gone by then and a person
+finishing this by hand needs to know where both copies are.
 
 The hidden staging name (`.Show - S01E01.mp4`) is never displaced under any
 circumstances. A file there is a hidden import waiting for its own reveal job,
@@ -1321,6 +1356,7 @@ newlines. Booleans accept `1`, `true`, `yes`, `on` (any case).
 | Only convert dot-hidden files | `HIDDEN_ONLY` | `false` | Off, the default, makes every matching file in the watched folders eligible - so point them at one small folder first, and read [What it may convert](#what-it-may-convert). On, only files whose name starts with a dot are eligible, which keeps your media server from ever seeing a file that is about to be replaced; nothing writes that dot for you, so read [Only convert dot-hidden files](#only-convert-dot-hidden-files) first. Turning it **off** in the UI asks you to confirm and names the trash retention window, because off is the widening direction. |
 | Convert these extensions | `CONVERT_EXTENSIONS` | `.mkv .avi .m4v .m2ts .mts .vob` | Dot-hidden `.mp4` files are revealed without re-encoding regardless of this list. |
 | Never convert files matching | `SKIP_PATTERNS` | (empty) | Case-insensitive substrings matched against the file name. See [Skip rules](#skip-rules). |
+| Extract subtitles to files | `EXTRACT_SUBTITLES` | `false` | On, every text subtitle in the source is written beside the finished video as its own file and none are embedded in the mp4. **Recommended for anime**, and worth reading before you turn it on: see [Subtitles](#subtitles). Off by default because it changes what an existing library looks like on disk. |
 | Duration tolerance | `VERIFY_DURATION_TOLERANCE` | `0.015` | How far the output length may drift from the source before the result is rejected, as a fraction: `0.015` is 1.5%. Capped at 0.5, because a tolerance loose enough to accept half a film is not a tolerance. |
 | Decode on the GPU too | `HARDWARE_DECODE` | `true` | The encoder was always on the GPU; the decoder was not, and decoding 1080p in software is what actually pins a NAS CPU. Measured on a real episode: 21.3s of CPU became 3.9s and the job ran 45% faster, for a byte-identical file. NVIDIA encoders only; ffmpeg falls back to CPU decoding by itself for anything the card cannot decode. |
 | Convert at once | `MAX_CONCURRENT` | `1` | 1 to 8. One at a time suits a NAS: a single set of spindles behind a single network link turns two encodes into two slow ones. Takes effect on the next job, no restart needed. |
@@ -1439,6 +1475,139 @@ Plain case-insensitive substring matching, not a regex - the thing people
 actually want to write is "Remux", and a regex dialect is a way to get that
 wrong. The rules are re-checked when a job runs, not only when it is queued, so
 a rule added while hundreds of files are already in the queue protects them too.
+
+## Subtitles
+
+Off by default. Turn **Extract subtitles to files** on in the Rules tab and each
+conversion writes the source's text subtitles beside the finished video instead
+of inside it:
+
+```
+Dark - S01E01.mp4
+Dark - S01E01.eng.srt
+Dark - S01E01.dut.srt
+Dark - S01E01.jpn.forced.ass
+```
+
+Jellyfin, Plex and Emby all read that naming, so the tracks are offered exactly
+as embedded ones would be.
+
+### Why, and why it matters most for anime
+
+MP4 can only carry text subtitles as `mov_text`. Converting an ASS or SSA track
+into `mov_text` keeps the words and throws away everything else it was: the
+styles, the fonts, the positioning, the colors - which for anime is the sign
+typesetting and the karaoke, and is most of the work the subtitle group did.
+That loss is permanent, because the styled original was in the source this
+worker has just moved to the trash.
+
+Extracting to `.ass` copies the stream out untouched. The words and the
+typesetting both survive, and the mp4 stays a plain video file.
+
+It fixes the other half too. MP4 cannot hold the image subtitles a Blu-ray remux
+carries at all, so those conversions used to walk down the fallback ladder and
+finish with `text subtitles could not be carried into mp4 - dropped` - every
+track gone. A verified case on the live box: one source MKV carried five
+`subrip` tracks (eng, dut, fre, ger, spa) into a conversion that could only
+degrade them.
+
+### What comes out
+
+| Source codec | Sidecar | How |
+| --- | --- | --- |
+| `subrip`, `srt` | `.srt` | `-c:s copy` |
+| `ass`, `ssa` | `.ass` | copied (`ssa` is transcoded, because the `.ass` muxer takes ASS) |
+| `mov_text`, `webvtt` | `.srt` | converted; neither carries styling worth keeping |
+| `hdmv_pgs_subtitle` (PGS), `dvd_subtitle` (VOBSUB) | **nothing** | see below |
+
+**Image subtitles are not extracted.** PGS and VOBSUB are pictures, not text.
+Nothing turns a bitmap into a `.srt` except OCR, and this worker is not going to
+run OCR unattended over somebody's library and write the guesses to disk as
+subtitles. Extracting them as `.sup` with `-c:s copy` is possible and was
+deliberately not done: almost nothing plays a `.sup` sidecar, so it would put
+files in the library that look like subtitles and are not. The job instead
+finishes with a warning naming the codecs that stayed behind, and they are still
+in the source, which is in the trash for the retention window.
+
+The name is `<stem>.<language>[.forced][.n]<ext>`. The language is whatever the
+stream is tagged with, reduced to letters and digits, and `und` when it is
+untagged. `forced` marks a signs-and-songs track so it is not offered as a full
+translation. A second track of the same language gets `.2`, a third `.3`.
+
+### The rules it obeys
+
+- **The subtitles are embedded or extracted, never both.** With this on, the
+  encode runs with `-sn`. Doing both would offer every language twice in
+  Jellyfin, with the degraded `mov_text` copy as one of the two.
+- **A sidecar is hidden until the film is, and unhidden just before it.** It is
+  written with a leading dot, matching the hidden stem, and revealed one moment
+  ahead of the video. A media server can never scan a half-written subtitle, one
+  named for a file that is about to be replaced, or the finished film without
+  its subtitles - the last of those is why the subtitles go first, since a scan
+  that catches a film alone caches it that way. See
+  [Only convert dot-hidden files](#only-convert-dot-hidden-files) for why the
+  dot is the whole mechanism.
+- **A failed or cancelled job leaves nothing behind, until the source is
+  trashed.** Every hidden sidecar is unlinked on the way out. Past the trash
+  that reverses: those files are then the only copy of those tracks, so a job
+  that dies there reveals them instead of unlinking them. Keeping them hidden
+  was not enough - the watcher picks the staged `.mp4` up as a reveal job and
+  unhides the film without them, and a hidden `.srt` is invisible to the media
+  server, so the subtitles would be stranded for good. One that cannot be
+  revealed at all is kept and named on the job rather than deleted.
+- **An extraction that fails, fails the job.** The mp4 was built with `-sn`
+  because these tracks were going to sidecars, so a swallowed failure would ship
+  a file with no subtitles anywhere and then trash the only copy that had them.
+  The source is left untouched and the job is retried later. A source with no
+  text subtitles in it is not a failure - there was nothing to write. A sidecar
+  that ffmpeg wrote but that cannot be read back afterwards (`ESTALE`, `EIO` -
+  a NAS) counts as a failure too, not as a success: the track is in neither the
+  mp4 nor a file anybody can open.
+- **A hidden sidecar name that is already taken is cleared, not refused
+  forever.** A leftover at a name this job is about to write goes to the trash
+  first, with the retention a displaced file gets - never an overwrite, and
+  never an unlink. Refusing was a permanent poison: nothing else ever cleared
+  those files, so one transient error failed every later conversion of that
+  filename identically, forever. What is still refused is a sidecar belonging to
+  a job still in flight, because two sources can plan the same targets and
+  several jobs run at once.
+- **Nothing this worker did not write is destroyed.** A subtitle already at a
+  name being revealed onto is displaced into the trash, not overwritten, exactly
+  as a replaced video is - and only when it is the same file that was there when
+  the job started. One that arrived while the job ran, a Bazarr download most
+  often, is left exactly where it is. Either way the job says so.
+- **The replaced file's own subtitles go to the trash with it.** A subtitle left
+  behind is not an orphan: it reattaches to whatever takes that name next.
+- **The sidecars are not convertible files.** `.srt` and `.ass` are not video
+  extensions, so the watcher walks past them and the API refuses them.
+
+### Bazarr
+
+**Not integrated, deliberately.** Bazarr has no filesystem watcher, so it learns
+about a new sidecar only at its next scheduled index - until then it can search
+for a subtitle you already have. The rescan endpoint is real and works:
+
+```
+PATCH {bazarr_url}/api/series?seriesid=<sonarrSeriesId>&action=scan-disk
+PATCH {bazarr_url}/api/movies?radarrid=<radarrId>&action=scan-disk
+X-API-KEY: <key>
+```
+
+Three things made it the wrong thing to wire in here:
+
+1. It is addressed by Bazarr's internal Sonarr/Radarr id. This worker knows a
+   path, so every finished job would need a full `GET /api/series` listing, a
+   longest-prefix match, and a second path map - Bazarr applies its own path
+   mappings to what it returns.
+2. `scan-disk` is whole-series and synchronous. One PATCH per finished episode
+   re-probes every episode of that series, which is the exact opposite of what
+   a library sweep should be doing to a NAS.
+3. Every other outbound call here holds to a ten second timeout. That endpoint
+   will not answer inside one, so each job would record a failure for a scan
+   that actually ran.
+
+Until then: Bazarr's **Index All Existing Episodes Subtitles** task, or its
+scheduled index, picks the sidecars up. Say so in an issue if you want it built.
 
 ## Trash
 
@@ -1764,6 +1933,7 @@ The one difference is the envelope on a **single** job.
 | `GET /api/jobs/{id}` | One job, plus `log_tail`. `200 {"job": {...}}` or `404 {"error": "no such job"}`. |
 | `DELETE /api/jobs/{id}` | Cancel. `200 {"cancelled": id}` if it was still queued; `202 {"canceling": id}` if it was running (the encode is terminated and the source is untouched); `404` if there is no such job; `409 {"error": "job is done"}` if it already finished. |
 | `GET /api/queue?limit=` | The live picture, in the order it will actually happen. `limit` defaults to 100, clamped 1-500, and caps the `queued` list only. |
+| `DELETE /api/replacements?path=` | Stop waiting on a replacement. The path is the row's own id (it is the primary key) and is url-encoded into the query string. `200 {"dismissed": path}` or `404 {"error": "nothing is waiting on a replacement for that path"}`. It deletes this worker's row and nothing else: the release stays blocklisted, and a download the arr already started keeps going. The card also clears rows itself - see [Watching the replacement arrive](#watching-the-replacement-arrive). |
 | `POST /api/scan` | Walk the watched folders **now** rather than at the next interval, and report what was there. `200 {"scanned": true, "queued": n, "eligible": n, "settling": n, "cooling": n, "already_queued": n, "skipped_visible": n, "missing_roots": [...], "at": <epoch>}`. `scanned: false` with a `detail` when a scan was already running - it is refused rather than queued behind one, because a library walk is minutes and the caller is holding an HTTP response open. `eligible` counts the files in the watched folders that this configuration would convert; `settling` are the ones whose size has not held still for `stable_seconds` yet; `skipped_visible` are the ones passed over for not being dot-hidden. **This route ignores the retry cooldown** for the same reason `POST /api/jobs` does - somebody pressing it is asking about those files now - so `cooling` is normally 0 here and non-zero only in the watcher's own scans. An empty queue and an empty library look identical from `GET /api/queue`, which is the whole reason this answers with counts instead of just doing the work. |
 | `GET /api/trash?limit=&offset=` | What is in the trash. `200 {"entries": [...], "total": n, "shown": n, "offset": n, "limit": n, "bytes": n, "keep_days": n}`, newest first. `limit` defaults to 100 and is clamped to 1-500 - the ceiling is the batch cap below, so a page can always be acted on in one request. `offset` past the end is clamped to the **start of the last page**, not to the end of the list: a bulk delete shortens this list under whoever ran it, and the alternative is a blank table with a working Previous button and no clue why. `total` and `bytes` describe the whole trash, not the page. Paged by offset rather than by a cursor, unlike the job history - the list is rebuilt and re-sorted per request anyway, and every operation is addressed by path, so a row shifting between two page loads cannot make a delete land on the wrong file. Each entry: `path` (where it is now), `original` (where Restore returns it), `origin_known` (false when it was derived rather than recorded - see below), `bytes`, `at`, `job_id`, `occupied` (something already holds `original`), `reconverts` (restoring it would put it straight back in the queue). `occupied` and `reconverts` are computed per request, never stored: the library moves under this view and a stale "free" is what would make Restore quietly replace something. |
 | `POST /api/trash/restore` `{"paths": [...], "replace": false}` | Put files back. `200 {"results": [...], "ok": n, "failed": n}` with one result per path, because a bulk call partly succeeding is the normal case and reporting it as one verdict is how somebody concludes a file moved when it did not. Without `replace`, a path whose destination is occupied fails with `occupied: true` and nothing is touched. With it, **the file in the way is moved to the trash, not deleted** - it is itself a restore candidate ten minutes later. At most 500 paths, refused rather than truncated. |

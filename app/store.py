@@ -105,6 +105,17 @@ SPECS: list[Spec] = [
     Spec("max_height", "MAX_HEIGHT", "int", 0, "Resolution",
          "Caps the picture height. Never upscales - asking for 1080p leaves a 720p file at 720p, because "
          "scaling up costs space and invents nothing. 0 keeps the source resolution.", "Rules", hidden=True),
+    Spec("extract_subtitles", "EXTRACT_SUBTITLES", "bool", False, "Extract subtitles to files",
+         "Off by default, because it changes what a converted file looks like on disk. On, every text "
+         "subtitle in the source is written beside the finished video as its own file - Show.eng.srt, "
+         "Show.jpn.ass - and none are embedded in the mp4. Recommended for anime: ASS subtitles hold the "
+         "styling, fonts and positioning that signs and karaoke are made of, mp4 can only carry them as "
+         "mov_text, and that conversion throws all of it away for good. It also fixes the other half: mp4 "
+         "cannot hold the image subtitles a Blu-ray remux has at all, so those conversions used to drop "
+         "every subtitle track and say so. Image subtitles (PGS, VOBSUB) still cannot become text files "
+         "and are left in the source, which the job says. An extraction that fails does fail the job: the "
+         "mp4 is built without subtitles because they are going beside it, so the source is kept and the "
+         "conversion is retried rather than shipped with no subtitles at all.", "Rules"),
     Spec("hardware_decode", "HARDWARE_DECODE", "bool", True, "Decode on the GPU too",
          "The encoder was always on the GPU; the decoder was not, and decoding 1080p in software is what "
          "actually pins a NAS CPU. Measured on a real episode: 21.3s of CPU became 3.9s and the job ran 45% "

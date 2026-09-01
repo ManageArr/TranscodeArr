@@ -74,6 +74,151 @@ class PlanNames(unittest.TestCase):
         self.assertEqual(n.visible, self.j("Movie.mp4"))
 
 
+class PlanSidecars(unittest.TestCase):
+    """Where an extracted subtitle goes, and what it is called when it gets there.
+
+    The name is not cosmetic. Jellyfin only offers an external subtitle whose
+    stem matches the video file exactly, so a sidecar named for the HIDDEN stem
+    and never renamed is a subtitle nobody is ever shown - the silent failure
+    this whole worker exists to avoid.
+    """
+
+    def j(self, name):
+        return os.path.join("/m", name)
+
+    def names(self, source=".Dark - S01E01.mkv"):
+        return core.plan_names(self.j(source))
+
+    def sub(self, codec, language="eng", forced=False):
+        return core.SubtitleStream(codec=codec, language=language, forced=forced)
+
+    def plan(self, *subs, source=".Dark - S01E01.mkv"):
+        return core.plan_sidecars(self.names(source), list(subs))
+
+    def test_a_text_subtitle_is_written_hidden_and_revealed_visible(self):
+        [sc], skipped = self.plan(self.sub("subrip"))
+        self.assertEqual(skipped, [])
+        self.assertEqual(sc.hidden, self.j(".Dark - S01E01.eng.srt"))
+        self.assertEqual(sc.visible, self.j("Dark - S01E01.eng.srt"))
+        # The visible stem is the FINAL video's, not the source's: the job
+        # converts .mkv to .mp4 and the subtitle has to sit beside the .mp4.
+        self.assertTrue(os.path.basename(sc.visible).startswith(
+            os.path.splitext(os.path.basename(self.names().visible))[0] + "."))
+
+    def test_ass_keeps_its_own_extension_and_is_copied_not_converted(self):
+        # The whole reason this feature exists. mov_text cannot hold styling,
+        # fonts or positioning, so an anime sign track converted into an mp4 is
+        # a loss with no way back - the styled original was in the source this
+        # job is about to trash.
+        [sc], _ = self.plan(self.sub("ass", "jpn"))
+        self.assertTrue(sc.visible.endswith(".jpn.ass"))
+        self.assertEqual(sc.codec, "copy")
+
+    def test_each_codec_picks_the_extension_that_can_hold_it(self):
+        for codec, ext in [("subrip", ".srt"), ("srt", ".srt"), ("mov_text", ".srt"),
+                           ("webvtt", ".srt"), ("ass", ".ass"), ("ssa", ".ass")]:
+            [sc], skipped = self.plan(self.sub(codec))
+            self.assertTrue(sc.visible.endswith(ext), f"{codec} became {sc.visible}")
+            self.assertEqual(skipped, [])
+
+    def test_image_subtitles_are_reported_and_never_guessed_at(self):
+        # PGS and VOBSUB are bitmaps. Writing them into a .srt would produce a
+        # file that is not a subtitle, and OCR is not something this worker is
+        # going to run unattended over somebody's library. Named on the job
+        # instead, because a remux that ends with no sidecars at all is the
+        # format's answer and not a fault anyone should have to guess at.
+        plans, skipped = self.plan(self.sub("hdmv_pgs_subtitle"), self.sub("dvd_subtitle", "fre"))
+        self.assertEqual(plans, [])
+        self.assertEqual(skipped, ["hdmv_pgs_subtitle", "dvd_subtitle"])
+
+    def test_a_skipped_image_track_does_not_shift_the_stream_numbers_after_it(self):
+        # -map 0:s:N counts every subtitle stream, extracted or not. Numbering
+        # only the ones we take writes the German track into the English file.
+        plans, _ = self.plan(self.sub("hdmv_pgs_subtitle"), self.sub("subrip", "ger"))
+        self.assertEqual([p.stream for p in plans], [1])
+
+    def test_a_forced_track_says_so_in_its_name(self):
+        # A forced track is signs and songs over foreign-language audio. Offered
+        # as a plain English subtitle it looks like a translation that keeps
+        # dropping out for minutes at a time.
+        [sc], _ = self.plan(self.sub("subrip", forced=True))
+        self.assertEqual(sc.visible, self.j("Dark - S01E01.eng.forced.srt"))
+
+    def test_five_tracks_of_one_language_get_five_distinct_names(self):
+        # The live box's case was five languages; five ENGLISH tracks is the one
+        # that used to collapse, and os.replace would have left exactly one.
+        plans, _ = self.plan(*[self.sub("subrip") for _ in range(5)])
+        self.assertEqual(len({p.visible for p in plans}), 5)
+        self.assertEqual(plans[0].visible, self.j("Dark - S01E01.eng.srt"))
+        self.assertEqual(plans[1].visible, self.j("Dark - S01E01.eng.2.srt"))
+
+    def test_a_forced_track_does_not_count_against_the_full_one(self):
+        plans, _ = self.plan(self.sub("subrip"), self.sub("subrip", forced=True))
+        self.assertEqual([p.visible for p in plans],
+                         [self.j("Dark - S01E01.eng.srt"), self.j("Dark - S01E01.eng.forced.srt")])
+
+    def test_the_five_languages_the_live_box_carried_all_survive(self):
+        plans, _ = self.plan(*[self.sub("subrip", lang) for lang in ("eng", "dut", "fre", "ger", "spa")])
+        self.assertEqual([os.path.basename(p.visible) for p in plans],
+                         [f"Dark - S01E01.{lang}.srt" for lang in ("eng", "dut", "fre", "ger", "spa")])
+
+    def test_a_missing_or_unusable_language_tag_becomes_und(self):
+        # A language tag is metadata from whoever muxed the file, so it arrives
+        # as anything at all. It must not be able to put a separator or a
+        # traversal into a filename.
+        for tag in ("", "  ", "../..", "English (SDH)"):
+            [sc], _ = self.plan(self.sub("subrip", tag))
+            self.assertEqual(os.path.dirname(sc.visible), "/m")
+            self.assertTrue(os.path.basename(sc.visible).startswith("Dark - S01E01."))
+        self.assertEqual(self.plan(self.sub("subrip", ""))[0][0].visible,
+                         self.j("Dark - S01E01.und.srt"))
+
+    def test_a_source_that_was_never_hidden_still_plans_a_hidden_sidecar(self):
+        # hidden_only is off by default, so most jobs convert a visible file.
+        # The sidecar still has to be invisible until the reveal, or a scan can
+        # pick it up beside the file it is about to replace.
+        [sc], _ = self.plan(self.sub("subrip"), source="Dark - S01E01.mkv")
+        self.assertEqual(sc.hidden, self.j(".Dark - S01E01.eng.srt"))
+        self.assertEqual(sc.visible, self.j("Dark - S01E01.eng.srt"))
+
+    def test_a_sidecar_is_never_something_the_watcher_would_convert(self):
+        # The name arithmetic is what keeps the worker from eating its own
+        # output. A .srt is safe because it is not a video extension at all -
+        # asserted here so a future addition to VIDEO_EXTENSIONS has to notice.
+        for sub in (self.sub("subrip"), self.sub("ass")):
+            [sc], _ = core.plan_sidecars(self.names(), [sub])
+            for path in (sc.hidden, sc.visible):
+                self.assertNotIn(os.path.splitext(path)[1], core.VIDEO_EXTENSIONS)
+                self.assertFalse(core.validate_path(path, ["/m"], realpath=lambda p: p)[0])
+
+
+class SubtitleProbe(unittest.TestCase):
+    """What ffprobe says about a subtitle track, reduced to what a name needs."""
+
+    PAYLOAD = {"format": {"duration": "3600"}, "streams": [
+        {"codec_type": "video", "pix_fmt": "yuv420p"},
+        {"codec_type": "audio"},
+        {"codec_type": "subtitle", "codec_name": "subrip", "tags": {"language": "eng"}},
+        {"codec_type": "subtitle", "codec_name": "ASS", "tags": {"language": "jpn"},
+         "disposition": {"forced": 1}},
+        {"codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle"},
+    ]}
+
+    def test_every_subtitle_stream_is_kept_in_source_order(self):
+        probe = core.parse_ffprobe(self.PAYLOAD)
+        self.assertEqual(probe.subtitle_streams, 3)
+        self.assertEqual(len(probe.subtitles), 3)
+        # Lowered, or the SIDECAR_FORMATS lookup misses and a styled ASS track
+        # is reported as an unextractable codec.
+        self.assertEqual([s.codec for s in probe.subtitles],
+                         ["subrip", "ass", "hdmv_pgs_subtitle"])
+        self.assertEqual([s.language for s in probe.subtitles], ["eng", "jpn", ""])
+        self.assertEqual([s.forced for s in probe.subtitles], [False, True, False])
+
+    def test_a_probe_with_no_subtitles_carries_none(self):
+        self.assertEqual(core.parse_ffprobe({"streams": [{"codec_type": "video"}]}).subtitles, ())
+
+
 class TrashOverride(unittest.TestCase):
     """prune_trash unlinks everything past the retention window under every
     trash root, so a trash root that contains the library deletes the library."""
@@ -282,6 +427,22 @@ class FfmpegArgs(unittest.TestCase):
         args = core.build_ffmpeg_args(core.DEFAULT_TEMPLATES["h264_nvenc"], "/m/x.mkv", "/m/.x.tapart.mp4", 24, False)
         self.assertIn("-sn", args)
         self.assertNotIn("mov_text", args)
+
+    def test_extraction_is_one_pass_with_one_output_per_track(self):
+        # One ffmpeg, many outputs. One process per track reads a 40GB remux
+        # once per subtitle, over the link the encode has just finished
+        # saturating.
+        names = core.plan_names("/m/.Show.mkv")
+        sidecars, _ = core.plan_sidecars(names, [core.SubtitleStream("subrip", "eng", False),
+                                                 core.SubtitleStream("ass", "jpn", False)])
+        args = core.build_extract_args("/m/.Show.mkv", sidecars)
+        self.assertEqual(args.count("-i"), 1)
+        self.assertEqual(args[-1], sidecars[1].hidden)
+        self.assertEqual(args[args.index("-map") + 1], "0:s:0")
+        # Written to the HIDDEN name, never the visible one.
+        for sc in sidecars:
+            self.assertIn(sc.hidden, args)
+            self.assertNotIn(sc.visible, args)
 
     def test_progress_parsing(self):
         self.assertEqual(core.parse_progress("out_time_us=30000000", 60.0), 50)

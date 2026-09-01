@@ -17,6 +17,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from unittest import mock
 
@@ -297,7 +298,11 @@ class TheQueueShowsWhatItIsWaitingFor(ApiCase):
         conn.commit()
         main._REPLACEMENTS = (0.0, [])            # the cache must not hide a new row
         self.addCleanup(setattr, main, "_REPLACEMENTS", (0.0, []))
-        with mock.patch.object(main.store, "list_arrs", lambda conn, redact=True: []):
+        # The connection still exists: a row whose arr is gone clears itself
+        # now, and this test is about one that has not.
+        with mock.patch.object(main.store, "list_arrs",
+                               lambda conn, redact=True: [{"id": "a1", "name": "Sonarr", "enabled": 1}]), \
+             mock.patch.object(main, "_client_for", mock.Mock(side_effect=RuntimeError("offline"))):
             status, body, _headers = self.call("GET", "/api/queue")
         self.assertEqual(status, 200)
         [waiting] = body["awaiting_replacement"]
@@ -322,9 +327,116 @@ class TheQueueShowsWhatItIsWaitingFor(ApiCase):
         conn.commit()
         main._REPLACEMENTS = (0.0, [])
         self.addCleanup(setattr, main, "_REPLACEMENTS", (0.0, []))
-        with mock.patch.object(main.store, "list_arrs", lambda conn, redact=True: []):
+        # The arr is still connected, so the conversion is the only thing that
+        # can be clearing this row.
+        with mock.patch.object(main.store, "list_arrs",
+                               lambda conn, redact=True: [{"id": "a1", "name": "Sonarr", "enabled": 1}]), \
+             mock.patch.object(main, "_client_for", mock.Mock(side_effect=RuntimeError("offline"))):
             self.assertEqual(main.replacements_view(), [])
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM replacements").fetchone()[0], 0)
+
+
+class AWaitingRowCanBeStopped(ApiCase):
+    """A waiting row was cleared by a later conversion of THAT EXACT PATH and by
+    nothing else, so a file whose world moved underneath it waited forever.
+
+    The case this is written from, off the live box: the media root was
+    deleted, the arr connection was deleted, and the file itself moved to
+    another library and converted there perfectly well. Three separate reasons
+    the original path will never convert again, and no way at all to say so.
+    """
+
+    PATH = "/media/Temp/TV/Criminal Minds/Season 07/.Criminal Minds - S07E10.mkv"
+    RELEASE = "Criminal.Minds.S07.1080p.WEBRip.DDP.5.1.x265-iVy"
+    NOTE = ("Sonarr (Temp TV): blocklisted Criminal.Minds.S07.1080p.WEBRip.DDP.5.1.x265-iVy (SingleEpisode) "
+            "and asked for a replacement of Criminal Minds")
+
+    def waiting(self, arr_id="a1"):
+        """One row, asked about an hour ago, and an empty job history."""
+        conn = main.db()
+        conn.execute("DELETE FROM replacements")
+        conn.execute("DELETE FROM jobs")
+        conn.execute(
+            "INSERT INTO replacements (path, arr_id, arr_name, kind, item_id, episode_id, release, at, note) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (self.PATH, arr_id, "Sonarr (Temp TV)", "sonarr", 126, 10984, self.RELEASE,
+             time.time() - 3600, self.NOTE))
+        conn.commit()
+        main._REPLACEMENTS = (0.0, [])
+        self.addCleanup(setattr, main, "_REPLACEMENTS", (0.0, []))
+        return conn
+
+    def done(self, conn, job_id, path, created=None):
+        conn.execute("INSERT INTO jobs (id, path, state, kind, created) VALUES (?,?,?,?,?)",
+                     (job_id, path, "done", "transcode", created or time.time()))
+        conn.commit()
+
+    def view(self, arrs=("a1",)):
+        """The card, with those connections existing and none of them reachable."""
+        rows = [{"id": i, "name": "Sonarr (Temp TV)", "enabled": 1} for i in arrs]
+        with mock.patch.object(main.store, "list_arrs", lambda conn, redact=True: rows), \
+             mock.patch.object(main, "_client_for", mock.Mock(side_effect=RuntimeError("offline"))):
+            return main.replacements_view()
+
+    def count(self):
+        return main.db().execute("SELECT COUNT(*) FROM replacements").fetchone()[0]
+
+    def test_dismissing_a_row_deletes_it_and_the_card_forgets_it_at_once(self):
+        self.waiting()
+        status, body, _headers = self.call(
+            "DELETE", "/api/replacements?path=" + urllib.parse.quote(self.PATH))
+        self.assertEqual(status, 200)
+        self.assertEqual(body["dismissed"], self.PATH)
+        self.assertEqual(self.count(), 0)
+        # The poll cache is 20 seconds wide. Left alone it would keep serving
+        # the row that was just deleted, and the button would read as broken.
+        self.assertEqual(self.view(), [])
+
+    def test_dismissing_something_nothing_is_waiting_on_is_a_404(self):
+        self.waiting()
+        status, _body, _headers = self.call("DELETE", "/api/replacements?path=/media/nope.mkv")
+        self.assertEqual(status, 404)
+        self.assertEqual(self.count(), 1)
+
+    def test_dismissing_needs_a_token_like_every_other_write(self):
+        self.waiting()
+        status, _body, _headers = self.call(
+            "DELETE", "/api/replacements?path=" + urllib.parse.quote(self.PATH), token=None)
+        self.assertEqual(status, 401)
+        self.assertEqual(self.count(), 1)
+
+    def test_a_row_whose_arr_connection_is_gone_clears_itself(self):
+        self.waiting()
+        self.assertEqual(self.view(arrs=()), [])
+        self.assertEqual(self.count(), 0)
+
+    def test_a_row_whose_file_converted_at_a_new_path_clears_itself(self):
+        conn = self.waiting()
+        # The same file, moved to the library that outlived the deleted root.
+        self.done(conn, "j1", "/truenas/media/TV/Criminal Minds (2005) [tvdbid-75710]/Season 07/"
+                              ".Criminal Minds - S07E10.mkv")
+        self.assertEqual(self.view(), [])
+        self.assertEqual(self.count(), 0)
+
+    def test_a_row_that_is_still_genuinely_waiting_is_left_alone(self):
+        """Everything the two rules look at says maybe, and nothing says yes.
+
+        The arr is connected. The file is not where the row says - but an
+        unmounted share reads exactly like that, which is why a missing path on
+        its own proves nothing. And nothing of that name has converted since
+        the request: a different episode, and the same name from BEFORE the
+        request, are both somebody else's file.
+        """
+        conn = self.waiting()
+        self.done(conn, "j2", "/media/TV/Other Show/.Other - S01E01.mkv")
+        self.done(conn, "j3", "/elsewhere/.Criminal Minds - S07E10.mkv", time.time() - 7200)
+        [row] = self.view()
+        self.assertEqual(row["path"], self.PATH)
+        self.assertEqual(self.count(), 1)
+        # And the card carries enough to find the item in Sonarr without it.
+        self.assertEqual(row["arr"], "Sonarr (Temp TV)")
+        self.assertEqual(row["release"], self.RELEASE)
+        self.assertIn("Criminal Minds", row["note"])
 
 
 class NothingIsCacheable(ApiCase):

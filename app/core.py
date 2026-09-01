@@ -120,6 +120,147 @@ def plan_names(source: str, target_ext: str = ".mp4") -> JobNames:
     )
 
 
+# What a text sidecar can hold, keyed by the codec name ffprobe reports:
+# (extension, the -c:s value that writes it).
+#
+# `copy` wherever the stream already IS the sidecar's format, which is the whole
+# point for anime: an ASS track carries the styling, fonts and positioning that
+# sign typesetting and karaoke are made of, and mp4's mov_text keeps none of it.
+# That loss is not recoverable afterwards - the styled original is in the source
+# this worker is about to trash. `ssa` is transcoded rather than copied because
+# the .ass muxer takes ASS, and ffmpeg's own decoder is what converts the older
+# header.
+#
+# hdmv_pgs_subtitle and dvd_subtitle are deliberately absent. They are pictures,
+# not text: no -c:s value turns a bitmap into a .srt, and the only thing that
+# would is OCR, which this worker is not going to run unattended over somebody's
+# library. They are reported as a warning on the job instead of being converted
+# badly or failing it.
+SIDECAR_FORMATS: dict[str, tuple[str, str]] = {
+    "subrip": (".srt", "copy"),
+    "srt": (".srt", "copy"),
+    "ass": (".ass", "copy"),
+    "ssa": (".ass", "ass"),
+    "mov_text": (".srt", "srt"),
+    "webvtt": (".srt", "srt"),
+}
+
+
+@dataclass(frozen=True)
+class SubtitleStream:
+    """One embedded subtitle track - as much of it as a sidecar name needs.
+
+    A record rather than the raw ffprobe dict because Probe is passed around and
+    compared as a value, and a dict inside it would make that stop working.
+    """
+    codec: str
+    language: str
+    forced: bool
+
+
+@dataclass(frozen=True)
+class Sidecar:
+    stream: int      # position among the SUBTITLE streams, which is what -map 0:s:N counts
+    codec: str       # the -c:s value, from SIDECAR_FORMATS
+    hidden: str      # written here while the job is in flight
+    visible: str     # renamed to this one moment before the video is
+
+
+def plan_sidecars(names: JobNames, subtitles: list[SubtitleStream]) -> tuple[list[Sidecar], list[str]]:
+    """Where each embedded subtitle in a source belongs. (sidecars, skipped codecs).
+
+    The name is `<stem>.<lang>[.forced][.n]<ext>` because that is what Jellyfin's
+    external-subtitle parser reads. The stem has to match the FINAL video file
+    exactly or the track is never offered; the language token is what it gets
+    labeled with, and `forced` is what keeps a signs-and-songs track from being
+    offered as a full translation.
+
+    Both names are worked out here, hidden and visible, because a sidecar is
+    written long before the video is revealed. The dot convention is the whole
+    safety mechanism (see above) and a subtitle has to obey it too: a visible
+    half-written .srt beside a file that is about to be replaced is exactly the
+    kind of thing a media server scan picks up once and then caches.
+
+    ponytail: same-language tracks are told apart by a counter, not by the
+    stream's title. A title is free text from whoever muxed the file, so using
+    it means sanitizing arbitrary bytes into a filename. Swap it in if anyone
+    ever needs to tell two English tracks apart by name.
+    """
+    directory, base = os.path.split(names.visible)
+    stem = os.path.splitext(base)[0]
+    plans: list[Sidecar] = []
+    skipped: list[str] = []
+    used: dict[str, int] = {}
+    for index, sub in enumerate(subtitles):
+        fmt = SIDECAR_FORMATS.get(sub.codec)
+        if fmt is None:
+            skipped.append(sub.codec or "unknown")
+            continue
+        ext, codec = fmt
+        # A language tag is metadata from the muxer, so it reaches here as
+        # anything at all - "en-US", "", "English (SDH)". Reduced to letters and
+        # digits so it cannot put a separator or a traversal into a filename,
+        # and "und" when there is nothing left, which is the ISO code for
+        # exactly that rather than a token this worker invented.
+        lang = re.sub(r"[^a-z0-9]", "", sub.language.lower())[:8] or "und"
+        name = ".".join([stem, lang] + (["forced"] if sub.forced else []))
+        # Counted per resulting name AND extension, so an English .srt and an
+        # English .ass are two files rather than a collision, while two English
+        # .srt tracks are numbered - which os.replace would otherwise reduce to
+        # one subtitle silently.
+        key = name + ext
+        used[key] = used.get(key, 0) + 1
+        if used[key] > 1:
+            name = f"{name}.{used[key]}"
+        plans.append(Sidecar(index, codec, os.path.join(directory, f".{name}{ext}"),
+                             os.path.join(directory, f"{name}{ext}")))
+    return plans, skipped
+
+
+# What plan_sidecars can write, which is also what counts as a subtitle already
+# beside a video: this worker moves and trashes files under this rule, so it
+# stays exactly the extensions it produces itself.
+#
+# ponytail: .sub/.idx and .vtt are subtitles too, and two videos whose stems
+# share a prefix ("Show - S01E01" and "Show - S01E01.extended") each claim the
+# other's sidecars. Both are files this worker never wrote; tighten this to a
+# full parse of the name if a real library trips over either.
+SIDECAR_EXTENSIONS = frozenset(ext for ext, _ in SIDECAR_FORMATS.values())
+
+
+def is_sidecar_of(video: str, name: str) -> bool:
+    """Whether `name`, a basename in the video's own directory, is one of that
+    video's subtitles: `<stem>.<anything>.srt|.ass`, which is what plan_sidecars
+    writes and what every media server reads back.
+
+    A rule rather than a glob: a real stem is full of glob metacharacters -
+    "Movie [2026] (1080p)" is three character classes - and escaping them is
+    how a match like this quietly stops matching anything.
+    """
+    stem = os.path.splitext(os.path.basename(video))[0]
+    return (os.path.splitext(name)[1].lower() in SIDECAR_EXTENSIONS
+            and name.startswith(stem + "."))
+
+
+# One displayed cue, in either format this worker writes: an SRT timing arrow or
+# an ASS Dialogue line. `Comment:` is deliberately not an event - ASS renders
+# none of them, so a track holding only comments displays nothing.
+_SUBTITLE_EVENT = re.compile(r"^\s*Dialogue\s*:|-->", re.M)
+
+
+def has_subtitle_events(text: str) -> bool:
+    """Whether an extracted subtitle actually carries anything to display.
+
+    Size is not the question, which is what "non-empty file" got wrong: ffmpeg
+    writes a file for a track with nothing in it, and for `.ass` that file is a
+    complete [Script Info] and [Events] header with no Dialogue under it -
+    hundreds of bytes of nothing that no size check will ever catch. Revealed,
+    it is a subtitle the media server offers and that plays nothing, which reads
+    as a broken file rather than as an absent track.
+    """
+    return bool(_SUBTITLE_EVENT.search(text))
+
+
 # ---------------------------------------------------------------------------
 # Where a replaced source is kept
 # ---------------------------------------------------------------------------
@@ -220,6 +361,10 @@ class Probe:
     # so an ffprobe that does not say reads as "unknown" rather than "8-bit" -
     # see output_pix_fmt, where unknown means "change nothing".
     pix_fmt: str = ""
+    # Every subtitle stream in source order, so the Nth entry here is the N that
+    # -map 0:s:N means. Defaulted for the same reason pix_fmt is: a Probe built
+    # by hand in a test is about durations, not subtitles.
+    subtitles: tuple[SubtitleStream, ...] = ()
 
 
 def parse_ffprobe(payload: dict) -> Probe:
@@ -238,6 +383,16 @@ def parse_ffprobe(payload: dict) -> Probe:
         audio_streams=count("audio"),
         subtitle_streams=count("subtitle"),
         pix_fmt=str(video[0].get("pix_fmt") or "") if video else "",
+        subtitles=tuple(
+            SubtitleStream(
+                codec=str(s.get("codec_name") or "").lower(),
+                language=str((s.get("tags") or {}).get("language") or ""),
+                # A forced track is signs and songs over foreign-language audio,
+                # not a translation of the dialogue, and Jellyfin only knows to
+                # treat it that way if the sidecar name says so.
+                forced=bool((s.get("disposition") or {}).get("forced")),
+            )
+            for s in streams if s.get("codec_type") == "subtitle"),
     )
 
 
@@ -856,6 +1011,10 @@ def build_ffmpeg_args(
     MP4 cannot carry PGS/VOBSUB image subtitles, so text subs are converted to
     mov_text and the caller retries without subtitles when that fails - a
     dropped subtitle is recorded as a warning, never a silent loss.
+
+    with_subtitles is also False for every attempt when subtitle EXTRACTION is
+    on: the sidecars carry the same tracks undegraded, and embedding them too
+    would offer every track twice, with the mov_text copy the worse of the two.
     """
     subs = "-map 0:s? -c:s mov_text" if with_subtitles else "-sn"
     filters = scale_filter(max_height)
@@ -887,6 +1046,21 @@ def build_ffmpeg_args(
         "-progress", "pipe:1",
         part,
     ]
+
+
+def build_extract_args(source: str, sidecars: list[Sidecar]) -> list[str]:
+    """argv for one pass that writes every sidecar in `sidecars`.
+
+    One pass with many outputs, not one ffmpeg per track: the alternative reads
+    a 40GB remux five times to pull five subtitle streams out of it, over the
+    same NAS link the encode has just finished saturating. -y because a crashed
+    earlier run of this same file can have left its hidden sidecars behind, and
+    ffmpeg asking a question nobody is there to answer would hang the worker.
+    """
+    args = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-i", source]
+    for s in sidecars:
+        args += ["-map", f"0:s:{s.stream}", "-c:s", s.codec, s.hidden]
+    return args
 
 
 PROGRESS_RE = re.compile(r"out_time_us=(\d+)")

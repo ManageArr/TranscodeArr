@@ -17,9 +17,143 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.4.0` is the release to run. Everything in the sections below is in it and is
+`1.5.0` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.5.0] - 2026-09-01
+
+### Added
+
+- **Subtitles can be extracted beside the file instead of squeezed into it.**
+  One new setting under Rules, `EXTRACT_SUBTITLES`, **off by default** because
+  it changes what an existing library looks like on disk. On, every text
+  subtitle in the source is written next to the finished video as
+  `<stem>.<language>[.forced][.n].srt` / `.ass`, which is the naming Jellyfin,
+  Plex and Emby all read, and the encode runs with `-sn` so no track is carried
+  twice.
+
+  **Recommended for anime.** MP4 can only hold text subtitles as `mov_text`,
+  and converting an ASS track into `mov_text` keeps the words while throwing
+  away the styles, fonts, positioning and colors - which for anime is the sign
+  typesetting and the karaoke. That loss was permanent, because the styled
+  original was in the source the job had just moved to the trash. Extracting to
+  `.ass` copies the stream out untouched.
+
+  It fixes the other half too. MP4 cannot carry the image subtitles a Blu-ray
+  remux has at all, so those conversions used to walk down the fallback ladder
+  and finish having dropped every track. A source on the live box carried five
+  `subrip` tracks - eng, dut, fre, ger, spa - into a conversion that could only
+  degrade them.
+
+  The dot convention applies to a subtitle exactly as it does to the video: a
+  sidecar is written hidden, revealed one moment ahead of the film, and unlinked
+  on every exit that is not a reveal - so a media server can never scan a
+  half-written subtitle, one named for a file that is about to be replaced, or
+  the film without its subtitles. Past the moment the source moves to the trash
+  that reverses: the hidden sidecars are then the only copy of those tracks, so
+  a job that dies after it reveals them rather than unlinking or keeping them.
+  Keeping them was not enough - the watcher then picks the staged `.mp4` up as a
+  reveal job and unhides the film without them, leaving the subtitles invisible
+  for good. A subtitle already at a name being revealed
+  onto is displaced into the trash rather than overwritten, and only when it is
+  the same file that was there when the job started: one that arrived while the
+  job ran - a Bazarr download - is left alone, and the job says which happened.
+  The replaced file's own subtitles go to the trash with it, because a subtitle
+  left behind reattaches to whatever takes that name next.
+
+  An extraction that fails, fails the job, and leaves the source where it is for
+  the retry. The encode is built with `-sn` BECAUSE these tracks are going to
+  sidecars, so a swallowed extraction failure shipped a file with no subtitles
+  anywhere and then trashed the only copy that had them. A sidecar ffmpeg wrote
+  and that cannot be read back afterwards - `ESTALE` or `EIO`, a NAS - counts as
+  a failure for the same reason: that track is in neither the mp4 nor a file
+  anybody can open. A source with no text subtitles at all is still a success -
+  there was nothing to write. Extraction is a full demux of the source, so the
+  two guards that protect the staging and visible names, and the cancel flag,
+  are all re-asked on the far side of it, and the visible-name guard is asked
+  once more immediately before the reveal.
+
+  A hidden sidecar name that is already taken is cleared rather than refused
+  forever: the leftover goes to the trash with the retention a displaced file
+  gets, never an overwrite and never an unlink. Refusing was a permanent poison:
+  nothing else ever cleared those files, so one transient error failed every
+  later conversion of that filename identically. A sidecar belonging to a job
+  still in flight is still refused, because two sources can plan the same
+  targets and several jobs run at once.
+
+  **Image subtitles are not extracted**, and that is a decision rather than a
+  gap. PGS and VOBSUB are pictures; nothing turns a bitmap into a `.srt` except
+  OCR, and this worker is not going to run OCR unattended over a library and
+  write the guesses out as subtitles. Extracting them as `.sup` with `-c:s
+  copy` was considered and left out - almost nothing plays a `.sup` sidecar, so
+  it would put files in the library that look like subtitles and are not. The
+  job names the codecs that stayed behind, and they are still in the source,
+  which is in the trash for the retention window.
+
+  **Bazarr is not integrated**, for reasons written out under
+  [Bazarr](README.md#bazarr) in the README. Its rescan endpoint
+  (`PATCH /api/series?seriesid=<id>&action=scan-disk`) is real, but it is
+  addressed by a Sonarr/Radarr id this worker does not have, it re-probes a
+  whole series synchronously per call, and it cannot answer inside the ten
+  second timeout every other outbound call here holds to.
+
+- **A "Waiting on a replacement" row can be dismissed.** New button on each row
+  of the card, and `DELETE /api/replacements?path=` behind it. It deletes this
+  worker's row and nothing else - the release stays blocklisted, and a download
+  the arr has already started belongs to the arr. Until now the card had no
+  control on it at all: the only thing that cleared a row was that exact path
+  converting later, so a file whose library moved out from under it sat there
+  saying "searching" with nothing to press.
+
+- **The card says which item it is waiting for.** Each row now shows the folder
+  the file was in, which connection was asked, the whole blocklisted release
+  rather than the first 44 characters of it, and the arr's own sentence about
+  the request - which is where the series or film title is. Finding the item in
+  Sonarr or Radarr no longer means going back through the logs.
+
+### Fixed
+
+- **The reveal no longer replaces a file that arrived while the source was
+  being trashed.** The guard that protects the visible name was asked before
+  the encode and again after it, and then the reveal ran without asking anyone.
+  Two slow things sit in that gap: an fsync of the whole freshly written output,
+  which is seconds to minutes over NFS, and the move of the source into the
+  trash, which is a full byte copy whenever the trash is on another filesystem.
+  An arr importing an upgrade inside that window landed on exactly the name
+  about to be revealed onto, and `os.replace` destroyed it without a word - and
+  unlike a source, a clobbered file there never reaches the trash.
+
+  Worse, the code already knew. `displace()` returns nothing both when the name
+  was free and when it positively identified a stranger there and refused to
+  move it, and the reveal read that second answer as permission to overwrite.
+
+  The guard is now re-asked immediately before the reveal. Because that is past
+  the point of no return - the source is already in the trash - refusing means
+  the job fails with the converted file left at its hidden staging name, and the
+  error names that path and the trashed source both, so finishing it by hand is
+  a rename rather than an investigation. The same rule now covers the reveal of
+  a skipped or already-`.mp4` file, which had the same gap around its own
+  `displace()`. This one is not new in `1.5.0`: it has been there since the
+  guard was introduced.
+
+- **A waiting row whose world moved underneath it no longer waits forever.** A
+  row was cleared by a later successful conversion OF THAT EXACT PATH and by
+  nothing else. That is the honest signal, and it is also unreachable once the
+  path can never convert again - a media root deleted, the connection deleted,
+  the file moved to another library and converted there. The live box had such
+  a row from a deleted `/media/Temp` root and a deleted "Sonarr (Temp TV)"
+  connection, permanently "searching" for an episode that had converted
+  perfectly well somewhere else.
+
+  Two rules now clear those, both deliberately narrow. The arr connection is
+  gone, so nothing can report on that download or deliver it. Or the file is
+  missing from where it was AND a file of that exact name has since converted
+  successfully somewhere else. Both halves of the second one are required: a
+  missing path on its own is an unmounted share, and a same-named conversion on
+  its own is a second copy of the episode in another library while this one is
+  still genuinely waiting. Anything that might still be waiting is left exactly
+  where it is - that is what the Dismiss button above is for.
 
 ## [1.4.0] - 2026-08-27
 

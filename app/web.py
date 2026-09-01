@@ -282,7 +282,9 @@ document.documentElement.dataset.theme=localStorage.theme||'dark'</script>
  <div class="card" id="awaitcard" style="display:none">
   <h2>Waiting on a replacement</h2>
   <p class="hint">These failed because the file itself is unreadable, so the release was blocklisted and the
-   arr was asked for a different one. There is nothing to convert until a new file lands.</p>
+   arr was asked for a different one. There is nothing to convert until a new file lands. A row clears itself
+   when the file converts, when its arr connection is deleted, or when the file turns up converted somewhere
+   else. Dismiss is for the rest: it stops this worker watching, and changes nothing on the arr.</p>
   <table id="awaittable"></table>
  </div>
  <div class="card">
@@ -709,7 +711,8 @@ function renderAwaiting(list){
  const rows=list||[];
  $('awaitcard').style.display=rows.length?'':'none';
  if(!rows.length)return;
- $('awaittable').innerHTML='<tr><th>File</th><th>Asked</th><th>Blocklisted</th><th>Download</th></tr>'+
+ $('awaittable').innerHTML='<tr><th>File</th><th>Arr</th><th>Blocklisted release</th><th>Asked</th>'+
+  '<th>Download</th><th></th></tr>'+
   rows.map(r=>{
    const d=r.download;
    let state;
@@ -717,9 +720,26 @@ function renderAwaiting(list){
    else if(d.error) state=`<span class="tag">${esc(d.status||'error')}</span> <code>${esc(d.error)}</code>`;
    else state=`<span class="tag">${esc(d.status||'downloading')}</span> `+
      (d.percent==null?'':`${d.percent}% `)+`<code>${esc((d.title||'').slice(0,58))}</code>`;
-   return `<tr><td>${esc(r.name)}</td><td>${esc(ago(r.asked_at))}</td>`+
-    `<td><code>${esc((r.release||'').slice(0,44))}</code></td><td>${state}</td></tr>`;
+   // The folder, the arr's own sentence and the whole release name, not a
+   // truncated one: this card is where somebody goes to find the item in
+   // Sonarr or Radarr, and the note is where the series or film title is.
+   return `<tr><td>${esc(r.name)}<div><code>${esc(folderOf(r.path))}</code></div>`+
+    (r.note?`<div><code>${esc(r.note)}</code></div>`:'')+`</td>`+
+    `<td>${esc(r.arr||'')}</td><td><code>${esc(r.release||'')}</code></td>`+
+    `<td>${esc(ago(r.asked_at))}</td><td>${state}</td>`+
+    `<td><button class="ghost" data-dismiss="${esc(r.path)}">Dismiss</button></td></tr>`;
   }).join('');
+}
+// The third way out of this card. The other two are the server's: the file
+// converts, or the row stops being resolvable at all. Neither can see media
+// that moved to a library this worker was never told about, and until this
+// button existed such a row said "searching" forever with nothing to press.
+async function dismissReplacement(path){
+ if(!confirm('Stop waiting on a replacement for:\n\n'+path+
+   '\n\nNothing on the arr changes. The release stays blocklisted, and a download it has '+
+   'already started keeps going.'))return;
+ try{await api('/api/replacements?path='+encodeURIComponent(path),{method:'DELETE'});await refreshQueue();}
+ catch(e){alert(e.message);}
 }
 const ago=t=>{
  const s=Math.max(0,Math.floor(Date.now()/1000-t));
@@ -791,6 +811,7 @@ document.addEventListener('click',e=>{
  const d=e.target&&e.target.dataset;
  if(!d) return;
  if(d.cancel) cancelJob(d.cancel);
+ if(d.dismiss) dismissReplacement(d.dismiss);
  if(d.editarr){const a=ARRS.find(x=>x.id===d.editarr); if(a) editArr(a);}
  if(d.delarr){const a=ARRS.find(x=>x.id===d.delarr); if(a) deleteArr(a.id,a.name);}
  if(d.revoke){const t=KEYS.find(x=>x.id===d.revoke); if(t) revokeKey(t.id,t.name);}

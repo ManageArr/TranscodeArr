@@ -121,7 +121,7 @@ def cfg() -> dict:
 # A constant compiled into the image cannot be overridden from outside it. Bump
 # it with the image tag: the release workflow refuses a tag that disagrees with
 # it, and a test refuses a Dockerfile that does.
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -265,6 +265,16 @@ def init_db() -> None:
                 os.unlink(names.hidden_final)
             except OSError:
                 pass
+            # And the sidecars that same dead job extracted, under exactly the
+            # same condition: the source is still there, so every track in them
+            # is still there too and the retry re-extracts them. Once the source
+            # has been trashed they are the only copy and this must not run -
+            # which is what the guard above already says.
+            for stale in existing_sidecars(names.hidden_final):
+                try:
+                    os.unlink(stale)
+                except OSError:
+                    pass
         conn.execute(
             "UPDATE jobs SET state='failed', error='interrupted by restart', finished=? WHERE id=?",
             (time.time(), row["id"]),
@@ -711,8 +721,16 @@ def profile_args(p: dict, source: str, part: str, with_subs: bool, audio_codec: 
 FALLBACK_WORTHY = re.compile(r"subtitle|mov_text|codec|cuda|nvdec|hwaccel|hardware", re.I)
 
 
-def run_encode(job_id: str, source: str, names: core.JobNames, src_probe: core.Probe) -> tuple[bool, str, str]:
-    """One encode attempt cycle, down the fallback ladder. (ok, warning, error)."""
+def run_encode(job_id: str, source: str, names: core.JobNames, src_probe: core.Probe,
+               extract_subtitles: bool) -> tuple[bool, str, str]:
+    """One encode attempt cycle, down the fallback ladder. (ok, warning, error).
+
+    extract_subtitles is passed in rather than read here: it decides both the
+    -sn below and whether process() extracts afterwards, and those two reads
+    used to sit on either side of a whole encode. A setting turned off in
+    between produced an mp4 built without subtitles and no sidecars either -
+    every track gone, with the source already in the trash.
+    """
     conn = db()
     prof = encoding_profile()
     c = cfg()
@@ -722,8 +740,14 @@ def run_encode(job_id: str, source: str, names: core.JobNames, src_probe: core.P
     # cancel, terminate and the stall watchdog all still reach the encoder - a
     # wrapper that forked would have broken cancel without saying so.
     throttle = core.throttle_prefix(c["encode_nice"], c["encode_idle_io"])
-    attempts = [(True, prof["audio_codec"], hw, "")]
-    if src_probe.subtitle_streams:
+    # Embedding and extraction are exclusive on purpose. With sidecars on, the
+    # same tracks are already beside the file undegraded, and carrying them
+    # inside the mp4 as well offers every language twice in Jellyfin with the
+    # mov_text copy - stripped of styling and positioning - as one of the two.
+    # It also removes the rung below, which would only ever repeat the first.
+    embed = not extract_subtitles
+    attempts = [(embed, prof["audio_codec"], hw, "")]
+    if embed and src_probe.subtitle_streams:
         attempts.append((False, prof["audio_codec"], hw, "text subtitles could not be carried into mp4 - dropped"))
     if prof["audio_codec"] == "copy":
         # MP4 cannot hold DTS or TrueHD, and those are exactly the tracks worth
@@ -874,6 +898,185 @@ def log_encoder_diagnostics(job_id: str) -> None:
     log.warning("job %s: encoder unavailable - nvidia-smi: %s | /dev/nvidia*: %s", job_id[:8], said[0], said[1])
 
 
+# Long enough to demux five subtitle tracks out of a 40GB remux over a NAS link,
+# short enough that a wedged ffmpeg cannot hold a worker slot for the life of the
+# container. The encode's own stall watchdog does not reach this process.
+SUBTITLE_TIMEOUT = 900
+
+
+def extract_sidecars(job_id: str, source: str, sidecars: list[core.Sidecar],
+                     skipped: list[str]) -> tuple[list[core.Sidecar], str, str]:
+    """Write the source's text subtitles to HIDDEN sidecars. (written, note, error).
+
+    Hidden, because this runs while the source is still the file the media
+    server is serving and the encode is still staged. reveal_sidecars renames
+    them just before the video, so a scan never sees a subtitle for a file that
+    does not exist yet or is about to be replaced.
+
+    An error here FAILS the job, and leaves the source exactly where it is so
+    the next attempt can try again. It used to be a warning on a job that
+    reported done - but the mp4 was built with -sn BECAUSE these tracks were
+    going to sidecars, so a swallowed failure shipped a file with no subtitles
+    anywhere and then trashed the only copy that had them. A source with no text
+    subtitles at all is still a success: there was nothing to write.
+
+    Anything half-written is unlinked rather than left behind.
+    """
+    notes = []
+    if skipped:
+        # Said out loud rather than dropped in silence: a Blu-ray remux whose
+        # only subtitles are PGS finishes this job with no sidecars at all, and
+        # that is the format's answer, not a bug. They stay in the source, which
+        # is in the trash for the retention window.
+        notes.append("image subtitles cannot become text files and were left in the source: "
+                     + ", ".join(sorted(set(skipped))))
+    if not sidecars:
+        return [], "; ".join(notes), ""
+    # The video's staging name is guarded against exactly this and the sidecars'
+    # names were guarded by nothing, while `ffmpeg -y` overwrites whatever it
+    # finds. A hidden .srt already at one of these names is somebody else's file
+    # or another job's work in flight, and neither is this one's to clobber.
+    #
+    # It used to be a permanent refusal, and nothing anywhere ever cleared the
+    # file: boot cleanup only sweeps hidden sidecars for a row still 'running'
+    # whose source still exists, which is none of the ways this worker actually
+    # leaves one behind. So one transient error poisoned that filename's
+    # conversions forever, every retry failing identically with nothing on disk
+    # changing between them - the same shape as the "target already exists" bug
+    # that stalled 26 files in a real library.
+    #
+    # What this clears: a leftover at a name THIS job is about to write, while
+    # the source of every track in it is on disk in front of us and about to be
+    # demuxed. What it will not touch: a sidecar belonging to a job still in
+    # flight - two sources plan the same targets (".Dark.mkv" and "Dark.avi"
+    # both become "Dark.mp4") and WORKER_POOL jobs run at once - or anything at
+    # a name outside this job's plan. It goes to the trash rather than under an
+    # unlink, with the retention a displaced file gets, because this worker does
+    # not destroy a file it did not write: if the in-flight check above is ever
+    # wrong, a move is recoverable and an unlink is not.
+    in_flight = [core.plan_names(r["path"]).hidden_final for r in db().execute(
+        "SELECT path FROM jobs WHERE state='running' AND id<>?", (job_id,)).fetchall()]
+    for sc in sidecars:
+        if not os.path.exists(sc.hidden):
+            continue
+        if any(os.path.dirname(v) == os.path.dirname(sc.hidden)
+               and core.is_sidecar_of(v, os.path.basename(sc.hidden)) for v in in_flight):
+            return [], "; ".join(notes), (f"subtitle staging name is taken by a job in flight: "
+                                          f"{sc.hidden} - not overwriting")
+        try:
+            notes.append(f"a leftover hidden subtitle was in the way of {os.path.basename(sc.hidden)} "
+                         f"and went to the trash: {trash(sc.hidden, job_id)}")
+        except OSError as e:
+            return [], "; ".join(notes), f"subtitle staging name is taken: {sc.hidden} - could not clear it: {e}"
+    try:
+        r = subprocess.run(core.build_extract_args(source, sidecars),
+                           capture_output=True, text=True, timeout=SUBTITLE_TIMEOUT)
+        if r.returncode != 0:
+            raise RuntimeError(core.error_summary((r.stderr or "").splitlines(), keep=2, width=200)
+                               or f"ffmpeg exited {r.returncode}")
+    except Exception as e:  # noqa: BLE001 - reported as this job's error, not raised
+        log.warning("job %s: subtitle extraction failed: %s", job_id[:8], e)
+        drop_sidecars(sidecars)
+        return [], "; ".join(notes), f"subtitles could not be extracted: {e}"
+    written, missing = [], []
+    for sc in sidecars:
+        if not os.path.exists(sc.hidden):
+            # Never trust exit 0 - the rule this whole worker exists for. An
+            # ffmpeg that reported success and wrote nothing has taken the track
+            # with it: the mp4 was built with -sn, so there is no other copy.
+            missing.append(os.path.basename(sc.hidden))
+            continue
+        try:
+            with open(sc.hidden, encoding="utf-8", errors="replace") as f:
+                has_events = core.has_subtitle_events(f.read())
+        except OSError as e:
+            # A sidecar ffmpeg really wrote but that cannot be read back -
+            # ESTALE or EIO on a NAS - used to land in neither list, so the
+            # loud branch below never fired and the job reported success. The
+            # mp4 was built with -sn, so that track ended up neither embedded
+            # nor on disk. Unreadable counts as missing: same loud path.
+            log.warning("job %s: could not read back %s: %s", job_id[:8], sc.hidden, e)
+            missing.append(os.path.basename(sc.hidden))
+            continue
+        if has_events:
+            written.append(sc)
+        else:
+            # An empty track is one ffmpeg wrote a header for and nothing else.
+            # Revealed, it becomes a subtitle Jellyfin offers and that plays
+            # nothing, which reads as a broken file rather than an absent track.
+            drop_sidecars([sc])
+    if missing:
+        # Every planned name rather than only the readable ones: the source is
+        # untouched at this point, so nothing here is the only copy of anything,
+        # and one left behind is what the staging guard above has to clear later.
+        drop_sidecars(sidecars)
+        return [], "; ".join(notes), "subtitles could not be extracted: nothing was written for " + ", ".join(missing)
+    # What actually landed is counted by the caller, after the reveal: a sidecar
+    # written here and never revealed is not a subtitle anybody has.
+    return written, "; ".join(notes), ""
+
+
+def drop_sidecars(sidecars: list[core.Sidecar]) -> None:
+    """Unlink every hidden sidecar. Every path out of a job that does not reveal.
+
+    A leftover hidden .srt is invisible to the media server and ineligible for
+    the watcher, so nothing breaks - but nothing cleans it up either, and a file
+    that fails the same way every six hours would leave one every time.
+    """
+    for sc in sidecars:
+        try:
+            os.unlink(sc.hidden)
+        except OSError:
+            pass
+
+
+def reveal_sidecars(sidecars: list[core.Sidecar],
+                    expected: dict[str, tuple | None]) -> tuple[list[core.Sidecar], list[str]]:
+    """Unhide the sidecars, immediately BEFORE the video's own reveal.
+    (revealed, notes).
+
+    Before and not after: the moment a media server can see
+    `Show - S01E01.mp4` it can also see `Show - S01E01.eng.srt`, and revealing
+    the video first left a window in which a scan could catch the film without
+    its subtitles and remember it that way. This order has no such window - a
+    subtitle beside a film that is not there yet is offered to nobody.
+
+    Whatever already holds a visible name goes through displace(), against the
+    identity `expected` recorded before the encode. The previous conversion's
+    own sidecar is moved to the trash with the same retention a replaced source
+    gets; a file that arrived while this job ran - Bazarr downloading a subtitle
+    is the ordinary case - is left exactly where it is, because this worker does
+    not destroy a file it did not write. Every one of those decisions comes back
+    as a note: a file moved that nobody is told about is a file nobody restores.
+    """
+    revealed, notes = [], []
+    for sc in sidecars:
+        name = os.path.basename(sc.visible)
+        try:
+            if file_identity(sc.visible) is not None:
+                moved = displace(sc.visible, expected.get(sc.visible))
+                if not moved:
+                    os.unlink(sc.hidden)
+                    notes.append(f"{name} was written by something else while this job ran - "
+                                 "left alone, and that track is still in the trashed source")
+                    continue
+                notes.append(f"replaced the subtitle already at {name} - the previous one is at {moved}")
+            os.replace(sc.hidden, sc.visible)
+            revealed.append(sc)
+        except OSError as e:
+            # Deliberately NOT unlinked. This runs after the source has gone to
+            # the trash, so the hidden file is the only copy of that track
+            # outside it, and dropping it here would be the one destructive
+            # thing this function could do. It is named instead - a leftover
+            # nothing references is a leftover nobody finds - and the staging
+            # guard in extract_sidecars clears it on the next conversion of this
+            # name, which is the only moment the source of those tracks is back
+            # on disk and clearing it is safe.
+            log.warning("could not reveal the subtitle file %s: %s", sc.visible, e)
+            notes.append(f"{name} could not be revealed: {e} - it is staged at {sc.hidden}")
+    return revealed, notes
+
+
 def trash(source: str, job_id: str | None = None) -> str:
     """The source is never deleted - it outlives its replacement in the trash.
 
@@ -1007,6 +1210,41 @@ def displace(visible: str, expected: tuple | None) -> str:
     if not expected or file_identity(visible) != expected:
         return ""
     return trash(visible)
+
+
+def existing_sidecars(video: str) -> list[str]:
+    """Every subtitle file sitting beside `video` right now, by core's rule.
+
+    Handed a hidden name it finds the hidden sidecars and only those, because
+    the leading dot is part of the stem it matches on - which is what boot
+    cleanup wants and what keeps this off the visible ones.
+    """
+    directory = os.path.dirname(video)
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    return sorted(os.path.join(directory, n) for n in names if core.is_sidecar_of(video, n))
+
+
+def displace_sidecars(visible: str, expected: dict[str, tuple | None]) -> list[str]:
+    """Move the subtitles of the file being displaced into the trash with it.
+
+    A subtitle is named for the video it belongs to, so one left behind does not
+    become an orphan - it reattaches to whatever takes that name next. The
+    previous conversion's German track beside a new file that has no German in
+    it is worse than a missing subtitle, because nothing about it looks wrong.
+
+    Same identity rule as displace(), for the same reason: only a file that was
+    already there when this job started is moved. One that arrived since is
+    somebody else's - a Bazarr download, most often - and it stays.
+    """
+    notes = []
+    for path in existing_sidecars(visible):
+        moved = displace(path, expected.get(path))
+        if moved:
+            notes.append(f"the replaced file's subtitle {os.path.basename(path)} went with it, to {moved}")
+    return notes
 
 
 def displaced_note(replaced: str) -> str | None:
@@ -1496,6 +1734,19 @@ def _post_webhook(url: str, secret: str, payload: dict, job_id: str) -> None:
 def process(job: dict) -> None:
     conn = db()
     job_id, source = job["id"], job["path"]
+    # Bound before the try so the handler at the bottom can clean them up: a
+    # sidecar is written while the job is still in flight, and every exit that
+    # is not the reveal has to leave nothing hidden behind.
+    sidecars: list[core.Sidecar] = []
+    # Bound here too, because the handler reveals through it: the identities the
+    # sidecar names held at pre-flight are what keeps a reveal off a file this
+    # job did not write.
+    sidecar_targets: dict[str, tuple | None] = {}
+    subtitle_note = ""
+    # Set the moment the source moves to the trash, and read by the handler at
+    # the bottom: before it, a hidden sidecar is litter to clean up; after it,
+    # the same file is the only copy of that subtitle track there is.
+    trashed = ""
     # worker_loop already claimed this row as 'running' - conditionally, so the
     # claim and a concurrent cancel cannot both win.
 
@@ -1541,13 +1792,15 @@ def process(job: dict) -> None:
         # already there apart from one that arrived while we worked.
         existing_target = None if names.visible == source else file_identity(names.visible)
 
-        def occupied() -> str | None:
+        def occupied(staging: bool = True) -> str | None:
             """Whichever of our two write targets holds a file we must not touch.
 
             Called before the encode AND again immediately before every
             os.replace, because os.replace destroys the destination without a
             word and the pre-flight answer is hours stale by the time an encode
-            finishes.
+            finishes. `staging=False` past the staging replace, where
+            hidden_final holds this job's own verified output and the only
+            question left is who owns the visible name.
 
             The visible target may hold the file it held at pre-flight: that is
             the previous conversion of an episode that has just been imported
@@ -1561,7 +1814,7 @@ def process(job: dict) -> None:
             job, not a stale output, and displacing it would eat somebody
             else's pending work.
             """
-            if names.hidden_final != source and os.path.exists(names.hidden_final):
+            if staging and names.hidden_final != source and os.path.exists(names.hidden_final):
                 return f"staging name is taken: {names.hidden_final} - not overwriting"
             if names.visible != source and not core.may_replace_target(
                     existing_target, file_identity(names.visible)):
@@ -1594,17 +1847,40 @@ def process(job: dict) -> None:
                 # imports at the visible name inside that window loses its file
                 # to os.replace without a word - and unlike the source, what
                 # gets clobbered here never reaches the trash.
+                #
+                # After the displace and not before it: displace() returns ""
+                # both when there was nothing there and when it found a file it
+                # refuses to move, so its answer cannot be read as consent, and
+                # the move itself is a byte copy whenever the trash is on
+                # another filesystem. Asking on this side covers both, and a
+                # refusal here has still destroyed nothing - the file it moved
+                # aside is in the trash and named in the error.
+                replaced = displace(names.visible, existing_target)
                 taken = occupied()
                 if taken:
-                    return finish("failed", error=taken)
-                replaced = displace(names.visible, existing_target)
+                    return finish("failed", error="; ".join(filter(None, [
+                        taken, f"the file it replaced is in the trash at {replaced}" if replaced else ""])))
                 os.replace(source, names.visible)
                 finish("done", output=names.visible, warning=displaced_note(replaced),
                        src_bytes=src_bytes, out_bytes=src_bytes, progress=100)
                 return rescan_after(job_id, names.visible)
             return finish("done", output=source, warning="nothing to do", progress=100)
 
-        ok, warning, error = run_encode(job_id, source, names, src_probe)
+        # Read once, here, for both halves of one decision: run_encode builds
+        # the mp4 with -sn BECAUSE these tracks are going to sidecars. Read
+        # again after the encode, a setting turned off in between shipped a file
+        # with nothing embedded and nothing beside it.
+        extract = cfg()["extract_subtitles"]
+        # Planned before the encode, and sampled before it for the same reason
+        # existing_target is: whatever holds a sidecar name NOW is what this job
+        # may displace at the reveal. Anything else there by then arrived while
+        # the job ran and is not this worker's to move.
+        sidecar_plan, sidecar_skipped = (core.plan_sidecars(names, list(src_probe.subtitles))
+                                         if extract else ([], []))
+        sidecar_targets = ({path: file_identity(path) for path in existing_sidecars(names.visible)}
+                           if extract else {})
+
+        ok, warning, error = run_encode(job_id, source, names, src_probe, extract)
         if not ok:
             try:
                 os.unlink(names.part)
@@ -1659,6 +1935,32 @@ def process(job: dict) -> None:
                 pass
             return finish("failed", error=taken)
 
+        # Here, and not a line earlier or later: after every guard that can still
+        # throw this encode away, and while the source - the only copy of these
+        # subtitle tracks anywhere - is still where it has always been. Three
+        # lines down it goes to the trash.
+        if extract:
+            sidecars, subtitle_note, subtitle_error = extract_sidecars(
+                job_id, source, sidecar_plan, sidecar_skipped)
+            # Both guards again, on the far side of the extraction, because the
+            # extraction is a full demux of the source and may run for
+            # SUBTITLE_TIMEOUT over a NAS. occupied()'s rule is that it is
+            # re-asked immediately before EVERY os.replace, and the two below
+            # are no exception: an arr importing the upgrade lands on exactly
+            # those names, and what it wrote would be destroyed without even
+            # reaching the trash. Cancel is asked here too - it had been a
+            # no-op for the whole window, and the job trashed and replaced
+            # anyway. A failed extraction stops here as well: the mp4 has no
+            # subtitles in it, so shipping it would lose every track for good.
+            stop = subtitle_error or occupied() or ("cancelled" if _cancelled(job_id) else "")
+            if stop:
+                drop_sidecars(sidecars)
+                try:
+                    os.unlink(names.part)
+                except OSError:
+                    pass
+                return finish("cancelled" if stop == "cancelled" else "failed", error=stop)
+
         os.replace(names.part, names.hidden_final)      # hidden, complete, atomic
         # Flushed to disk BEFORE the source is trashed, not after. Until this
         # returns, the verified output exists only in the page cache of a NAS -
@@ -1670,7 +1972,48 @@ def process(job: dict) -> None:
         # rather than clobbered. Between the trash above and this one, both
         # copies of the episode outlive the swap by the full retention window.
         replaced = displace(names.visible, existing_target)
+        # The replaced file's own subtitles go to the trash with it. Left
+        # behind they are not orphans - they reattach to the film that has just
+        # taken that name.
+        sidecar_notes = displace_sidecars(names.visible, sidecar_targets) if replaced else []
+        # The guard's last word, and the one the reveal never had. Between the
+        # answer above and this line sit an fsync of the whole freshly written
+        # output (seconds to minutes over NFS) and two moves that are byte
+        # copies whenever the trash is on another filesystem - and displace()
+        # returns "" both when nothing was there and when it POSITIVELY found a
+        # stranger and refused to move it, so the reveal was reading "I did not
+        # touch anything" as consent to overwrite. Asked here rather than one
+        # line later because this is the last point at which refusing is still
+        # clean: past reveal_sidecars the subtitles are already visible.
+        #
+        # Refusing costs a staged output and a trashed source, both named in
+        # the error. Replacing costs a file this worker did not write, and
+        # unlike the source it would not even reach the trash.
+        #
+        # ponytail: what is left unguarded is reveal_sidecars, which is a
+        # handful of renames of small files - microseconds against the minutes
+        # this closes, and no check-then-replace can ever close the last of it
+        # anyway. Move this below the reveal only if the sidecars ever learn to
+        # hide themselves again on the way out.
+        taken = occupied(staging=False)
+        if taken:
+            return finish("failed", error="; ".join(filter(None, [
+                taken,
+                f"the converted file is staged at {names.hidden_final}",
+                f"the source is in the trash at {trashed}",
+                f"the replaced file is in the trash at {replaced}" if replaced else "",
+                ("the extracted subtitles are staged at "
+                 + ", ".join(sc.hidden for sc in sidecars)) if sidecars else "",
+            ])))
+        # Revealed BEFORE the video, so there is no window in which a scan sees
+        # the film without its subtitles and remembers it that way.
+        revealed, reveal_notes = reveal_sidecars(sidecars, sidecar_targets)
         os.replace(names.hidden_final, names.visible)    # the reveal
+        if sidecar_plan:
+            # Counted from what actually landed rather than from what was
+            # written: the job used to claim files that the reveal never got to.
+            sidecar_notes.append(
+                f"extracted {len(revealed)} subtitle file{'' if len(revealed) == 1 else 's'}")
         # Both of these are in the trash now, where nothing reads them, and
         # between them they are most of what this job put in the page cache.
         release_page_cache(trashed, replaced)
@@ -1681,7 +2024,8 @@ def process(job: dict) -> None:
         finish(
             "done",
             output=names.visible,
-            warning="; ".join(filter(None, [warning, displaced_note(replaced)])) or None,
+            warning="; ".join(filter(None, [warning, subtitle_note, *sidecar_notes, *reveal_notes,
+                                            displaced_note(replaced)])) or None,
             src_bytes=src_bytes,
             out_bytes=out_bytes,
             progress=100,
@@ -1693,6 +2037,31 @@ def process(job: dict) -> None:
         rescan_after(job_id, names.visible)
     except Exception as e:  # noqa: BLE001
         log.exception("job %s crashed", job_id[:8])
+        # Anything already extracted belongs to a reveal that did not happen -
+        # unless the source has already gone to the trash, in which case these
+        # hidden files are the only copy of those tracks anywhere and unlinking
+        # them is the one destructive thing this handler could do.
+        #
+        # Past the trash they are REVEALED rather than merely kept. Keeping them
+        # left them hidden and referenced by nothing: the watcher then finds the
+        # staged .mp4, queues it as a reveal job and unhides the film WITHOUT
+        # them, so the subtitles are stranded invisible for good. Revealing here
+        # is the simpler of the two fixes - the other is recording their paths
+        # for a recovery path that would have to reveal them anyway - and it is
+        # the safe one: reveal_sidecars keeps its own identity check, so a name
+        # that belongs to somebody else is still left alone, and a subtitle
+        # beside a film that is not visible yet is offered to nobody.
+        if not trashed:
+            drop_sidecars(sidecars)
+        elif sidecars:
+            log.warning("job %s: source already trashed - revealing the extracted subtitles",
+                        job_id[:8])
+            try:
+                revealed, _notes = reveal_sidecars(sidecars, sidecar_targets)
+                log.warning("job %s: revealed %s", job_id[:8],
+                            ", ".join(sc.visible for sc in revealed) or "nothing")
+            except Exception:  # noqa: BLE001 - already in the crash handler
+                log.exception("job %s: could not reveal the extracted subtitles", job_id[:8])
         finish("failed", error=f"internal: {e}")
     finally:
         # The success path hands back the output and both trashed files above.
@@ -2133,6 +2502,58 @@ REPLACEMENT_POLL_SECONDS = 20
 REPLACEMENT_GIVE_UP_DAYS = 14
 
 
+def _forget_replacements() -> None:
+    """Drop the poll cache so the next read goes back to the table.
+
+    A dismissal that only deleted the row would leave the card showing it for
+    up to REPLACEMENT_POLL_SECONDS, which reads as a button that did nothing.
+    """
+    global _REPLACEMENTS  # noqa: PLW0603
+    _REPLACEMENTS = (0.0, [])
+
+
+def _clear_unresolvable(conn: sqlite3.Connection) -> int:
+    """Delete the waiting rows nothing left in this system can ever resolve.
+
+    A row is normally cleared by a later successful conversion OF THAT EXACT
+    PATH, which is the honest signal - and it is the only one, so a row whose
+    world moved underneath it waits forever. Two cases, both deliberately
+    narrow. A row that might still be waiting legitimately is left exactly
+    where it is: dismissing one of those is a button, not a heuristic.
+
+    1. The arr connection was deleted. Nothing can report on that download any
+       more and nothing can deliver it, so the row is a permanent "searching".
+    2. The file is gone from where it was AND a file of that exact name has
+       since converted successfully somewhere else. Both halves are required:
+       a missing path on its own is an unmounted share, and a same-named
+       conversion on its own is a second copy of the episode in another
+       library while this one is still genuinely waiting.
+    """
+    live = {a["id"] for a in store.list_arrs(conn, redact=False)}
+    gone = []
+    for row in conn.execute("SELECT path, arr_id, arr_name, at FROM replacements").fetchall():
+        if row["arr_id"] and row["arr_id"] not in live:
+            gone.append((row["path"], f"the {row['arr_name']} connection was deleted"))
+            continue
+        if os.path.exists(row["path"]):
+            continue
+        # ponytail: a scan of the jobs finished since the request, not an index
+        # on the basename. It runs only for a row whose file is already
+        # missing, at most once per poll interval - index it if a long history
+        # ever makes this show up.
+        name = os.path.basename(row["path"])
+        elsewhere = next((j["path"] for j in conn.execute(
+            "SELECT path FROM jobs WHERE state='done' AND created > ?", (row["at"],)).fetchall()
+            if j["path"] != row["path"] and os.path.basename(j["path"]) == name), None)
+        if elsewhere:
+            gone.append((row["path"], f"it converted at {elsewhere}"))
+    for path, why in gone:
+        log.info("stopped waiting on a replacement for %s: %s", path, why)
+    conn.executemany("DELETE FROM replacements WHERE path=?", [(p,) for p, _why in gone])
+    conn.commit()
+    return len(gone)
+
+
 def replacements_view() -> list[dict]:
     """Files waiting on an arr to deliver a better copy, and how that is going.
 
@@ -2153,9 +2574,11 @@ def replacements_view() -> list[dict]:
                  "SELECT r.path FROM replacements r JOIN jobs j ON j.path = r.path "
                  "WHERE j.state = 'done' AND j.created > r.at)")
     conn.commit()
+    _clear_unresolvable(conn)
     out = []
+    arrs = {a["id"]: a for a in store.list_arrs(conn, redact=False)}
     for row in conn.execute("SELECT * FROM replacements ORDER BY at DESC").fetchall():
-        arr = next((a for a in store.list_arrs(conn, redact=False) if a["id"] == row["arr_id"]), None)
+        arr = arrs.get(row["arr_id"])
         status = None
         if arr:
             try:
@@ -3007,6 +3430,21 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             return self._send(*((200, {"deleted": m.group(1)}) if store.delete_arr(db(), m.group(1))
                                 else (404, {"error": "no such connection"})))
+        if route == "/api/replacements":
+            # The path IS this row's id - it is the primary key - and it arrives
+            # in the query string because nothing else in do_DELETE reads a body.
+            # Stops this worker watching for the file and nothing else: the
+            # release stays blocklisted, and a download already running belongs
+            # to the arr rather than to us.
+            path = _query(self.path).get("path", "")
+            conn = db()
+            cur = conn.execute("DELETE FROM replacements WHERE path=?", (path,))
+            conn.commit()
+            if not cur.rowcount:
+                return self._send(404, {"error": "nothing is waiting on a replacement for that path"})
+            _forget_replacements()
+            log.info("dismissed the replacement watch on %s", path)
+            return self._send(200, {"dismissed": path})
         m = re.fullmatch(r"/jobs/([0-9a-f-]{36})", route)
         if not m:
             return self._send(404, {"error": "not found"})
