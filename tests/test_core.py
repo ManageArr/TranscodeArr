@@ -753,5 +753,57 @@ class JellyfinPathMap(unittest.TestCase):
         self.assertEqual(core.map_path("/media/Film.mp4", core.parse_path_map("/=/")), "/media/Film.mp4")
 
 
+class ChoosingAReplacementRelease(unittest.TestCase):
+    """Every release offered for a file we are waiting to replace is REJECTED,
+    because the unreadable file is still on disk and still meets the quality
+    profile. Real rejections from the live Sonarr are used verbatim here: a
+    rule that treats "rejected" as disqualifying produces an empty list every
+    single time, which is the feature not existing.
+    """
+
+    CUTOFF = "Existing file meets cutoff: WEB 1080p (WEBRip-1080p, WEBDL-1080p)"
+    NO_SEEDS = "Not enough seeders: 0. Minimum seeders: 1"
+
+    def rel(self, title, weight, rejections=(), allowed=True):
+        return {"title": title, "guid": "g-" + title, "release_weight": weight,
+                "rejections": list(rejections), "download_allowed": allowed}
+
+    def test_meeting_cutoff_is_the_rejection_this_exists_to_override(self):
+        self.assertTrue(core.overridable_only([self.CUTOFF]))
+        self.assertTrue(core.overridable_only([]))
+
+    def test_a_reason_about_the_release_itself_is_not_overridable(self):
+        self.assertFalse(core.overridable_only([self.NO_SEEDS]))
+        # Mixed counts as not overridable: the seeder problem is still real.
+        self.assertFalse(core.overridable_only([self.NO_SEEDS, self.CUTOFF]))
+
+    def test_best_skips_a_better_ranked_release_that_cannot_finish(self):
+        # Exactly the pair the live search returned for Malcolm S07E14: the
+        # arr ranked the dead torrent first, and grabbing it unattended would
+        # hold a queue slot for days and replace nothing.
+        dead = self.rel("dead", 0, [self.NO_SEEDS, self.CUTOFF])
+        good = self.rel("good", 1, [self.CUTOFF])
+        self.assertEqual(core.best_release([dead, good])["title"], "good")
+
+    def test_best_keeps_the_arrs_own_order_among_equals(self):
+        first = self.rel("first", 0, [self.CUTOFF])
+        second = self.rel("second", 1, [self.CUTOFF])
+        self.assertEqual(core.best_release([second, first])["title"], "first")
+
+    def test_nothing_qualifies_rather_than_grabbing_the_least_bad(self):
+        self.assertIsNone(core.best_release([self.rel("dead", 0, [self.NO_SEEDS])]))
+        self.assertIsNone(core.best_release([]))
+
+    def test_a_release_the_arr_will_not_download_is_never_best(self):
+        blocked = self.rel("blocked", 0, [self.CUTOFF], allowed=False)
+        self.assertIsNone(core.best_release([blocked]))
+        # ...but it is still LISTED, last, because a person may want to see it.
+        self.assertEqual([r["title"] for r in core.rank_releases([blocked, self.rel("ok", 5, [self.CUTOFF])])],
+                         ["ok", "blocked"])
+
+    def test_ranking_brings_the_overridable_ones_forward(self):
+        rows = [self.rel("seedless", 0, [self.NO_SEEDS]), self.rel("cutoff", 9, [self.CUTOFF])]
+        self.assertEqual([r["title"] for r in core.rank_releases(rows)], ["cutoff", "seedless"])
+
 if __name__ == "__main__":
     unittest.main()

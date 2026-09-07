@@ -121,7 +121,7 @@ def cfg() -> dict:
 # A constant compiled into the image cannot be overridden from outside it. Bump
 # it with the image tag: the release workflow refuses a tag that disagrees with
 # it, and a test refuses a Dockerfile that does.
-VERSION = "1.5.2"
+VERSION = "1.6.0"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -1616,6 +1616,86 @@ def awaiting_replacement(conn: sqlite3.Connection, path: str) -> bool:
     return False
 
 
+def auto_grab(client: arr_client.ArrClient, path: str, found: dict) -> str:
+    """Search for a replacement and take the best one, with nobody watching.
+
+    Only reached in `auto` mode, and it says what it did either way - this runs
+    inside the handler for a job that has ALREADY failed, so an indexer that is
+    slow or an arr that is down must produce a note, never an exception.
+
+    "Best" is core.best_release, which refuses anything rejected for a reason
+    about the release itself. That is the difference that matters when no one
+    is looking: overriding "existing file meets cutoff" is the intent here,
+    while grabbing a torrent with no seeders unattended is just a download that
+    never finishes and a queue slot held open for days.
+    """
+    try:
+        releases, error = client.search_releases(found["item_id"], found["episode_id"])
+        if error:
+            return f"automatic search failed: {error}"
+        pick = core.best_release(releases)
+        if pick is None:
+            return (f"searched, {len(releases)} release(s) offered, none worth grabbing unattended - "
+                    "pick one yourself on the Queue page")
+        ok, error = client.grab_release(pick["guid"], pick["indexer_id"])
+        if not ok:
+            return f"could not grab {pick['title']}: {error}"
+        return f"grabbed {pick['title']} from {pick['indexer']}"
+    except Exception as e:  # noqa: BLE001 - a job has already failed; this cannot add a crash to it
+        log.exception("automatic replacement search for %s failed", path)
+        return f"automatic search failed: {e}"
+
+
+def replacement_target(conn: sqlite3.Connection, path: str) -> tuple[dict | None, str]:
+    """Which arr owns this file and what a search for it needs, or (None, why).
+
+    The replacements row first when there is one: it already recorded the arr,
+    the item and the episode at blocklist time, and re-deriving them costs
+    three API calls per look. Otherwise every enabled arr is asked whether the
+    path falls under its root - which is what makes this work for a job that
+    merely FAILED, with no replacement ever requested for it.
+    """
+    row = conn.execute(
+        "SELECT arr_id, item_id, episode_id FROM replacements WHERE path=?", (path,)).fetchone()
+    if row is not None and row["item_id"] is not None:
+        arr = store.get_arr(conn, row["arr_id"])
+        if arr and arr["enabled"]:
+            return {"arr": arr, "item_id": row["item_id"], "episode_id": row["episode_id"],
+                    "title": os.path.basename(path)}, ""
+    notes = []
+    for arr in store.list_arrs(conn, redact=False):
+        if not arr["enabled"]:
+            continue
+        target, why = _client_for(arr).find_target(path)
+        if target is not None:
+            return {"arr": arr, **target}, ""
+        # "not under this connection's root" is the ordinary answer from every
+        # arr but one and is not worth showing; anything else is a real fault
+        # and is exactly what somebody staring at an empty list needs to read.
+        if "not under" not in why:
+            notes.append(why)
+    return None, "; ".join(n for n in notes if n) or "no linked arr owns this file"
+
+
+def grab_replacement(conn: sqlite3.Connection, path: str, guid: str, indexer_id: int) -> tuple[bool, str]:
+    """Ask the owning arr to download one release for this file.
+
+    Records nothing and deletes nothing. What happens next is the arr's: it
+    downloads, imports over the file, and the next scan sees a different file
+    at that path - which is the signal awaiting_replacement is already watching
+    for, so the wait clears and the new file converts without anything here
+    having to be told.
+    """
+    target, why = replacement_target(conn, path)
+    if target is None:
+        return False, why
+    ok, error = _client_for(target["arr"]).grab_release(guid, indexer_id)
+    if not ok:
+        return False, f"{target['arr']['name']}: {error}"
+    log.info("grabbed a replacement for %s from %s", path, target["arr"]["name"])
+    return True, f"{target['arr']['name']}: grabbed it - the arr will import it when the download finishes"
+
+
 def request_replacement(job_id: str, source: str, error: str) -> None:
     """Ask whichever arr owns an unreadable file to blocklist it and find another.
 
@@ -1659,6 +1739,11 @@ def request_replacement(job_id: str, source: str, error: str) -> None:
                      # while it is still the file the job just failed on.
                      identity_mark(file_identity(source))))
                 conn.commit()
+                # Only in auto mode, and only once the row above exists: if the
+                # grab lands before anything records what we are waiting for,
+                # the replacement arrives with nothing watching for it.
+                if cfg()["replacement_search"] == "auto":
+                    notes.append(auto_grab(_client_for(row), source, found))
             break   # one arr owns the file; asking the rest would be asking about somebody else's library
     if not notes:
         notes.append("no linked arr owns this file")
@@ -2283,7 +2368,7 @@ def scan_once(force: bool = False) -> dict:
     # Eligible, stable, and still not queued. Split by reason, because "nothing
     # new to convert" and "23 files are sitting out a cooldown you can override"
     # are different answers and only one of them means there is nothing to do.
-    cooling = pending = 0
+    cooling = pending = waiting = 0
     missing: list[str] = []
     # A candidate the stability window has not finished holding yet. Worth
     # counting separately: "found nothing to do" and "found six files that are
@@ -2363,6 +2448,13 @@ def scan_once(force: bool = False) -> dict:
                                 (resolved,)).fetchone()
                             if last and last["state"] in ("queued", "running"):
                                 pending += 1
+                            elif awaiting_replacement(conn, resolved):
+                                # Not cooling. A cooldown lapses on its own and
+                                # this does not: it ends when a different file
+                                # turns up, or when somebody dismisses the wait.
+                                # Reporting it as "held by the retry cooldown"
+                                # sends the reader off to wait for a clock.
+                                waiting += 1
                             else:
                                 cooling += 1
                 else:
@@ -2408,6 +2500,7 @@ def scan_once(force: bool = False) -> dict:
     store.purge_expired_sessions(conn)
     conn.commit()
     return {"queued": queued, "eligible": hidden_found, "settling": settling, "cooling": cooling,
+            "waiting_on_replacement": waiting,
             "already_queued": pending, "skipped_visible": visible_skipped,
             "missing_roots": missing, "at": now}
 
@@ -3033,7 +3126,11 @@ class Handler(BaseHTTPRequestHandler):
                     {"key": s.key, "kind": s.kind, "label": s.label, "help": s.help, "group": s.group,
                      # So the page renders a password field and sends the mask
                      # back untouched instead of a readable secret in a text box.
-                     "secret": s.secret, "env": s.env}
+                     "secret": s.secret, "env": s.env,
+                     # Empty for every kind but choice. The page renders a
+                     # select from exactly these, so a value the daemon would
+                     # refuse cannot be picked from the form in the first place.
+                     "choices": list(s.choices)}
                     for s in store.SPECS if not s.hidden
                 ],
                 # The one gate between effective() and a response body. Without
@@ -3471,6 +3568,47 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as e:
                 return self._send(400, {"error": str(e)})
             return self._send(201, {"arr": {**row, "api_key": "********"}})
+        if route in ("/api/replacements/search", "/api/replacements/grab"):
+            # Same containment guard the queue route uses. The path arrives from
+            # a caller, and neither of these should be a way to ask an arr about
+            # arbitrary points on the host filesystem.
+            ok, resolved = _resolve_job_path(str(body.get("path", "")))
+            if not ok:
+                return self._send(400, {"error": resolved})
+            conn = db()
+            if route == "/api/replacements/grab":
+                guid = str(body.get("guid", "")).strip()
+                try:
+                    indexer_id = int(body.get("indexer_id", body.get("indexerId")))
+                except (TypeError, ValueError):
+                    return self._send(400, {"error": "indexer_id must be a number"})
+                if not guid:
+                    return self._send(400, {"error": "guid is required"})
+                done, detail = grab_replacement(conn, resolved, guid, indexer_id)
+                return self._send(200 if done else 502, {"ok": done, "detail": detail})
+            target, why = replacement_target(conn, resolved)
+            if target is None:
+                return self._send(404, {"error": why})
+            # POST rather than GET because this really does go out to every
+            # indexer: it is slow, it is rate-limited upstream, and a GET would
+            # invite a page that refreshes it.
+            releases, error = _client_for(target["arr"]).search_releases(
+                target["item_id"], target["episode_id"])
+            if error:
+                return self._send(502, {"error": f"{target['arr']['name']}: {error}"})
+            ranked = core.rank_releases(releases)
+            best = core.best_release(releases)
+            return self._send(200, {
+                "path": resolved,
+                "arr": target["arr"]["name"],
+                "title": target.get("title") or os.path.basename(resolved),
+                "mode": cfg()["replacement_search"],
+                # The guid is the whole identity of a release to the arr, so it
+                # is what a Grab has to send back unchanged.
+                "best_guid": (best or {}).get("guid"),
+                "releases": ranked,
+            })
+
         if route == "/api/arrs/test":
             key = str(body.get("api_key", "")).strip()
             base = str(body.get("base_url", "")).strip().rstrip("/")

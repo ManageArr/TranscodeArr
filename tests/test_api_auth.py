@@ -592,6 +592,104 @@ class Tls(ApiCase):
         os.unlink(body["cert"])
         os.unlink(body["key"])
 
+class FindingAReplacementFromHere(ApiCase):
+    """The way out of a wait that the arr will never end on its own.
+
+    A blocklisted release does not make the arr look for another one: the
+    unreadable file is still on disk and still meets the quality profile, so
+    every search comes back "Existing file meets cutoff" and nothing is ever
+    grabbed. Overriding that by hand is what these two routes are for.
+    """
+
+    CUTOFF = "Existing file meets cutoff: WEB 1080p"
+
+    def releases(self):
+        return [
+            {"guid": "dead", "indexer_id": 1, "indexer": "A", "title": "dead.release", "size": 1,
+             "rejections": ["Not enough seeders: 0", self.CUTOFF], "download_allowed": True,
+             "release_weight": 0, "quality": "WEBDL-1080p"},
+            {"guid": "good", "indexer_id": 2, "indexer": "B", "title": "good.release", "size": 2,
+             "rejections": [self.CUTOFF], "download_allowed": True,
+             "release_weight": 1, "quality": "WEBDL-1080p"},
+        ]
+
+    def stub_arr(self, releases=None, grabbed=None, target=True):
+        """One enabled arr that owns everything and answers from memory."""
+        client = mock.Mock()
+        client.find_target.return_value = (
+            ({"item_id": 126, "episode_id": 10984, "title": "Show S01E01"}, "") if target
+            else (None, "Sonarr: no episode of Show has this file"))
+        client.search_releases.return_value = (releases if releases is not None else self.releases(), None)
+        client.grab_release.side_effect = lambda guid, ind: (grabbed.append((guid, ind)) or (True, "")
+                                                             if grabbed is not None else (True, ""))
+        return client
+
+    def search(self, path, client):
+        with mock.patch.object(main.store, "list_arrs",
+                               lambda conn, redact=True: [{"id": "a1", "name": "Sonarr", "enabled": 1}]), \
+             mock.patch.object(main, "_client_for", lambda row: client), \
+             mock.patch.object(main, "_resolve_job_path", lambda raw: (True, raw)):
+            return self.call("POST", "/api/replacements/search", {"path": path})
+
+    def test_the_list_comes_back_with_every_rejection_and_the_best_named(self):
+        status, body, _ = self.search("/media/TV/Show/.Show - S01E01.mkv", self.stub_arr())
+        self.assertEqual(status, 200)
+        titles = [r["title"] for r in body["releases"]]
+        self.assertEqual(titles, ["good.release", "dead.release"],
+                         "the overridable release must come first")
+        self.assertEqual(body["best_guid"], "good", "best must skip the seedless one")
+        self.assertIn(self.CUTOFF, body["releases"][0]["rejections"])
+        self.assertEqual(body["arr"], "Sonarr")
+
+    def test_nothing_qualifying_still_lists_what_was_offered(self):
+        only_dead = [dict(self.releases()[0])]
+        status, body, _ = self.search("/media/TV/Show/.Show - S01E01.mkv", self.stub_arr(only_dead))
+        self.assertEqual(status, 200)
+        self.assertIsNone(body["best_guid"], "a seedless torrent is not a best pick")
+        self.assertEqual(len(body["releases"]), 1, "but it is still shown, for a person to judge")
+
+    def test_a_file_no_arr_owns_says_so_rather_than_returning_nothing(self):
+        status, body, _ = self.search("/media/TV/Show/.Show - S01E01.mkv", self.stub_arr(target=False))
+        self.assertEqual(status, 404)
+        self.assertIn("no episode", body["error"])
+
+    def test_a_grab_sends_the_guid_untouched(self):
+        grabbed = []
+        client = self.stub_arr(grabbed=grabbed)
+        with mock.patch.object(main.store, "list_arrs",
+                               lambda conn, redact=True: [{"id": "a1", "name": "Sonarr", "enabled": 1}]), \
+             mock.patch.object(main, "_client_for", lambda row: client), \
+             mock.patch.object(main, "_resolve_job_path", lambda raw: (True, raw)):
+            status, body, _ = self.call("POST", "/api/replacements/grab", {
+                "path": "/media/TV/Show/.Show - S01E01.mkv",
+                "guid": "magnet:?xt=urn:btih:abc&dn=x", "indexer_id": 18})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(grabbed, [("magnet:?xt=urn:btih:abc&dn=x", 18)])
+
+    def test_a_grab_without_an_indexer_is_refused_before_any_arr_is_called(self):
+        client = self.stub_arr()
+        with mock.patch.object(main, "_resolve_job_path", lambda raw: (True, raw)), \
+             mock.patch.object(main, "_client_for", lambda row: client):
+            status, body, _ = self.call("POST", "/api/replacements/grab",
+                                        {"path": "/media/TV/x.mkv", "guid": "g"})
+        self.assertEqual(status, 400)
+        client.grab_release.assert_not_called()
+
+    def test_a_path_outside_the_media_roots_never_reaches_an_arr(self):
+        # Same containment guard the queue route uses: these routes must not be
+        # a way to ask an arr about arbitrary points on the host filesystem.
+        client = self.stub_arr()
+        with mock.patch.object(main, "_client_for", lambda row: client):
+            status, _body, _ = self.call("POST", "/api/replacements/search", {"path": "/etc/passwd"})
+        self.assertEqual(status, 400)
+        client.search_releases.assert_not_called()
+
+    def test_both_routes_need_a_token(self):
+        for route in ("/api/replacements/search", "/api/replacements/grab"):
+            status, _body, _ = self.call("POST", route, {"path": "/media/TV/x.mkv"}, token=None)
+            self.assertEqual(status, 401, route)
+
 
 if __name__ == "__main__":
     unittest.main()

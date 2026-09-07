@@ -165,6 +165,36 @@ def find_item(items: list[dict], arr_path: str) -> dict | None:
     return best
 
 
+def _release_view(r: dict) -> dict:
+    """One release, reduced to what a person choosing between them needs.
+
+    Not the raw arr object: that is fifty fields wide, carries three different
+    spellings of the episode numbering, and would make this API a passthrough
+    for whatever the next arr version decides to add. `rejections` is kept in
+    full and never summarised - it is the reason a release is refused, and
+    hiding it would leave somebody clicking Grab with no idea what they are
+    overriding.
+    """
+    quality = ((r.get("quality") or {}).get("quality") or {}).get("name") or ""
+    return {
+        "guid": r.get("guid") or "",
+        "indexer_id": r.get("indexerId"),
+        "indexer": r.get("indexer") or "",
+        "title": r.get("title") or "",
+        "size": r.get("size") or 0,
+        "age_days": r.get("age"),
+        "seeders": r.get("seeders"),
+        "leechers": r.get("leechers"),
+        "protocol": r.get("protocol") or "",
+        "quality": quality,
+        "custom_format_score": r.get("customFormatScore"),
+        "rejected": bool(r.get("rejected")),
+        "rejections": [str(x) for x in (r.get("rejections") or [])],
+        "download_allowed": bool(r.get("downloadAllowed", True)),
+        "release_weight": r.get("releaseWeight"),
+    }
+
+
 class ArrClient:
     """One arr, with its library list cached - a rescan should not re-download
     2,800 movies for every file that finishes."""
@@ -362,6 +392,65 @@ class ArrClient:
                 "error": record.get("errorMessage") or "",
             }
         return None
+
+    def find_target(self, worker_file: str) -> tuple[dict | None, str]:
+        """What a replacement search needs for this file: item, episode, title.
+
+        Resolved from the PATH rather than from the grab that produced the
+        file. A job can fail verification on a file whose grab the arr has
+        long since pruned from its history, or that was imported by hand and
+        never grabbed at all, and those are exactly the files somebody wants to
+        go looking for a replacement of. replace_bad_file needs the grab
+        because it blocklists it; a search does not.
+        """
+        item, arr_file = self._owning_item(worker_file)
+        if item is None:
+            return None, arr_file
+        if self.kind == "radarr":
+            return {"item_id": item.get("id"), "episode_id": None,
+                    "title": item.get("title") or str(item.get("id"))}, ""
+        res, error = _request(
+            "GET", f"{self.base_url}/api/v3/episode?seriesId={item.get('id')}&includeEpisodeFile=true",
+            self.api_key)
+        if error:
+            return None, f"{self.name}: {error}"
+        for ep in res or []:
+            if ((ep.get("episodeFile") or {}).get("path") or "") == arr_file:
+                return {"item_id": item.get("id"), "episode_id": ep.get("id"),
+                        "title": "%s S%02dE%02d" % (item.get("title") or "",
+                                                    ep.get("seasonNumber") or 0,
+                                                    ep.get("episodeNumber") or 0)}, ""
+        return None, f"{self.name}: no episode of {item.get('title')} has this file"
+
+    def search_releases(self, item_id: int, episode_id: int | None) -> tuple[list[dict], str | None]:
+        """Every release the indexers offer for this item, in the ARR's order.
+
+        The same call the arr's own Interactive Search makes, and the ordering
+        it returns is kept. This list is read beside that page, and a worker
+        that re-scored the results would disagree with it and have no way to
+        explain why.
+
+        Slow on purpose - it really does go out to every indexer - so nothing
+        calls it on a timer or from a view that refreshes.
+        """
+        q = f"episodeId={episode_id}" if episode_id is not None else f"movieId={item_id}"
+        res, error = _request("GET", f"{self.base_url}/api/v3/release?{q}", self.api_key)
+        if error:
+            return [], error
+        return [_release_view(r) for r in (res or [])], None
+
+    def grab_release(self, guid: str, indexer_id: int) -> tuple[bool, str]:
+        """Tell the arr to download one specific release, refusals and all.
+
+        This is a MANUAL grab and that is the whole point. Every release
+        offered for a file this worker is waiting on comes back rejected with
+        "Existing file meets cutoff", because the unreadable file is still on
+        disk and still satisfies the profile. The arr is not wrong to refuse -
+        it cannot see that the file is unplayable. A person can.
+        """
+        _, error = _request("POST", f"{self.base_url}/api/v3/release", self.api_key,
+                            {"guid": guid, "indexerId": indexer_id})
+        return (False, error) if error else (True, "")
 
     def rescan_for(self, worker_file: str) -> tuple[bool, str]:
         """Ask this arr to re-read the title that owns `worker_file`.

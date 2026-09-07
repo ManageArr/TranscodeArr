@@ -287,6 +287,22 @@ document.documentElement.dataset.theme=localStorage.theme||'dark'</script>
    else. Dismiss is for the rest: it stops this worker watching, and changes nothing on the arr.</p>
   <table id="awaittable"></table>
  </div>
+ <div class="card" id="searchcard" style="display:none">
+  <h2>Replacements for <span id="searchtitle"></span></h2>
+  <p class="hint">The same interactive search the arr's own page runs, in the order the arr ranked it.
+   <b>Expect everything to say rejected</b>, usually "Existing file meets cutoff": the unreadable file is
+   still on disk and still satisfies the quality profile, so the arr will not replace it on its own, and it
+   is not wrong - it cannot tell the file is unplayable. Grabbing one anyway is the point of this card, so
+   the reasons are shown in full rather than hidden. A reason about the RELEASE, like no seeders, is a
+   different thing and is worth reading before you override it. Nothing here deletes anything: the arr
+   downloads, imports over the file, and the next scan converts whatever it finds there.</p>
+  <div class="msg" id="searchmsg"></div>
+  <div class="row" style="margin-bottom:.8rem">
+   <button class="ghost" id="searchclose" data-searchclose="1">Close</button>
+   <span id="searchbest"></span>
+  </div>
+  <table id="searchtable"></table>
+ </div>
  <div class="card">
   <h2>Up next</h2>
   <p class="hint" id="queuehint">In the order they will run - one at a time, oldest first.</p>
@@ -727,7 +743,8 @@ function renderAwaiting(list){
     (r.note?`<div><code>${esc(r.note)}</code></div>`:'')+`</td>`+
     `<td>${esc(r.arr||'')}</td><td><code>${esc(r.release||'')}</code></td>`+
     `<td>${esc(ago(r.asked_at))}</td><td>${state}</td>`+
-    `<td><button class="ghost" data-dismiss="${esc(r.path)}">Dismiss</button></td></tr>`;
+    `<td><button class="ghost" data-find="${esc(r.path)}">Find a replacement</button> `+
+    `<button class="ghost" data-dismiss="${esc(r.path)}">Dismiss</button></td></tr>`;
   }).join('');
 }
 // The third way out of this card. The other two are the server's: the file
@@ -740,6 +757,69 @@ async function dismissReplacement(path){
    'already started keeps going.'))return;
  try{await api('/api/replacements?path='+encodeURIComponent(path),{method:'DELETE'});await refreshQueue();}
  catch(e){alert(e.message);}
+}
+// ---- finding a replacement -----------------------------------------------
+// Held outside the table so a Grab button can carry an INDEX rather than a
+// guid: a guid is a magnet URI hundreds of characters long, chosen by an
+// indexer, and the rule on the delegated handler above is that a data
+// attribute holds an id and never server-supplied text.
+let SEARCH={path:'',title:'',mode:'manual',releases:[],best:null};
+async function findReplacement(path,btn){
+ $('searchcard').style.display='';
+ $('searchtitle').textContent=path.split('/').pop();
+ $('searchtable').innerHTML='<tr><td>Asking every indexer - this takes a few seconds.</td></tr>';
+ $('searchbest').innerHTML='';
+ $('searchcard').scrollIntoView({block:'nearest'});
+ try{
+  const r=await api('/api/replacements/search',{method:'POST',body:JSON.stringify({path})});
+  SEARCH={path:r.path,title:r.title||'',mode:r.mode||'manual',releases:r.releases||[],best:r.best_guid||null};
+  $('searchtitle').textContent=SEARCH.title||path.split('/').pop();
+  renderSearch();
+ }catch(e){
+  SEARCH={path:'',title:'',mode:'manual',releases:[],best:null};
+  $('searchtable').innerHTML=`<tr><td>${esc(e.message)}</td></tr>`;
+ }
+}
+function renderSearch(){
+ const rs=SEARCH.releases;
+ // Only in best/auto mode, and only when something actually qualified. A
+ // button that is always there and sometimes says "nothing qualified" is a
+ // button people press to find out, which costs an indexer sweep every time.
+ $('searchbest').innerHTML=(SEARCH.mode!=='manual'&&SEARCH.best)
+   ?'<button data-grabbest="1">Grab best</button> <span class="hint">The arr\'s own top pick, '+
+    'skipping any refused for a reason about the release itself.</span>'
+   :(SEARCH.mode!=='manual'?'<span class="hint">Nothing here qualifies for an unattended grab.</span>':'');
+ if(!rs.length){$('searchtable').innerHTML='<tr><td>No indexer offered anything for this one.</td></tr>';return;}
+ $('searchtable').innerHTML='<tr><th>Release</th><th>Quality</th><th>Size</th><th>Age</th><th>Seed</th>'+
+  '<th>Indexer</th><th>Why the arr refused it</th><th></th></tr>'+
+  rs.map((r,i)=>{
+   const why=r.rejections.length?r.rejections.map(x=>esc(x)).join('<br>')
+     :'<span class="tag">the arr would take this</span>';
+   const blocked=!r.download_allowed;
+   return `<tr><td><code>${esc(r.title)}</code></td><td>${esc(r.quality||'')}</td>`+
+    `<td>${esc(gb(r.size||0))}</td><td>${r.age_days==null?'':esc(r.age_days+'d')}</td>`+
+    `<td>${r.seeders==null?'':esc(r.seeders)}</td><td>${esc(r.indexer||'')}</td>`+
+    `<td><small>${why}</small></td>`+
+    `<td>${blocked?'<span class="tag">not downloadable</span>'
+      :`<button class="ghost" data-grab="${i}">Grab</button>`}</td></tr>`;
+  }).join('');
+}
+async function grabRelease(i,btn){
+ const r=SEARCH.releases[i];
+ if(!r) return;
+ const worry=r.rejections.length?'\n\nThe arr refused this one:\n'+r.rejections.join('\n'):'';
+ if(!confirm('Grab this release?\n\n'+r.title+'\n'+gb(r.size||0)+' from '+r.indexer+worry+
+   '\n\nThe arr downloads it and imports it over the file. Nothing is deleted here.'))return;
+ try{
+  const res=await busy(btn,'Grabbing...',()=>api('/api/replacements/grab',
+    {method:'POST',body:JSON.stringify({path:SEARCH.path,guid:r.guid,indexer_id:r.indexer_id})}));
+  say('searchmsg',res.detail||'Grabbed it.');
+  await refreshQueue();
+ }catch(e){say('searchmsg',e.message,true);}
+}
+function grabBest(btn){
+ const i=SEARCH.releases.findIndex(r=>r.guid===SEARCH.best);
+ if(i>=0) grabRelease(i,btn);
 }
 const ago=t=>{
  const s=Math.max(0,Math.floor(Date.now()/1000-t));
@@ -812,6 +892,10 @@ document.addEventListener('click',e=>{
  if(!d) return;
  if(d.cancel) cancelJob(d.cancel);
  if(d.dismiss) dismissReplacement(d.dismiss);
+ if(d.find) findReplacement(d.find,e.target);
+ if(d.grab!==undefined) grabRelease(Number(d.grab),e.target);
+ if(d.grabbest) grabBest(e.target);
+ if(d.searchclose) $('searchcard').style.display='none';
  if(d.editarr){const a=ARRS.find(x=>x.id===d.editarr); if(a) editArr(a);}
  if(d.delarr){const a=ARRS.find(x=>x.id===d.delarr); if(a) deleteArr(a.id,a.name);}
  if(d.revoke){const t=KEYS.find(x=>x.id===d.revoke); if(t) revokeKey(t.id,t.name);}
@@ -880,6 +964,9 @@ async function scanNow(btn){
    // this button exists to remove.
    if(z.already_queued)bits.push(`${z.already_queued} already queued or running`);
    if(z.cooling)bits.push(`${z.cooling} held by the retry cooldown`);
+   // Said separately because it does not end on a clock: it ends when a
+   // different file lands, or when somebody dismisses the wait.
+   if(z.waiting_on_replacement)bits.push(`${z.waiting_on_replacement} waiting on a replacement`);
    if(z.settling)bits.push(`${z.settling} still settling (size has not held still yet)`);
    if(z.skipped_visible)bits.push(`${z.skipped_visible} skipped for not being dot-hidden`);
    if((z.missing_roots||[]).length)bits.push('watched folder missing in this container: '+z.missing_roots.join(', '));
@@ -920,7 +1007,9 @@ async function refreshJobs(){
    // negative the reader has to unpick to learn the file grew.
    const saved=sizeDelta(x.src_bytes,x.out_bytes);
    const stop=(x.state==='queued'||x.state==='running')
-     ?`<button class="ghost" data-cancel="${esc(x.id)}">Cancel</button>`:'';
+     ?`<button class="ghost" data-cancel="${esc(x.id)}">Cancel</button>`
+     :(x.state==='failed'
+       ?`<button class="ghost" data-find="${esc(x.path)}">Find a replacement</button>`:'');
    return `<tr><td class="${x.state}">${esc(x.state)}${x.kind==='reveal'?' <span class="tag">reveal</span>':''}</td>`+
     `<td>${esc(x.path.split('/').pop())}</td><td>${x.progress??''}</td><td>${esc(saved)}</td>`+
     `<td><code>${esc(x.error||x.warning||x.rescan||x.output||'')}</code></td><td>${stop}</td></tr>`;
@@ -1148,6 +1237,11 @@ function field(spec){
  else if(spec.secret){input=`<input type="password" data-key="${spec.key}" value="${esc(v)}" autocomplete="new-password">`;
   extra=v?' Saved. Leave the stars alone to keep it; empty the box to remove it.':'';}
  else if(spec.kind==='int') input=`<input type="number" data-key="${spec.key}" value="${esc(v)}">`;
+ // The collector below reads el.value, which a select answers exactly like an
+ // input, so nothing there needs to know this kind exists.
+ else if(spec.kind==='choice')
+   input=`<select data-key="${spec.key}">`+(spec.choices||[]).map(c=>
+     `<option value="${esc(c)}" ${v===c?'selected':''}>${esc(c)}</option>`).join('')+`</select>`;
  else if(spec.kind==='exts'||spec.kind==='patterns')
    input=`<textarea data-key="${spec.key}" placeholder="one per line">${esc((v||[]).join('\n'))}</textarea>`;
  else input=`<input type="text" data-key="${spec.key}" value="${esc(v)}">`;

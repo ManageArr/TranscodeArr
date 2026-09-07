@@ -1151,3 +1151,58 @@ def map_path(path: str, pairs: list[tuple[str, str]]) -> str | None:
         return None
     root, target = best
     return target + path[len(root):]
+
+# ---------------------------------------------------------------------------
+# Choosing a replacement release
+# ---------------------------------------------------------------------------
+# Every release offered for a file this worker is waiting to replace comes back
+# REJECTED, and the reason is almost always "Existing file meets cutoff": the
+# unreadable file is still on disk and still satisfies the quality profile, so
+# the arr will not act on its own. It is not wrong to refuse - only a person
+# knows the file is bad. Overriding that refusal is the entire feature, so a
+# rejection cannot simply disqualify a release or the list is always empty.
+#
+# What must still disqualify one is a rejection about the RELEASE rather than
+# about the file we already have. "Not enough seeders" is a real reason not to
+# grab something; "meets cutoff" is the thing being overridden.
+_OVERRIDABLE = re.compile(r"cutoff|already have|existing file|upgrade", re.I)
+
+
+def overridable_only(rejections: list[str]) -> bool:
+    """True when every rejection is one an operator is entitled to override.
+
+    Empty rejections count: a release the arr would have taken anyway is
+    obviously fine to take deliberately.
+    """
+    return all(_OVERRIDABLE.search(r or "") for r in rejections or [])
+
+
+def rank_releases(releases: list[dict]) -> list[dict]:
+    """The arr's own ordering, with the ones worth overriding brought forward.
+
+    The ordering inside each group is `release_weight`, which is the ARR's
+    ranking index and not a score invented here. That matters: this list sits
+    beside the same search on the arr's own page, and a worker that re-scored
+    the results would disagree with it and be unable to say why.
+    """
+    def key(r: dict) -> tuple:
+        return (
+            0 if r.get("download_allowed", True) else 1,
+            0 if overridable_only(r.get("rejections") or []) else 1,
+            r.get("release_weight") if r.get("release_weight") is not None else 1 << 30,
+        )
+    return sorted(releases, key=key)
+
+
+def best_release(releases: list[dict]) -> dict | None:
+    """The one a Grab best button takes, or None when nothing qualifies.
+
+    Never returns a release the arr refuses to download at all, and never one
+    rejected for a reason that is about the release itself - those are the
+    cases where "best" would mean "least bad", and grabbing a dead torrent
+    unattended is worse than saying nothing qualified.
+    """
+    for r in rank_releases(releases):
+        if r.get("download_allowed", True) and overridable_only(r.get("rejections") or []):
+            return r
+    return None

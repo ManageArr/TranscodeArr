@@ -53,7 +53,7 @@ def is_within_any(path: str, roots: list[str]) -> bool:
 class Spec:
     key: str
     env: str
-    kind: str  # text | int | bool | paths | exts | patterns
+    kind: str  # text | int | bool | choice | paths | exts | patterns
     default: Any
     label: str
     help: str
@@ -62,6 +62,10 @@ class Spec:
     # on upgrade - but not shown, because a visible control that no longer does
     # anything is worse than no control at all.
     hidden: bool = False
+    # choice only: the allowed values, first one being the conservative default.
+    # Stored as the value, never the label - a saved setting that reads
+    # "Grab the best match" would be a sentence this code has to keep parsing.
+    choices: tuple[str, ...] = ()
     # Never leaves the container in readable form: masked in API responses and
     # left out of a config backup entirely. The daemon still reads the real
     # value through effective(), which is the only place it is needed.
@@ -166,6 +170,19 @@ SPECS: list[Spec] = [
          "blocklisted too, which is the only way the arr will stop handing that same pack back for this "
          "episode. Blocklisting a pack does not delete anything and does not touch the episodes already "
          "imported from it; it stops that release being grabbed again.", "Rules"),
+    Spec("replacement_search", "REPLACEMENT_SEARCH", "choice", "manual", "Finding a replacement",
+         "What TranscodeArr may do about a file it has failed on, when an arr owns it. Every job that "
+         "failed on the source offers Find a replacement, which runs the same interactive search the arr's "
+         "own page runs and lists what the indexers have. Expect every result to come back REJECTED, and "
+         "usually with 'Existing file meets cutoff': the unreadable file is still on disk and still "
+         "satisfies the quality profile, so the arr will not replace it on its own and is not wrong to "
+         "refuse - it cannot tell the file is unplayable. Overriding that is the point, so the rejections "
+         "are shown in full rather than filtered out. MANUAL lists the releases and grabs only the one you "
+         "click - nothing is ever chosen for you. BEST adds a button that takes the arr's own top-ranked "
+         "release, skipping any refused for a reason about the release itself, such as no seeders. AUTO "
+         "does that same pick by itself whenever a source is blocklisted, which starts downloads with "
+         "nobody watching - it is the only setting here that spends bandwidth on its own judgement.",
+         "Rules", choices=("manual", "best", "auto")),
     Spec("trash_keep_days", "TRASH_KEEP_DAYS", "int", 7, "Keep replaced sources (days)",
          "Replaced originals are moved to trash, never deleted outright. This is how long they survive. "
          "Raise it before a large batch - a source pruned mid-run is one you cannot get back. Lowering it "
@@ -377,6 +394,13 @@ def parse_value(spec: Spec, raw: Any, roots: list[str] | None = None) -> Any:
                 if roots and not is_within_any(p, roots):
                     raise ValueError(f"{p} is outside the media roots")
         return parts
+    if spec.kind == "choice":
+        v = ("" if raw is None else str(raw).strip()).lower()
+        if v not in spec.choices:
+            # Named in full rather than "invalid value": this is reachable from
+            # an env var, where there is no dropdown to pick from.
+            raise ValueError(f"{spec.label} must be one of {', '.join(spec.choices)}")
+        return v
     text = "" if raw is None else str(raw).strip()
     if text:
         if spec.key == "convert_window":

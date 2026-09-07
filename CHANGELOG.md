@@ -17,9 +17,71 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.5.2` is the release to run. Everything in the sections below is in it and is
+`1.6.0` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.6.0] - 2026-09-07
+
+### Added
+
+- **Find a replacement, from here.** Any job that failed now offers a search
+  against the arr that owns the file - the same interactive search the arr's
+  own page runs - and lists what the indexers have, in the order the arr
+  ranked them. Pick one, press Grab, and the arr downloads it and imports it
+  over the bad file.
+
+  This exists because blocklisting a release does not, on its own, bring you a
+  new file, and 1.5.2 made that impossible to miss by finally leaving those
+  files alone. Nothing here deletes media, so after a verification failure the
+  unreadable file is still on disk and the arr still counts the episode as
+  having one: `hasFile: true`, `qualityCutoffNotMet: false` - satisfied.
+  Blocklisting stops that release coming back; it does not make the arr want
+  anything. `Redownload Failed` does not apply either, because that is about a
+  download that never imported and this one imported cleanly weeks ago. On a
+  real library seven files waited this way, the oldest five days, with no
+  `grabbed` event ever following the blocklist.
+
+  **Expect every result to say rejected**, usually `Existing file meets
+  cutoff`. That is the arr correctly refusing to replace a file it cannot know
+  is unplayable, and overriding it is the whole point - so the rejections are
+  shown in full rather than filtered out. The distinction that matters is
+  shown too: a rejection about the file you already have is the one to
+  override, and one about the release itself - `Not enough seeders: 0` - is
+  not.
+
+  One new setting under Rules, **Finding a replacement**
+  (`REPLACEMENT_SEARCH`), decides how far that goes:
+
+  | Mode | What it may do |
+  | --- | --- |
+  | `manual` (default) | Lists releases. Grabs only the one you click. |
+  | `best` | Adds a Grab best button: the arr's top-ranked release, skipping any refused for a reason about the release itself. |
+  | `auto` | Makes that same pick by itself whenever a source is blocklisted. |
+
+  `auto` is the only setting in this project that spends bandwidth on its own
+  judgement, so it is not the default, and even there it never takes a release
+  rejected for a reason about the release - "best" would then mean "least
+  bad", and a seedless torrent grabbed unattended is a queue slot held open
+  for days and a replacement that never arrives.
+
+  The ordering is the arr's own `releaseWeight` and is deliberately not
+  re-scored here: this list is read beside the same search on the arr's page,
+  and a worker that invented its own ranking would disagree with it and have
+  no way to explain why.
+
+  Grabbing records nothing on this side and needs no follow-up. The arr
+  imports over the file, the next scan sees a different file at that path,
+  and that is already the signal 1.5.2 watches for - so the wait clears itself
+  and the new file converts.
+
+### Fixed
+
+- **A scan no longer calls a replacement wait a retry cooldown.** Files held
+  back by 1.5.2 were counted as "held by the retry cooldown", which sends the
+  reader off to wait for a clock that is never going to run out. A cooldown
+  lapses on its own; this ends when a different file lands or when somebody
+  dismisses it, so the scan reports it separately and says so.
 
 ## [1.5.2] - 2026-09-07
 

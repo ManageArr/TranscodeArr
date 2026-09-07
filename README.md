@@ -762,6 +762,55 @@ have, which is why this is a switch and not a default.
 An unclassified release is treated as the broad case on purpose: unknown is not
 the same as safe when the consequence is retiring somebody's release.
 
+
+#### Blocklisting alone does not bring you a new file
+
+This is the part that surprises people, and it is worth stating plainly because
+the setting above reads like it finishes the job. It does not.
+
+Nothing here deletes your media, so after a source fails verification the
+unreadable file is **still on disk** and the arr still counts the episode as
+having a file. Ask Sonarr about it and it says `hasFile: true` and
+`qualityCutoffNotMet: false` - satisfied. Blocklisting the release stops that
+release being handed back; it does not make the arr want anything. `Redownload
+Failed` does not help either: that is about a download that never imported, and
+this one imported cleanly weeks ago. On a real library seven files sat waiting
+this way, the oldest for five days, with no `grabbed` event ever following the
+blocklist.
+
+So the wait can be indefinite by construction, and that is what **Finding a
+replacement** (`REPLACEMENT_SEARCH`) exists to end.
+
+Any job that failed offers **Find a replacement**, which runs the same
+interactive search the arr's own page runs and lists what the indexers have,
+in the order the arr ranked them. Expect every result to come back **rejected**,
+usually `Existing file meets cutoff` - that is the arr correctly refusing to
+replace a file it has no way of knowing is unplayable. Overriding that refusal
+is the entire feature, so the rejections are shown in full rather than filtered
+out: a reason about the file you already have is the one to override, and a
+reason about the release itself, like `Not enough seeders: 0`, is not.
+
+| Mode | What it may do |
+| --- | --- |
+| `manual` (default) | Lists releases. Grabs only the one you click. Nothing is ever chosen for you. |
+| `best` | Adds a **Grab best** button: the arr's own top-ranked release, skipping any refused for a reason about the release itself. |
+| `auto` | Makes that same pick by itself whenever a source is blocklisted. |
+
+`auto` is the only setting in this project that spends bandwidth on its own
+judgement, so it is not the default and it never grabs something rejected for a
+reason about the release - "best" there would mean "least bad", and a torrent
+with no seeders grabbed unattended is a queue slot held open for days.
+
+The ranking is the arr's own (`releaseWeight`) and is deliberately not
+re-scored here. This list is read beside the same search on the arr's page, and
+a worker that invented its own order would disagree with it and be unable to
+say why.
+
+Grabbing changes nothing on this side. The arr downloads, imports over the
+file, and the next scan sees a **different file at that path** - which is
+exactly what the wait is watching for, so it clears itself and the new file
+converts without anything here being told.
+
 ### When the name is already taken
 
 A conversion of `.Show - S01E01.mkv` wants to end up at `Show - S01E01.mp4`. It
