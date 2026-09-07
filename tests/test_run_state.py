@@ -7,6 +7,7 @@ cannot be delivered is a log line and not a failed conversion.
 
 import os
 import socket
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -221,7 +222,11 @@ class Drain(RunStateCase):
         main.set_run_state(True)
         claimed = self.worker_pass()
         self.assertEqual([j["id"] for j in claimed], [job_id])
-        self.assertEqual(self.state(job_id), "running")
+        # The claim is what this test is about, and that is the line above.
+        # 'failed' rather than 'running' because process() is mocked out here:
+        # it returns without recording anything, and a worker that has stopped
+        # working on a job no longer leaves the row claiming to be an encode.
+        self.assertEqual(self.state(job_id), "failed")
 
     def test_a_shut_window_holds_the_claim_and_the_open_one_releases_it(self):
         store.save_settings(main.db(), {"convert_window": "22:00-06:00"})
@@ -584,6 +589,67 @@ class JellyfinRefresh(RunStateCase):
         self.assertEqual(posted, [])
         self.assertTrue(self.rescan(job_id).startswith("jellyfin: "), self.rescan(job_id))
 
+
+class AWorkerThatOutlivesItsJob(RunStateCase):
+    """The two ways a worker used to be lost for the life of the container.
+
+    Both were seen live on 2026-09-05: one progress UPDATE lost its race, and
+    the job it belonged to read "converting" for two and a half days while that
+    worker failed to claim anything, once every five seconds, forever.
+    """
+
+    def setUp(self):
+        super().setUp()
+        with main._jobs_lock:
+            main._running.clear()
+        self.addCleanup(main._running.clear)
+
+    def queue(self, job_id):
+        conn = main.db()
+        conn.execute("INSERT INTO jobs (id, path, state, kind, created) VALUES (?,?,?,?,?)",
+                     (job_id, "/media/Movies/.%s.mkv" % job_id, "queued", "transcode", time.time()))
+        conn.commit()
+        return job_id
+
+    def pass_with(self, process):
+        with mock.patch.object(main, "time", _StopAtSleep()),                 mock.patch.object(main, "process", process):
+            with self.assertRaises(LoopStop):
+                main.worker_loop()
+
+    def test_a_job_whose_terminal_write_never_landed_is_not_left_running(self):
+        # process() that records nothing: the shape of a crash handler whose own
+        # finish() write failed on the same connection that had just failed.
+        self.queue("orphan")
+        self.pass_with(lambda _job: None)
+        self.assertEqual(self.state("orphan"), "failed",
+                         "a job the worker stopped working on is still claimed to be running")
+
+    def test_a_worker_can_still_claim_after_a_write_left_a_transaction_open(self):
+        # Exactly the live failure. A statement that raises still leaves
+        # sqlite3's implicit transaction open, and once ANOTHER connection has
+        # committed, that stale snapshot can no longer be upgraded to a write -
+        # SQLITE_BUSY, returned instantly, so busy_timeout never waits it out.
+        self.queue("poisons")
+
+        def leave_it_open(_job):
+            main.db().execute("UPDATE jobs SET progress=1 WHERE id=?", ("poisons",))  # no commit
+
+        self.pass_with(leave_it_open)
+        self.assertFalse(main.db().in_transaction, "the worker's connection is still mid-transaction")
+
+        # A second connection commits the next job. This is what makes a stale
+        # snapshot fatal rather than merely stale: the worker cannot see this
+        # row at all while pinned, and cannot write if it tries.
+        other = sqlite3.connect(main.DB_PATH, timeout=5)
+        other.execute("INSERT INTO jobs (id, path, state, kind, created) VALUES (?,?,?,?,?)",
+                      ("after", "/media/Movies/.after.mkv", "queued", "transcode", time.time()))
+        other.commit()
+        other.close()
+
+        claimed = []
+        self.pass_with(claimed.append)
+        self.assertEqual([j["id"] for j in claimed], ["after"],
+                         "the worker never claimed again after one lost write")
 
 if __name__ == "__main__":
     unittest.main()

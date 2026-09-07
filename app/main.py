@@ -121,7 +121,7 @@ def cfg() -> dict:
 # A constant compiled into the image cannot be overridden from outside it. Bump
 # it with the image tag: the release workflow refuses a tag that disagrees with
 # it, and a test refuses a Dockerfile that does.
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -808,12 +808,29 @@ def run_encode(job_id: str, source: str, names: core.JobNames, src_probe: core.P
                     return
 
         threading.Thread(target=watchdog, daemon=True).start()
+        shown = -1
         for line in proc.stdout or []:
             heartbeat[0] = time.time()
             pct = core.parse_progress(line, src_probe.duration)
-            if pct is not None:
-                conn.execute("UPDATE jobs SET progress=? WHERE id=?", (pct, job_id))
-                conn.commit()
+            # Only when the integer percent actually moves. ffmpeg reports twice
+            # a second however long the encode runs, so writing every report
+            # committed ~4,800 times across a 40-minute episode to publish 100
+            # distinct numbers - eight workers doing that is what made a write
+            # eventually lose its race, and losing it here used to kill the job.
+            if pct is not None and pct != shown:
+                shown = pct
+                try:
+                    conn.execute("UPDATE jobs SET progress=? WHERE id=?", (pct, job_id))
+                    conn.commit()
+                except sqlite3.Error:
+                    # A percentage for the UI is not worth a finished encode.
+                    # The rollback is the point: sqlite3 opens the transaction
+                    # implicitly, a failed statement leaves it OPEN, and this
+                    # connection belongs to a worker thread that lives forever -
+                    # so one lost race here used to pin the WAL and wedge that
+                    # worker permanently. See run_encode's caller for the rest.
+                    conn.rollback()
+                    log.debug("job %s: dropped a progress update", job_id[:8], exc_info=True)
             if _cancelled(job_id):
                 proc.terminate()
         try:
@@ -2037,6 +2054,12 @@ def process(job: dict) -> None:
         rescan_after(job_id, names.visible)
     except Exception as e:  # noqa: BLE001
         log.exception("job %s crashed", job_id[:8])
+        # Before anything else touches this connection. If we got here from a
+        # failed write, sqlite3's implicit transaction is still open, and every
+        # statement below - finish() above all - fails the same way on the same
+        # connection. That is how a crashed job stayed 'running' for two and a
+        # half days: the handler meant to mark it failed could not write either.
+        conn.rollback()
         # Anything already extracted belongs to a reveal that did not happen -
         # unless the source has already gone to the trash, in which case these
         # hidden files are the only copy of those tracks anywhere and unlinking
@@ -2124,8 +2147,32 @@ def worker_loop() -> None:
             finally:
                 with _jobs_lock:
                     _running.pop(row["id"], None)
+                # The one place that knows this job is over however it ended.
+                # process() records its own terminal state, but the write that
+                # does so can lose a race like any other, and a row left
+                # 'running' is then invisible to every retry path there is: the
+                # boot reconcile is the only thing that ever clears it, the
+                # watcher counts the file as pending and never re-queues it, and
+                # the queue page reports an encode that stopped days ago.
+                conn.rollback()
+                stuck = conn.execute(
+                    "UPDATE jobs SET state='failed', finished=?, error=? WHERE id=? AND state='running'",
+                    (time.time(), "the worker stopped without recording a result", row["id"]),
+                )
+                conn.commit()
+                if stuck.rowcount:
+                    log.warning("job %s ended without recording a result - marked failed", row["id"][:8])
         except Exception:  # noqa: BLE001
             log.exception("worker loop error")
+            # Same rule as process()'s crash handler, and the reason this thread
+            # could spin forever: a failed write leaves sqlite3's implicit
+            # transaction OPEN, this thread keeps its connection for the life of
+            # the process, and the next claim then fails identically every time.
+            # Instantly, too - a stale snapshot is not something busy_timeout
+            # waits out - and the open read stops the WAL ever checkpointing, so
+            # it grows without bound until every other writer is slow enough to
+            # start losing races of its own.
+            db().rollback()
             time.sleep(5)
 
 
@@ -2339,6 +2386,10 @@ def watch_loop() -> None:
             prune_trash()
         except Exception:  # noqa: BLE001
             log.exception("scan failed")
+            # The watcher is the other thread that outlives every job, and
+            # scan_once holds a transaction open per directory on purpose - so a
+            # walk that dies mid-directory is exactly the shape that strands one.
+            db().rollback()
         time.sleep(max(15, cfg()["scan_interval_seconds"]))
 
 

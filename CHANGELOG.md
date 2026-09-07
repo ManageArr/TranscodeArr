@@ -17,9 +17,61 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.5.0` is the release to run. Everything in the sections below is in it and is
+`1.5.1` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.5.1] - 2026-09-07
+
+### Fixed
+
+- **A job that lost one database race stopped being an encode that never
+  ends.** On the live box a conversion read "converting" for two days and
+  fourteen hours while nothing was encoding it, and one of the eight worker
+  threads had been dead for exactly as long. Both were the same lost write.
+
+  `run_encode` recorded progress on every line ffmpeg emitted - twice a second,
+  committed each time, about 4,800 writes across a forty-minute episode to
+  publish a hundred distinct numbers, times eight workers, beside the watcher
+  and every HTTP thread. Eventually one of those writes lost its race and
+  raised `database is locked`. `sqlite3` opens the transaction implicitly, so a
+  statement that raises leaves it **open**, and nothing rolled it back.
+
+  Everything after that followed from the one open transaction. The crash
+  handler ran `finish("failed")` on the same poisoned connection, so it failed
+  the same way and the row was never marked terminal - which is the job that
+  read "converting" for two and a half days. The watcher counts such a file as
+  already pending, so it is never queued again; the boot reconcile was the only
+  thing that would ever have cleared it. The stale read then pinned the WAL: a
+  checkpoint could reclaim 755 of 96,271 frames, so a 4.5 MB database was
+  carrying a 396 MB write-ahead log that had not checkpointed since the minute
+  of the crash, and every reader was paying for it. And the worker itself was
+  finished: a stale snapshot cannot be upgraded to a write, SQLite answers
+  `SQLITE_BUSY` immediately rather than waiting out `busy_timeout`, so that
+  thread failed to claim once every five seconds, 19,843 times, and would have
+  gone on failing for the life of the container.
+
+  Four things changed, none of them large:
+
+  - Progress is written only when the integer percent actually moves, which is
+    the difference between ~4,800 writes an encode and ~100.
+  - A progress write that fails now rolls back and is dropped. A percentage for
+    the UI is not worth a finished encode.
+  - The crash handler rolls back **before** it does anything else, so the
+    `finish("failed")` that follows can land.
+  - `worker_loop` is the one place that knows a job is over however it ended.
+    If the row still says `running` when `process` returns, it is marked failed
+    there. A job stuck running forever is now structurally impossible rather
+    than merely unlikely.
+
+  The watcher guard rolls back for the same reason: it is the other thread that
+  outlives every job, and `scan_once` holds a transaction open per directory on
+  purpose, so a walk that dies mid-directory is exactly the shape that strands
+  one.
+
+  Nothing about this was visible from outside. `/healthz` answered `ok` for the
+  whole two and a half days, and the seven surviving workers kept converting,
+  which is what made a dead thread and a phantom job look like a slow queue.
 
 ## [1.5.0] - 2026-09-01
 
