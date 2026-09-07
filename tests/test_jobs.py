@@ -1316,5 +1316,68 @@ class ProbeThatNeverAnswered(JobCase):
         self.assertFalse(os.path.exists(core.plan_names(source).part))
 
 
+class AFileWaitingOnAReplacement(JobCase):
+    """The loop that made this rule: asking an arr for a replacement did not
+    stop the watcher re-queueing the unreadable file, so every retry cooldown
+    spent a whole GPU encode reaching the identical verification failure. Seven
+    files on the live box did that 58 times, one of them for five days.
+    """
+
+    def setUp(self):
+        super().setUp()
+        conn = main.db()
+        conn.execute("DELETE FROM replacements")
+        conn.commit()
+
+    def waiting_on(self, path, identity="sample"):
+        """A replacements row for `path`, stamped with what is on disk now."""
+        conn = main.db()
+        mark = main.identity_mark(main.file_identity(path)) if identity == "sample" else identity
+        conn.execute(
+            "INSERT OR REPLACE INTO replacements (path, arr_id, arr_name, kind, item_id, "
+            "episode_id, release, at, note, bad_identity) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (path, "a1", "Sonarr", "sonarr", 1, 2, "Some.Release-GRP", time.time(), "blocklisted", mark))
+        conn.commit()
+
+    def test_the_unreadable_file_is_not_queued_again(self):
+        source = self.write(".Bad.mkv", "unreadable")
+        self.waiting_on(source)
+        self.assertIsNone(main.enqueue(source, "transcode"))
+        self.assertEqual(main.db().execute(
+            "SELECT COUNT(*) FROM jobs WHERE path=?", (source,)).fetchone()[0], 0)
+
+    def test_pressing_check_for_files_does_not_override_it(self):
+        # force exists to skip the retry COOLDOWN, which is about timing. This
+        # is about a file already known to be unreadable, and asking sooner
+        # cannot change that answer.
+        source = self.write(".Bad.mkv", "unreadable")
+        self.waiting_on(source)
+        self.assertIsNone(main.enqueue(source, "transcode", force=True))
+
+    def test_the_replacement_arriving_clears_the_wait_and_converts_it(self):
+        source = self.write(".Bad.mkv", "unreadable")
+        self.waiting_on(source)
+        # A different file at the same path is the only signal that means the
+        # replacement landed. Not mtime: an arr import preserves the release's.
+        os.unlink(source)
+        source = self.write(".Bad.mkv", "a whole different download entirely")
+        job = main.enqueue(source, "transcode")
+        self.assertIsNotNone(job, "the replacement was refused as though it were the bad file")
+        self.assertEqual(main.db().execute(
+            "SELECT COUNT(*) FROM replacements WHERE path=?", (source,)).fetchone()[0], 0,
+            "the wait outlived the replacement it was waiting for")
+
+    def test_a_row_from_before_the_column_existed_still_blocks_and_is_stamped(self):
+        source = self.write(".Bad.mkv", "unreadable")
+        self.waiting_on(source, identity=None)
+        self.assertIsNone(main.enqueue(source, "transcode"))
+        self.assertEqual(
+            main.db().execute("SELECT bad_identity FROM replacements WHERE path=?", (source,)).fetchone()[0],
+            main.identity_mark(main.file_identity(source)))
+
+    def test_a_file_nobody_is_waiting_on_is_untouched(self):
+        source = self.write(".Fine.mkv", "convert me")
+        self.assertIsNotNone(main.enqueue(source, "transcode"))
+
 if __name__ == "__main__":
     unittest.main()

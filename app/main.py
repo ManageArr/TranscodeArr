@@ -121,7 +121,7 @@ def cfg() -> dict:
 # A constant compiled into the image cannot be overridden from outside it. Bump
 # it with the image tag: the release workflow refuses a tag that disagrees with
 # it, and a test refuses a Dockerfile that does.
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -226,6 +226,13 @@ def init_db() -> None:
         # A pre-0.9.1 row recorded a validated_at only on success, so that is a
         # pass we already know about and need not make the user re-run.
         conn.execute("UPDATE profiles SET validated_ok=1 WHERE validated_at IS NOT NULL")
+    # Which file we complained about, so a row can tell "still the bad one" from
+    # "the replacement landed". Deliberately NOT backfilled here: filling it
+    # means a stat() per row against a share that may not be mounted yet, at
+    # boot, and awaiting_replacement records it on its first look anyway.
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(replacements)").fetchall()}
+    if "bad_identity" not in have:
+        conn.execute("ALTER TABLE replacements ADD COLUMN bad_identity TEXT")
     # process_unhidden became hidden_only, and the default flipped meaning. An
     # install that was quietly converting only what something else had hidden
     # must not wake up with its whole visible library eligible, so its behavior
@@ -322,6 +329,12 @@ def enqueue(path: str, kind: str, force: bool = False) -> dict | None:
         "SELECT id FROM jobs WHERE path=? AND state IN ('queued','running')", (path,)
     ).fetchone()
     if dup:
+        return None
+    # Not gated by `force`. The retry cooldown is about timing, and a person
+    # pressing Check for files is entitled to override timing; this is about a
+    # file already known to be unreadable, which no amount of asking again
+    # changes. Dismiss is the door out, and it is already on the Queue page.
+    if awaiting_replacement(conn, path):
         return None
     if not force:
         last = conn.execute(
@@ -1557,6 +1570,52 @@ def already_asked_for_replacement(path: str) -> bool:
     ).fetchone() is not None
 
 
+def identity_mark(identity: tuple | None) -> str | None:
+    """file_identity as one comparable string. One helper so that the value
+    written at request time and the value compared against it can never drift
+    into two different formats."""
+    return None if identity is None else "%d:%d:%d" % identity
+
+
+def awaiting_replacement(conn: sqlite3.Connection, path: str) -> bool:
+    """Is the file at `path` still the unreadable one we asked an arr to replace?
+
+    The reason this exists: asking for a replacement did not stop the file being
+    eligible, so the watcher re-queued the same unreadable source every time the
+    retry cooldown lapsed and burned a whole GPU encode to reach the identical
+    verification failure. Seven files did that 58 times on the live box, one of
+    them for five days. The blocklist is a statement that this file is known bad
+    - converting it again cannot produce a different answer.
+
+    Identity rather than a timestamp, because an arr import PRESERVES the
+    release's mtime, so "modified since we asked" is not a question the
+    filesystem can answer here. When a different file does turn up at that path
+    the replacement has landed, and this stops waiting and lets it convert -
+    which is the whole point of having asked.
+    """
+    row = conn.execute("SELECT bad_identity FROM replacements WHERE path=?", (path,)).fetchone()
+    if row is None:
+        return False
+    now = identity_mark(file_identity(path))
+    if now is None:
+        # Nothing there to convert either way. _clear_unresolvable owns retiring
+        # this row; guessing at it from here would race that.
+        return False
+    if row["bad_identity"] is None:
+        # Written before bad_identity existed. Nothing has converted this file
+        # since the ask - that is exactly why the row is still here - so what is
+        # on disk now IS the file we complained about.
+        conn.execute("UPDATE replacements SET bad_identity=? WHERE path=?", (now, path))
+        conn.commit()
+        return True
+    if row["bad_identity"] == now:
+        return True
+    conn.execute("DELETE FROM replacements WHERE path=?", (path,))
+    conn.commit()
+    log.info("a different file is now at %s - the replacement arrived, converting it", path)
+    return False
+
+
 def request_replacement(job_id: str, source: str, error: str) -> None:
     """Ask whichever arr owns an unreadable file to blocklist it and find another.
 
@@ -1592,10 +1651,13 @@ def request_replacement(job_id: str, source: str, error: str) -> None:
                 # would be three API calls per file per refresh.
                 conn.execute(
                     "INSERT OR REPLACE INTO replacements "
-                    "(path, arr_id, arr_name, kind, item_id, episode_id, release, at, note) "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    "(path, arr_id, arr_name, kind, item_id, episode_id, release, at, note, bad_identity) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (source, found["arr_id"], found["arr_name"], found["kind"], found["item_id"],
-                     found["episode_id"], found["release"], time.time(), message))
+                     found["episode_id"], found["release"], time.time(), message,
+                     # Which file we are waiting to see replaced. Sampled here,
+                     # while it is still the file the job just failed on.
+                     identity_mark(file_identity(source))))
                 conn.commit()
             break   # one arr owns the file; asking the rest would be asking about somebody else's library
     if not notes:
@@ -3441,6 +3503,14 @@ class Handler(BaseHTTPRequestHandler):
         # tell a caller to come back in six hours.
         job = enqueue(resolved, "reveal" if names.reveal_only or protected else "transcode", force=True)
         if job is None:
+            # Two different refusals reach here, and answering both with
+            # "already queued" would report a job that does not exist.
+            if awaiting_replacement(db(), resolved):
+                return self._send(409, {
+                    "error": "this file was blocklisted as unreadable and an arr has been asked to "
+                             "replace it - converting it again fails the same way. Dismiss the "
+                             "replacement to convert it anyway.",
+                    "job": None})
             # enqueue found the duplicate and threw it away. Handing back the id
             # makes "make sure this is queued, then watch it" two calls; without
             # it a caller has to list the queue and match on path to find the

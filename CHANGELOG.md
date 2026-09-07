@@ -17,9 +17,46 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.5.1` is the release to run. Everything in the sections below is in it and is
+`1.5.2` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.5.2] - 2026-09-07
+
+### Fixed
+
+- **A file waiting on a replacement is no longer converted again every six
+  hours.** Asking an arr to replace an unreadable file did not make that file
+  ineligible, so the watcher re-queued it the moment the retry cooldown lapsed
+  and spent a whole GPU encode arriving at the identical verification failure.
+  It then declined to ask for a replacement a second time - correctly - and
+  waited to do the whole thing again. On the live box seven files had done this
+  **58 times**, one of them repeatedly for five days.
+
+  Blocklisting a release is a statement that this file is known bad. Converting
+  it again cannot produce a different answer, so `enqueue` now refuses while a
+  replacement is outstanding.
+
+  The refusal is keyed on **file identity** - inode, size and mtime, the same
+  `file_identity` the reveal already uses to tell a file apart from the one
+  that replaced it - and not on a timestamp. An arr import preserves the
+  release's mtime, so "has it changed since we asked" is not a question the
+  clock can answer here; a source on this library carries an mtime from 1989.
+  When a genuinely different file turns up at that path the replacement has
+  landed, the wait is cleared and it converts, which is the entire point of
+  having asked.
+
+  This is deliberately **not** overridable by `force`. The retry cooldown is
+  about timing and a person pressing "Check for files to convert" may override
+  timing; this is about a file already known to be unreadable. Dismiss, which
+  the Queue page has had since 1.5.0, is the door out, and `POST /jobs` for
+  such a file now says so instead of answering "already queued" about a job
+  that does not exist.
+
+  Rows written before this release carry no recorded identity. They are not
+  backfilled at boot - that would mean a `stat()` per row against a share that
+  may not be mounted yet - so the first check records what is on disk then,
+  which for a file still waiting is by definition the one complained about.
 
 ## [1.5.1] - 2026-09-07
 
