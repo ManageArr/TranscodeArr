@@ -138,6 +138,52 @@ class SettingsCoverage(unittest.TestCase):
         # the stars to the room while making them look like a real value.
         self.assertIn("spec.secret", web.PAGE)
 
+class TopChrome(unittest.TestCase):
+    """The header and tabs stay put, and the two things that quietly break that."""
+
+    def zindex(self, selector):
+        block = re.search(re.escape(selector) + r"\{(.*?)\}", web.PAGE, re.S)
+        self.assertIsNotNone(block, f"{selector} has no rule any more")
+        found = re.search(r"z-index:(\d+)", block.group(1))
+        self.assertIsNotNone(found, f"{selector} lost its z-index")
+        return int(found.group(1))
+
+    def test_the_sticky_bar_wraps_both_the_header_and_the_tabs(self):
+        # Sticking only the header leaves the tabs scrolling away underneath it,
+        # which looks like a rendering fault rather than a layout choice.
+        page = web.PAGE
+        self.assertEqual(page.count('<div class="topbar">'), 1)
+        opened = page.index('<div class="topbar">')
+        closed = page.index('</div>\n<button id="totop"')
+        for tag in ("<header>", "<nav>", "</nav>"):
+            self.assertLess(opened, page.index(tag), f"{tag} is before the sticky bar opens")
+            self.assertLess(page.index(tag), closed, f"{tag} is outside the sticky bar")
+
+    def test_the_tabs_carry_no_bottom_margin_of_their_own(self):
+        # A margin is OUTSIDE the sticky box, so it is a transparent band the
+        # page scrolls through - text sliding between the tabs and the content.
+        # The gap belongs to .topbar as padding, where the background covers it.
+        nav = re.search(r"\n nav\{(.*?)\}", web.PAGE, re.S).group(1)
+        self.assertIn("margin-bottom:0", nav)
+        self.assertIn("padding:0 1rem 1.1rem", re.search(r"\.topbar\{(.*?)\}", web.PAGE, re.S).group(1))
+
+    def test_the_bar_and_the_back_to_top_button_stay_under_the_sign_in_screen(self):
+        # #gate covers the page because everything behind it needs a token to
+        # have rendered. A Sign out button or a scroll arrow floating over it
+        # belongs to a session nobody has yet.
+        gate = self.zindex("#gate")
+        self.assertLess(self.zindex(".topbar"), gate)
+        self.assertLess(self.zindex("#totop"), gate)
+
+    def test_every_delegated_action_is_actually_emitted_somewhere(self):
+        # The click handler dispatches on dataset keys. A data-attribute the
+        # markup never writes, or a key spelled differently in the two places,
+        # is a button that silently does nothing when pressed.
+        handler = re.search(r"document\.addEventListener\('click'.*?\n\}\);", web.PAGE, re.S).group(0)
+        for key in sorted(set(re.findall(r"\bd\.([a-z]+)", handler))):
+            self.assertIn(f"data-{key}", web.PAGE,
+                          f"the click handler reads d.{key} and nothing writes data-{key}")
+
 
 if __name__ == "__main__":
     unittest.main()

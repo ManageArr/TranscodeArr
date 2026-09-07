@@ -110,10 +110,32 @@ document.documentElement.dataset.theme=localStorage.theme||'dark'</script>
  h1 .mark{width:.9em;height:.9em;vertical-align:-.13em;margin-right:.38em}
  #summary{color:var(--dim);font-size:.85rem}
  #theme{width:auto;margin-left:auto;font-size:.8rem;padding:.25rem .4rem}
- nav{display:flex;gap:.25rem;border-bottom:1px solid var(--line);margin-bottom:1.1rem;flex-wrap:wrap}
+ nav{display:flex;gap:.25rem;border-bottom:1px solid var(--line);margin-bottom:0;flex-wrap:wrap}
  nav button{background:none;border:0;border-bottom:2px solid transparent;color:var(--dim);cursor:pointer;
             padding:.55rem .85rem;font:inherit;font-size:.9rem}
  nav button.on{color:var(--link);border-bottom-color:var(--accent)}
+ /* Header and tabs hold still; only the content under them scrolls. The
+    negative inline margin puts the bar's background over the body's own 1rem
+    padding, so nothing slides through at the edges. Padding rather than nav's
+    old margin for the same reason: a margin is outside the box and would leave
+    a transparent 1.1rem band for text to scroll through. z-index stays UNDER
+    #gate's 20 - the sign-in screen covers everything, and a Sign out button
+    floating over it belongs to a session nobody has yet. */
+ .topbar{position:sticky;top:0;z-index:10;background:var(--bg);margin:0 -1rem;padding:0 1rem 1.1rem}
+ /* Only once the header has actually gone. Under the gate for the same reason
+    the top bar is. */
+ #totop{position:fixed;right:1.1rem;bottom:1.1rem;z-index:15;display:none;width:2.5rem;height:2.5rem;
+        align-items:center;justify-content:center;border-radius:999px;background:var(--panel);
+        border:1px solid var(--edge);color:var(--link);font-size:1.1rem;line-height:1;cursor:pointer;
+        box-shadow:0 2px 12px rgba(0,0,0,.4)}
+ #totop.on{display:flex}
+ #totop:hover{background:var(--hover);border-color:var(--accent)}
+ /* A row's actions, sized to the widest of them and stacked. Without this the
+    cell is whatever width the rest of the table left over, "Find a replacement"
+    wraps mid-phrase, and the pair renders as two different widths. */
+ td.actions{width:1%;white-space:nowrap}
+ td.actions button{display:block;width:100%;margin-bottom:.35rem}
+ td.actions button:last-child{margin-bottom:0}
  section{display:none} section.on{display:block}
  table{width:100%;border-collapse:collapse;font-size:.85rem}
  td,th{border-bottom:1px solid var(--line);padding:.45rem .5rem;text-align:left;vertical-align:top}
@@ -241,6 +263,7 @@ document.documentElement.dataset.theme=localStorage.theme||'dark'</script>
   <p class="hint" style="margin:.9rem 0 0"><button class="ghost" id="g_swap" onclick="gateMode()"></button></p>
  </div>
 </div>
+<div class="topbar">
 <header><h1>""" + _INLINE_MARK + r"""TranscodeArr</h1><div id="summary">connecting...</div>
  <select id="theme" aria-label="Color theme" onchange="setTheme(this.value)"><option value="dark">Dark</option>
   <option value="light">Light</option><option value="system">System</option></select>
@@ -258,6 +281,8 @@ document.documentElement.dataset.theme=localStorage.theme||'dark'</script>
  <button data-tab="system">System</button>
  <button data-tab="keys">Access</button>
 </nav>
+</div>
+<button id="totop" data-totop="1" title="Back to top" aria-label="Back to top">&#8593;</button>
 
 <section id="queue" class="on">
  <div class="card now" id="runcard">
@@ -743,7 +768,7 @@ function renderAwaiting(list){
     (r.note?`<div><code>${esc(r.note)}</code></div>`:'')+`</td>`+
     `<td>${esc(r.arr||'')}</td><td><code>${esc(r.release||'')}</code></td>`+
     `<td>${esc(ago(r.asked_at))}</td><td>${state}</td>`+
-    `<td><button class="ghost" data-find="${esc(r.path)}">Find a replacement</button> `+
+    `<td class="actions"><button class="ghost" data-find="${esc(r.path)}">Find a replacement</button>`+
     `<button class="ghost" data-dismiss="${esc(r.path)}">Dismiss</button></td></tr>`;
   }).join('');
 }
@@ -800,7 +825,7 @@ function renderSearch(){
     `<td>${esc(gb(r.size||0))}</td><td>${r.age_days==null?'':esc(r.age_days+'d')}</td>`+
     `<td>${r.seeders==null?'':esc(r.seeders)}</td><td>${esc(r.indexer||'')}</td>`+
     `<td><small>${why}</small></td>`+
-    `<td>${blocked?'<span class="tag">not downloadable</span>'
+    `<td class="actions">${blocked?'<span class="tag">not downloadable</span>'
       :`<button class="ghost" data-grab="${i}">Grab</button>`}</td></tr>`;
   }).join('');
 }
@@ -821,6 +846,13 @@ function grabBest(btn){
  const i=SEARCH.releases.findIndex(r=>r.guid===SEARCH.best);
  if(i>=0) grabRelease(i,btn);
 }
+// Shown only once the header has actually scrolled away, so it never covers a
+// corner of a page that had nowhere to go. passive: this fires on every frame
+// of a scroll and must never be what makes one drop.
+addEventListener('scroll',()=>{
+ const b=$('totop');
+ if(b) b.classList.toggle('on',window.scrollY>400);
+},{passive:true});
 const ago=t=>{
  const s=Math.max(0,Math.floor(Date.now()/1000-t));
  if(s<90)return 'just now';
@@ -896,6 +928,7 @@ document.addEventListener('click',e=>{
  if(d.grab!==undefined) grabRelease(Number(d.grab),e.target);
  if(d.grabbest) grabBest(e.target);
  if(d.searchclose) $('searchcard').style.display='none';
+ if(d.totop) scrollTo({top:0,behavior:'smooth'});
  if(d.editarr){const a=ARRS.find(x=>x.id===d.editarr); if(a) editArr(a);}
  if(d.delarr){const a=ARRS.find(x=>x.id===d.delarr); if(a) deleteArr(a.id,a.name);}
  if(d.revoke){const t=KEYS.find(x=>x.id===d.revoke); if(t) revokeKey(t.id,t.name);}
@@ -1012,7 +1045,8 @@ async function refreshJobs(){
        ?`<button class="ghost" data-find="${esc(x.path)}">Find a replacement</button>`:'');
    return `<tr><td class="${x.state}">${esc(x.state)}${x.kind==='reveal'?' <span class="tag">reveal</span>':''}</td>`+
     `<td>${esc(x.path.split('/').pop())}</td><td>${x.progress??''}</td><td>${esc(saved)}</td>`+
-    `<td><code>${esc(x.error||x.warning||x.rescan||x.output||'')}</code></td><td>${stop}</td></tr>`;
+    `<td><code>${esc(x.error||x.warning||x.rescan||x.output||'')}</code></td>`+
+    `<td class="actions">${stop}</td></tr>`;
   }).join(''):'<tr><td colspan="6">Nothing here yet.</td></tr>');
 }
 // ---- trash ---------------------------------------------------------------

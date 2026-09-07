@@ -17,9 +17,39 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.6.0` is the release to run. Everything in the sections below is in it and is
+`1.6.1` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.6.1] - 2026-09-07
+
+### Changed
+
+- **The header and the tabs hold still while the page scrolls.** Both, not just
+  the header: sticking the header alone leaves the tabs sliding away underneath
+  it, which reads as a rendering fault rather than a layout choice. The gap
+  under the tabs moved from the tab strip's own margin onto the sticky wrapper
+  as padding, because a margin sits OUTSIDE the sticky box and left a
+  transparent band for text to scroll through.
+
+  The bar sits below the sign-in screen in stacking order, deliberately. That
+  screen covers the page because everything behind it needed a token to render
+  at all, and a Sign out button floating over it belongs to a session nobody
+  has yet.
+
+- **A back-to-top arrow, once there is a top to go back to.** Bottom right,
+  and only after the page has scrolled about a screen - a control that is
+  always there is one that covers a corner of every short page for no reason.
+  Under the sign-in screen for the same reason the top bar is.
+
+### Fixed
+
+- **Row action buttons are no longer ragged.** In a dense table the actions
+  cell got whatever width the other columns left over, so "Find a replacement"
+  wrapped mid-phrase and sat above a "Dismiss" of a completely different width.
+  The cell is now sized to the widest button in it and both fill that width,
+  which also fixes the Grab column in the release list and the Cancel column in
+  the job history.
 
 ## [1.6.0] - 2026-09-07
 
