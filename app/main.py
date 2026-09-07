@@ -121,7 +121,7 @@ def cfg() -> dict:
 # A constant compiled into the image cannot be overridden from outside it. Bump
 # it with the image tag: the release workflow refuses a tag that disagrees with
 # it, and a test refuses a Dockerfile that does.
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -3595,6 +3595,12 @@ class Handler(BaseHTTPRequestHandler):
             releases, error = _client_for(target["arr"]).search_releases(
                 target["item_id"], target["episode_id"])
             if error:
+                # Logged as well as returned. A search that fails leaves the
+                # person looking at a red box and the container log completely
+                # silent about it, which is the wrong way round for the one
+                # call here that depends on somebody else's indexers.
+                log.warning("replacement search for %s failed: %s: %s",
+                            resolved, target["arr"]["name"], error)
                 return self._send(502, {"error": f"{target['arr']['name']}: {error}"})
             ranked = core.rank_releases(releases)
             best = core.best_release(releases)

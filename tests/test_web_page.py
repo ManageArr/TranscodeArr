@@ -184,6 +184,65 @@ class TopChrome(unittest.TestCase):
             self.assertIn(f"data-{key}", web.PAGE,
                           f"the click handler reads d.{key} and nothing writes data-{key}")
 
+class TheReplacementModal(unittest.TestCase):
+    def zindex(self, selector):
+        block = re.search(re.escape(selector) + r"\{(.*?)\}", web.PAGE, re.S)
+        self.assertIsNotNone(block, f"{selector} has no rule any more")
+        return int(re.search(r"z-index:(\d+)", block.group(1)).group(1))
+
+    def test_it_lives_outside_every_tab_section(self):
+        """The bug this move fixed, and the one it would silently reintroduce.
+
+        Sections are display:none unless their tab is on. While this markup sat
+        inside <section id="queue">, the History tab's own Find a replacement
+        button opened a panel inside a hidden section - a button that looked
+        like it did nothing at all.
+        """
+        page = web.PAGE
+        modal = page.index('<div id="searchmodal">')
+        for m in re.finditer(r'<section id="([a-z]+)"', page):
+            start = m.start()
+            end = page.index("</section>", start)
+            self.assertFalse(start < modal < end,
+                             f"the search modal is inside <section id={m.group(1)}>, "
+                             "which is display:none whenever another tab is on")
+
+    def test_it_stacks_over_the_page_chrome_but_under_the_sign_in_screen(self):
+        # A session that expires while this is open must be covered by the gate,
+        # not left with a live Grab button floating over the login form.
+        self.assertGreater(self.zindex("#searchmodal"), self.zindex(".topbar"))
+        self.assertGreater(self.zindex("#searchmodal"), self.zindex("#totop"))
+        self.assertLess(self.zindex("#searchmodal"), self.zindex("#gate"))
+
+    def test_every_way_out_goes_through_the_one_close(self):
+        # openSearch locks body scroll. If any exit skipped closeSearch the page
+        # would be left permanently unscrollable with nothing on screen to blame.
+        self.assertIn("function closeSearch()", web.PAGE)
+        self.assertIn("document.body.style.overflow=''", web.PAGE)
+        for exit_path in ("d.searchclose", "e.target.id==='searchmodal'", "e.key==='Escape'"):
+            self.assertIn(exit_path, web.PAGE, f"{exit_path} is no longer a way out")
+        # ...and exactly one thing turns the lock on.
+        self.assertEqual(web.PAGE.count("document.body.style.overflow='hidden'"), 1)
+
+
+class SearchTimeouts(unittest.TestCase):
+    def test_a_search_waits_far_longer_than_an_ordinary_arr_call(self):
+        """A cold search on a real library took 28s against a 20s limit.
+
+        The arr must be the one that gives up first: it has its own per-indexer
+        timeout and returns whatever answered, and a partial list of real
+        releases beats an error about a limit this worker invented.
+        """
+        import arrs
+
+        self.assertGreater(arrs.SEARCH_TIMEOUT, arrs.TIMEOUT * 4)
+        source = open(os.path.join(APP, "arrs.py"), encoding="utf-8").read()
+        # To the next method at the same indent. A blank line stops inside the
+        # docstring, which made this pass on a body it had never read.
+        search = re.search(r"def search_releases\(.*?(?=\n    def )", source, re.S).group(0)
+        self.assertIn("timeout=SEARCH_TIMEOUT", search,
+                      "search_releases fell back to the ordinary 20s call timeout")
+
 
 if __name__ == "__main__":
     unittest.main()

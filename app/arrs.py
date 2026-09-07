@@ -24,6 +24,18 @@ from typing import Any
 
 TIMEOUT = 20
 
+# An interactive search is not a request to an arr, it is a request to every
+# indexer the arr has, and it takes as long as the slowest of them. Measured on
+# a real library: 4s warm, 28s cold, and one indexer behind FlareSolverr is
+# configured for 90s on its own. At the 20s every other call uses, a cold search
+# failed at 21s with "the read operation timed out" while Sonarr was still
+# waiting perfectly happily.
+#
+# High enough that the arr is always the one that gives up first. It already has
+# a per-indexer timeout and returns what did answer, and a partial list of real
+# releases beats an error about a limit this worker invented.
+SEARCH_TIMEOUT = 180
+
 # urllib announces itself as "Python-urllib/3.x", which Cloudflare and several
 # reverse proxies answer with a flat 403 before the request ever reaches the
 # arr. Found against a real proxied Sonarr, where a correct API key looked
@@ -85,7 +97,8 @@ def blocked_reason(url: str) -> str | None:
     return None
 
 
-def _request(method: str, url: str, api_key: str, body: dict | None = None) -> tuple[Any, str | None]:
+def _request(method: str, url: str, api_key: str, body: dict | None = None,
+             timeout: int = TIMEOUT) -> tuple[Any, str | None]:
     # Guarded here rather than at the API handler because every outbound call
     # carrying the X-Api-Key goes through this one function, including the
     # rescans that run later from a stored row.
@@ -100,7 +113,7 @@ def _request(method: str, url: str, api_key: str, body: dict | None = None) -> t
         data = json.dumps(body).encode()
         req.add_header("Content-Type", "application/json")
     try:
-        with _opener.open(req, data=data, timeout=TIMEOUT) as res:
+        with _opener.open(req, data=data, timeout=timeout) as res:
             raw = res.read()
             return (json.loads(raw) if raw else None), None
     except urllib.error.HTTPError as e:
@@ -119,7 +132,11 @@ def _request(method: str, url: str, api_key: str, body: dict | None = None) -> t
         return None, f"HTTP {e.code}{': ' + detail if detail else ''}"
     except urllib.error.URLError as e:
         return None, f"Cannot reach {url}: {e.reason}"
-    except (TimeoutError, json.JSONDecodeError, ValueError) as e:
+    except TimeoutError:
+        # "The read operation timed out" names neither the wait nor its length,
+        # which is the whole content of the answer when a call is slow by nature.
+        return None, f"no answer in {timeout}s"
+    except (json.JSONDecodeError, ValueError) as e:
         return None, str(e)
 
 
@@ -434,9 +451,10 @@ class ArrClient:
         calls it on a timer or from a view that refreshes.
         """
         q = f"episodeId={episode_id}" if episode_id is not None else f"movieId={item_id}"
-        res, error = _request("GET", f"{self.base_url}/api/v3/release?{q}", self.api_key)
+        res, error = _request("GET", f"{self.base_url}/api/v3/release?{q}", self.api_key,
+                              timeout=SEARCH_TIMEOUT)
         if error:
-            return [], error
+            return [], f"{error} - the indexers were still being asked" if "no answer" in error else error
         return [_release_view(r) for r in (res or [])], None
 
     def grab_release(self, guid: str, indexer_id: int) -> tuple[bool, str]:

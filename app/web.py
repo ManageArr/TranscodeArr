@@ -136,6 +136,19 @@ document.documentElement.dataset.theme=localStorage.theme||'dark'</script>
  td.actions{width:1%;white-space:nowrap}
  td.actions button{display:block;width:100%;margin-bottom:.35rem}
  td.actions button:last-child{margin-bottom:0}
+ /* Above the sticky bar and the scroll arrow, still UNDER #gate: a session
+    that expires while this is open must be covered by the sign-in screen, not
+    left with a live Grab button floating over it. */
+ #searchmodal{position:fixed;inset:0;z-index:18;display:none;padding:1rem;
+              background:rgba(0,0,0,.55);align-items:center;justify-content:center}
+ #searchmodal.on{display:flex}
+ .modalbox{background:var(--panel);border:1px solid var(--edge);border-radius:10px;padding:1rem 1.1rem;
+           width:min(62rem,100%);max-height:85vh;display:flex;flex-direction:column}
+ .modalhead{display:flex;align-items:baseline;justify-content:space-between;gap:1rem}
+ .modalhead h2{font-size:.95rem;margin:0 0 .2rem;color:var(--ink)}
+ /* The list scrolls, not the box: the explanation above it is the part that
+    stops somebody grabbing a release without reading why it was refused. */
+ .modalbody{overflow:auto;min-height:0}
  section{display:none} section.on{display:block}
  table{width:100%;border-collapse:collapse;font-size:.85rem}
  td,th{border-bottom:1px solid var(--line);padding:.45rem .5rem;text-align:left;vertical-align:top}
@@ -263,6 +276,24 @@ document.documentElement.dataset.theme=localStorage.theme||'dark'</script>
   <p class="hint" style="margin:.9rem 0 0"><button class="ghost" id="g_swap" onclick="gateMode()"></button></p>
  </div>
 </div>
+<div id="searchmodal">
+ <div class="modalbox">
+  <div class="modalhead">
+   <h2>Replacements for <span id="searchtitle"></span></h2>
+   <button class="ghost" data-searchclose="1" aria-label="Close">Close</button>
+  </div>
+  <p class="hint">The same interactive search the arr's own page runs, in the order the arr ranked it.
+   <b>Expect everything to say rejected</b>, usually "Existing file meets cutoff": the unreadable file is
+   still on disk and still satisfies the quality profile, so the arr will not replace it on its own, and it
+   is not wrong - it cannot tell the file is unplayable. Grabbing one anyway is the point of this box, so
+   the reasons are shown in full rather than hidden. A reason about the RELEASE, like no seeders, is a
+   different thing and is worth reading before you override it. Nothing here deletes anything: the arr
+   downloads, imports over the file, and the next scan converts whatever it finds there.</p>
+  <div class="msg" id="searchmsg"></div>
+  <div class="row" style="margin-bottom:.8rem"><span id="searchbest"></span></div>
+  <div class="modalbody"><table id="searchtable"></table></div>
+ </div>
+</div>
 <div class="topbar">
 <header><h1>""" + _INLINE_MARK + r"""TranscodeArr</h1><div id="summary">connecting...</div>
  <select id="theme" aria-label="Color theme" onchange="setTheme(this.value)"><option value="dark">Dark</option>
@@ -311,22 +342,6 @@ document.documentElement.dataset.theme=localStorage.theme||'dark'</script>
    when the file converts, when its arr connection is deleted, or when the file turns up converted somewhere
    else. Dismiss is for the rest: it stops this worker watching, and changes nothing on the arr.</p>
   <table id="awaittable"></table>
- </div>
- <div class="card" id="searchcard" style="display:none">
-  <h2>Replacements for <span id="searchtitle"></span></h2>
-  <p class="hint">The same interactive search the arr's own page runs, in the order the arr ranked it.
-   <b>Expect everything to say rejected</b>, usually "Existing file meets cutoff": the unreadable file is
-   still on disk and still satisfies the quality profile, so the arr will not replace it on its own, and it
-   is not wrong - it cannot tell the file is unplayable. Grabbing one anyway is the point of this card, so
-   the reasons are shown in full rather than hidden. A reason about the RELEASE, like no seeders, is a
-   different thing and is worth reading before you override it. Nothing here deletes anything: the arr
-   downloads, imports over the file, and the next scan converts whatever it finds there.</p>
-  <div class="msg" id="searchmsg"></div>
-  <div class="row" style="margin-bottom:.8rem">
-   <button class="ghost" id="searchclose" data-searchclose="1">Close</button>
-   <span id="searchbest"></span>
-  </div>
-  <table id="searchtable"></table>
  </div>
  <div class="card">
   <h2>Up next</h2>
@@ -789,12 +804,20 @@ async function dismissReplacement(path){
 // indexer, and the rule on the delegated handler above is that a data
 // attribute holds an id and never server-supplied text.
 let SEARCH={path:'',title:'',mode:'manual',releases:[],best:null};
+// Paired so the body scroll lock can never be left on. Anything that opens this
+// goes through openSearch, and all three ways out - the button, the backdrop
+// and Escape - go through closeSearch.
+function openSearch(){$('searchmodal').classList.add('on');document.body.style.overflow='hidden';}
+function closeSearch(){$('searchmodal').classList.remove('on');document.body.style.overflow='';}
+addEventListener('keydown',e=>{
+ if(e.key==='Escape'&&$('searchmodal').classList.contains('on')) closeSearch();
+});
 async function findReplacement(path,btn){
- $('searchcard').style.display='';
+ openSearch();
  $('searchtitle').textContent=path.split('/').pop();
- $('searchtable').innerHTML='<tr><td>Asking every indexer - this takes a few seconds.</td></tr>';
+ $('searchtable').innerHTML='<tr><td>Asking every indexer. This can take a minute: it is a live search, '+
+   'and it takes as long as the slowest indexer the arr has.</td></tr>';
  $('searchbest').innerHTML='';
- $('searchcard').scrollIntoView({block:'nearest'});
  try{
   const r=await api('/api/replacements/search',{method:'POST',body:JSON.stringify({path})});
   SEARCH={path:r.path,title:r.title||'',mode:r.mode||'manual',releases:r.releases||[],best:r.best_guid||null};
@@ -927,7 +950,10 @@ document.addEventListener('click',e=>{
  if(d.find) findReplacement(d.find,e.target);
  if(d.grab!==undefined) grabRelease(Number(d.grab),e.target);
  if(d.grabbest) grabBest(e.target);
- if(d.searchclose) $('searchcard').style.display='none';
+ if(d.searchclose) closeSearch();
+ // The backdrop, and only the backdrop: e.target is the overlay itself only
+ // when the click missed the box entirely.
+ if(e.target&&e.target.id==='searchmodal') closeSearch();
  if(d.totop) scrollTo({top:0,behavior:'smooth'});
  if(d.editarr){const a=ARRS.find(x=>x.id===d.editarr); if(a) editArr(a);}
  if(d.delarr){const a=ARRS.find(x=>x.id===d.delarr); if(a) deleteArr(a.id,a.name);}

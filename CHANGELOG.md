@@ -17,9 +17,43 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.6.1` is the release to run. Everything in the sections below is in it and is
+`1.6.2` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.6.2] - 2026-09-07
+
+### Fixed
+
+- **A replacement search no longer times out at twenty seconds.** Every call to
+  an arr shared one 20-second budget, which is right for a status ping and
+  wrong for the one call that is not a request to the arr at all: an
+  interactive search is a request to every indexer the arr has, and it takes as
+  long as the slowest of them. Measured here: 4s warm, **28s cold**, with one
+  indexer behind FlareSolverr configured for 90s on its own. A cold search
+  failed at 21s with "the read operation timed out" while Sonarr was still
+  waiting perfectly happily.
+
+  Searches now get their own budget, set high enough that the **arr** is always
+  the one to give up first. It already has a per-indexer timeout and returns
+  whatever answered, and a partial list of real releases beats an error about a
+  limit this worker invented. A timeout that does happen now says how long it
+  waited instead of "the read operation timed out", and the failure is written
+  to the container log - it used to leave a red box on the page and the log
+  completely silent about the one call here that depends on somebody else's
+  indexers.
+
+- **Find a replacement worked from the Queue and did nothing from History.**
+  The results panel was a card inside the Queue tab, and tab sections are
+  `display:none` unless their tab is on - so the same button in the job history
+  opened it inside a hidden section. It looked like a button that did nothing
+  at all. It is now a modal outside every section, which is also what was asked
+  for: it opens over the page rather than pushing the queue down, closes on the
+  button, the backdrop or Escape, and scrolls its own list instead of the page.
+
+  It stacks above the sticky header and the scroll arrow but still under the
+  sign-in screen, so a session that expires while it is open is covered by the
+  login form rather than leaving a live Grab button floating over it.
 
 ## [1.6.1] - 2026-09-07
 
