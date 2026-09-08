@@ -440,6 +440,10 @@ _ENCODER_UNAVAILABLE = re.compile(
 # what the watcher reads to pick the short cooldown over the long one.
 ENCODER_UNAVAILABLE = "encoder unavailable"
 
+# What the boot reconcile writes on a job the previous process died holding.
+# Shared with main so the sentence and the rule that reads it cannot drift.
+INTERRUPTED = "interrupted by restart"
+
 
 def is_encoder_unavailable(text: str) -> bool:
     """Whether ffmpeg failed because the hardware encoder was not there.
@@ -562,6 +566,12 @@ def retry_cooldown_hours(error: str | None, failed_hours: float, encoder_minutes
     """
     if (error or "").startswith(ENCODER_UNAVAILABLE):
         return encoder_minutes / 60
+    if (error or "").startswith(INTERRUPTED):
+        # Not a verdict on the file at all - the process was killed holding it,
+        # which says nothing about whether it converts. Every container restart
+        # is one of these, so charging the long wait meant a deploy parked
+        # whatever was mid-encode for six hours.
+        return 0.0
     return failed_hours
 
 

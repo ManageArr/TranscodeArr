@@ -7,6 +7,8 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
 import core  # noqa: E402
 
+APP = os.path.join(os.path.dirname(__file__), "..", "app")
+
 
 class ValidatePath(unittest.TestCase):
     ROOTS = ["/media"]
@@ -804,6 +806,36 @@ class ChoosingAReplacementRelease(unittest.TestCase):
     def test_ranking_brings_the_overridable_ones_forward(self):
         rows = [self.rel("seedless", 0, [self.NO_SEEDS]), self.rel("cutoff", 9, [self.CUTOFF])]
         self.assertEqual([r["title"] for r in core.rank_releases(rows)], ["cutoff", "seedless"])
+
+
+class ACooldownIsAVerdictOnTheFile(unittest.TestCase):
+    """The retry cooldown exists to stop the watcher re-running a file that
+    always fails. It must not be charged for something that says nothing about
+    the file at all."""
+
+    def test_an_encode_killed_by_a_restart_retries_at_once(self):
+        # Every container restart writes this on whatever was mid-encode, so a
+        # deploy used to park that file for six hours over a process that was
+        # killed rather than a conversion that failed.
+        self.assertEqual(core.retry_cooldown_hours(core.INTERRUPTED, 6, 15), 0.0)
+        self.assertEqual(
+            core.retry_cooldown_hours(core.INTERRUPTED + " (mid-encode)", 6, 15), 0.0)
+
+    def test_a_missing_encoder_still_gets_the_short_wait(self):
+        self.assertEqual(core.retry_cooldown_hours(core.ENCODER_UNAVAILABLE + ": cuInit", 6, 30), 0.5)
+
+    def test_a_file_that_genuinely_failed_still_gets_the_long_one(self):
+        self.assertEqual(
+            core.retry_cooldown_hours("output failed verification: duration mismatch", 6, 15), 6)
+        self.assertEqual(core.retry_cooldown_hours(None, 6, 15), 6)
+
+    def test_the_reconcile_and_the_rule_use_the_same_sentence(self):
+        # Two copies of this string drifting apart would silently restore the
+        # six-hour wait, and nothing else in the app would look wrong.
+        main_source = open(os.path.join(APP, "main.py"), encoding="utf-8").read()
+        self.assertIn("core.INTERRUPTED", main_source)
+        self.assertNotIn("error='interrupted by restart'", main_source)
+
 
 if __name__ == "__main__":
     unittest.main()

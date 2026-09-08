@@ -121,7 +121,7 @@ def cfg() -> dict:
 # A constant compiled into the image cannot be overridden from outside it. Bump
 # it with the image tag: the release workflow refuses a tag that disagrees with
 # it, and a test refuses a Dockerfile that does.
-VERSION = "1.7.3"
+VERSION = "1.7.4"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -283,8 +283,8 @@ def init_db() -> None:
                 except OSError:
                     pass
         conn.execute(
-            "UPDATE jobs SET state='failed', error='interrupted by restart', finished=? WHERE id=?",
-            (time.time(), row["id"]),
+            "UPDATE jobs SET state='failed', error=?, finished=? WHERE id=?",
+            (core.INTERRUPTED, time.time(), row["id"]),
         )
     conn.commit()
 
@@ -1691,6 +1691,11 @@ def stuck_seconds(path: str, status: dict | None) -> float:
     if not status or not status.get("awaiting_import"):
         _STUCK_SINCE.pop(path, None)
         return 0.0
+    # Bounded by the number of rows being waited on, which is small - but a
+    # path whose row is dismissed while its download is stuck would otherwise
+    # keep its entry for the life of the process.
+    if len(_STUCK_SINCE) > 512:
+        _STUCK_SINCE.clear()
     return time.time() - _STUCK_SINCE.setdefault(path, time.time())
 
 
@@ -1795,6 +1800,10 @@ def settle_replacements() -> int:
             forced += 1
             conn.execute("UPDATE replacements SET note=? WHERE path=?", (detail, row["path"]))
             conn.commit()
+    if forced:
+        # The queue view caches for 20s. Without this the page goes on saying
+        # the arr is refusing something this worker has just told it to take.
+        _forget_replacements()
     return forced
 
 

@@ -406,11 +406,13 @@ class ArrClient:
             # Every reason the arr gave for not finishing, flattened. Sonarr
             # nests them as {title, messages[]} and the title alone is usually
             # the release name, so the messages are the part worth reading.
+            # Only the messages. An entry's `title` is the FILE the arr is
+            # talking about, not the reason - and these strings are what decides
+            # whether a refusal may be overridden, so feeding a release name to
+            # that rule refused every force with a filename as the explanation.
             messages = []
             for m in record.get("statusMessages") or []:
-                messages.extend(str(x) for x in (m.get("messages") or []))
-                if not (m.get("messages") or []):
-                    messages.append(str(m.get("title") or ""))
+                messages.extend(str(x) for x in (m.get("messages") or []) if str(x).strip())
             return {
                 "title": record.get("title") or "",
                 # The download is done and the arr has not taken it. That is the

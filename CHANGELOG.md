@@ -17,9 +17,50 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.7.3` is the release to run. Everything in the sections below is in it and is
+`1.7.4` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.7.4] - 2026-09-08
+
+### Fixed
+
+- **A restart no longer parks whatever was mid-encode for six hours.** The boot
+  reconcile fails an interrupted job with "interrupted by restart", and the
+  retry cooldown charged that the full failure wait - so every container
+  restart, which means every update, sent the file it was converting to the
+  back of a six-hour queue. The cooldown is a verdict on the FILE: a process
+  killed while holding one says nothing about whether it converts, so an
+  interruption now retries on the next scan. The sentence is a shared constant
+  rather than two string literals that can drift apart, which is checked.
+
+- **A file the arr names is no longer mistaken for a reason it gives.** Queue
+  status messages arrive as `{title, messages}`, where the title is the FILE
+  being discussed. When an entry carried no messages the title was being read
+  as a rejection reason - and those strings are exactly what decides whether a
+  refused import may be overridden, so a release name was capable of refusing a
+  force with a filename as the explanation. Only real messages count now.
+
+- **The Queue page no longer keeps saying an import is refused after the
+  worker has forced it.** The replacements view caches for 20 seconds, and the
+  automatic path was not clearing it.
+
+- Bounded the in-memory record of how long each download has been stuck, so a
+  row dismissed while its download is parked cannot leave an entry behind for
+  the life of the process.
+
+### Note for anyone running the QNAP host tuning from the ops notes
+
+A `host-tuning.sh` written from these notes read the order-9 free page count
+as `awk '/Normal/{print $11}'`. **That is order-6.** `/proc/buddyinfo` lines
+begin `Node 0, zone Normal`, so order *k* is field `$(5+k)` and order-9 is
+`$14`. Order-6 sits in the thousands where order-9 sits in the hundreds, so the
+`-lt 200` test never fired and the compaction half of the `cuInit` mitigation
+had never once run on the box it was written for.
+
+Fix the field number only. Rewriting the line with double quotes lets the SHELL
+expand `$14` before awk sees it, which yields a small number, passes the test on
+every run, and drops the entire page cache every five minutes.
 
 ## [1.7.3] - 2026-09-08
 

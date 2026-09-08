@@ -2438,6 +2438,19 @@ on them.
   `sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory`
   This also un-breaks hardware transcoding for every other container on the
   box - a Jellyfin on the same host had been silently falling back to CPU.
+
+  **If you automate that on a timer, read the right column.** The pool that
+  matters is order-9, and in `/proc/buddyinfo` a line begins
+  `Node 0, zone Normal` before the counts, so order *k* is field `$(5+k)` and
+  order-9 is **`$14`**. `$11` is order-6, which sits in the thousands where
+  order-9 sits in the hundreds - a threshold written against it never fires,
+  and the automation quietly never runs. That exact mistake sat on the box
+  these notes came from for a week.
+
+  Quote it as `awk '/Normal/{print $14}'`, single quotes. In double quotes the
+  SHELL expands `$14` before awk sees it, which yields a small number, passes
+  any sane threshold on every run, and drops the whole page cache on every
+  tick - considerably worse than not running at all.
 - **Converting is itself what refragments memory, so this recurs.** The first
   time it took 101 days of uptime. Under a sustained queue it came back in
   **90 minutes**: 18 jobs, each reading ~2 GB and writing ~1.7 GB, put 50 GB
