@@ -811,6 +811,48 @@ file, and the next scan sees a **different file at that path** - which is
 exactly what the wait is watching for, so it clears itself and the new file
 converts without anything here being told.
 
+
+#### Winning the search is still not the end of it
+
+The arr decides an import by QUALITY, and the file being replaced is almost
+always the same quality - it is unreadable, not low resolution. So a
+replacement can download perfectly and still be refused at the door with
+`Not an upgrade for existing episode file(s)`, sitting in the queue forever.
+Same blind spot as above, one step later: blocklisting never triggers a search,
+and winning the search still does not finish the job.
+
+**When the arr will not import it** (`REPLACEMENT_IMPORT`) is the last link.
+
+| Mode | What it may do |
+| --- | --- |
+| `off` | Leaves it parked, and says on the row that it is parked. |
+| `manual` (default) | Adds a **Force import** button once the download really is stuck. |
+| `auto` | Does it unprompted, 10 minutes after the arr gives up. |
+
+Forcing an import is the arr's own Manual Import, which is the only thing that
+overrules an import rejection. The ten minutes exist so the arr always gets
+first refusal - it retries its own import well inside that, so anything still
+parked afterwards is parked on a decision rather than on a timer.
+
+**What decides whether forcing is allowed is the reason, not the fact of the
+refusal** - the same distinction the release list makes. A refusal about the
+file you ALREADY HAVE (`not an upgrade`, `existing file meets cutoff`) is yours
+to overrule, because that file is the entire problem. A refusal about the
+DOWNLOAD (a sample, a file the arr cannot parse, an episode it cannot match) is
+refused for a good reason and stays refused; forcing it would import something
+broken over something merely unplayable. Both arrive through the same field,
+and a mixed set of reasons is treated as the serious half.
+
+It will not act on a path this worker is not already waiting on a replacement
+for, so it is never a way to import something nobody asked about. Inside a
+season pack it imports only the file matching the episode the row is about,
+because importing the wrong one replaces an episode nobody was talking about.
+
+> **This is the one action in the chain that destroys a file.** The arr replaces
+> the existing file as part of importing, and with no Recycle Bin configured it
+> deletes it rather than keeping a copy. That is why the default is a button
+> rather than automatic.
+
 ### When the name is already taken
 
 A conversion of `.Show - S01E01.mkv` wants to end up at `Show - S01E01.mp4`. It

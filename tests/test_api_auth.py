@@ -691,5 +691,143 @@ class FindingAReplacementFromHere(ApiCase):
             self.assertEqual(status, 401, route)
 
 
+class ForcingAnImportTheArrRefused(ApiCase):
+    """The last step of a replacement, and the only one that destroys a file.
+
+    The arr judges an import by quality. The file being replaced is unreadable,
+    not low quality, so the arr refuses with "not an upgrade" and parks the
+    download forever. Overruling that is the point. Overruling a refusal about
+    the DOWNLOAD - a sample, an unparseable file - is not, and both arrive
+    through the same field.
+    """
+
+    NOT_UPGRADE = "Not an upgrade for existing episode file(s). Existing quality: WEBDL-1080p"
+    SAMPLE = "Sample"
+    UNREADABLE = "Invalid video file, unable to parse"
+
+    def waiting(self, path="/media/TV/Show/.Show - S01E01.mkv", episode_id=10984):
+        conn = main.db()
+        conn.execute("DELETE FROM replacements")
+        conn.execute(
+            "INSERT INTO replacements (path, arr_id, arr_name, kind, item_id, episode_id, release, at, note) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (path, "a1", "Sonarr", "sonarr", 126, episode_id, "Show.S01-GRP", time.time(), "blocklisted"))
+        conn.commit()
+        self.addCleanup(setattr, main, "_REPLACEMENTS", (0.0, []))
+        return path
+
+    def client(self, messages=(NOT_UPGRADE,), rejections=(NOT_UPGRADE,), episode_ids=(10984,),
+               awaiting=True, imported=None):
+        c = mock.Mock()
+        c.queue_status.return_value = {
+            "title": "Show.S01E01", "status": "importPending", "awaiting_import": awaiting,
+            "download_id": "abc123", "messages": list(messages), "percent": 100, "error": "",
+        }
+        c.import_candidates.return_value = ([{
+            "id": 1, "path": "/downloads/Show.S01E01.mkv", "folder_name": "Show.S01E01",
+            "item_id": 126, "episode_ids": list(episode_ids), "quality": {"quality": {"id": 3}},
+            "languages": [], "release_group": "GRP", "indexer_flags": 0, "size": 900,
+            "rejections": list(rejections),
+        }], None)
+        c.force_import.side_effect = lambda cand, dl: (imported.append((cand["path"], dl)) or (True, "")
+                                                       if imported is not None else (True, ""))
+        return c
+
+    def run_force(self, client, path):
+        with mock.patch.object(main.store, "get_arr",
+                               lambda conn, arr_id: {"id": "a1", "name": "Sonarr", "enabled": 1}), \
+             mock.patch.object(main, "_client_for", lambda row: client):
+            return main.force_replacement_import(main.db(), path)
+
+    def test_a_not_an_upgrade_refusal_is_overruled(self):
+        path, imported = self.waiting(), []
+        ok, detail = self.run_force(self.client(imported=imported), path)
+        self.assertTrue(ok, detail)
+        self.assertEqual(imported, [("/downloads/Show.S01E01.mkv", "abc123")])
+
+    def test_a_refusal_about_the_download_itself_is_never_overruled(self):
+        for reason in (self.SAMPLE, self.UNREADABLE):
+            path, imported = self.waiting(), []
+            client = self.client(messages=(reason,), rejections=(reason,), imported=imported)
+            ok, detail = self.run_force(client, path)
+            self.assertFalse(ok, f"{reason} was forced anyway")
+            self.assertEqual(imported, [], "a bad download was imported")
+            self.assertIn("refusing this download itself", detail)
+
+    def test_a_mixed_refusal_is_treated_as_the_serious_half(self):
+        path, imported = self.waiting(), []
+        client = self.client(messages=(self.NOT_UPGRADE, self.SAMPLE),
+                             rejections=(self.NOT_UPGRADE, self.SAMPLE), imported=imported)
+        ok, _detail = self.run_force(client, path)
+        self.assertFalse(ok)
+        self.assertEqual(imported, [])
+
+    def test_a_download_still_running_is_left_alone(self):
+        path, imported = self.waiting(), []
+        ok, detail = self.run_force(self.client(awaiting=False, imported=imported), path)
+        self.assertFalse(ok)
+        self.assertEqual(imported, [])
+        self.assertIn("not sitting waiting", detail)
+
+    def test_a_pack_never_imports_an_episode_nobody_asked_about(self):
+        # A season pack offers a dozen candidates, and importing the wrong one
+        # replaces an episode this row was never about.
+        path, imported = self.waiting(episode_id=10984), []
+        client = self.client(episode_ids=(11111,), imported=imported)
+        ok, detail = self.run_force(client, path)
+        self.assertFalse(ok)
+        self.assertEqual(imported, [])
+        self.assertIn("none of the downloaded files are for this episode", detail)
+
+    def test_a_file_nobody_is_waiting_on_is_refused_outright(self):
+        conn = main.db()
+        conn.execute("DELETE FROM replacements")
+        conn.commit()
+        ok, detail = self.run_force(self.client(), "/media/TV/Show/.Whatever.mkv")
+        self.assertFalse(ok)
+        self.assertIn("nothing is waiting", detail)
+
+    def test_the_watcher_only_acts_on_auto(self):
+        self.waiting()
+        main.db().execute("UPDATE replacements SET at=?", (time.time() - 4000,))
+        main.db().commit()
+        self.addCleanup(store.save_settings, main.db(), {"replacement_import": "manual"})
+        for mode in ("off", "manual"):
+            store.save_settings(main.db(), {"replacement_import": mode})
+            with mock.patch.object(main, "force_replacement_import",
+                                   mock.Mock(side_effect=AssertionError("forced in " + mode))):
+                self.assertEqual(main.settle_replacements(), 0)
+        store.save_settings(main.db(), {"replacement_import": "auto"})
+        with mock.patch.object(main, "force_replacement_import", lambda conn, path: (True, "done")):
+            self.assertEqual(main.settle_replacements(), 1)
+
+    def test_the_watcher_gives_the_arr_its_grace_period_first(self):
+        self.waiting()
+        conn = main.db()
+        conn.execute("UPDATE replacements SET at=?", (time.time(),))   # asked just now
+        conn.commit()
+        store.save_settings(conn, {"replacement_import": "auto"})
+        self.addCleanup(store.save_settings, conn, {"replacement_import": "manual"})
+        with mock.patch.object(main, "force_replacement_import",
+                               mock.Mock(side_effect=AssertionError("forced inside the grace period"))):
+            self.assertEqual(main.settle_replacements(), 0)
+
+    def test_the_route_is_refused_when_the_setting_is_off(self):
+        path = self.waiting()
+        store.save_settings(main.db(), {"replacement_import": "off"})
+        self.addCleanup(store.save_settings, main.db(), {"replacement_import": "manual"})
+        with mock.patch.object(main, "_resolve_job_path", lambda raw: (True, raw)), \
+             mock.patch.object(main, "force_replacement_import",
+                               mock.Mock(side_effect=AssertionError("forced while off"))):
+            status, body, _ = self.call("POST", "/api/replacements/import", {"path": path})
+        self.assertEqual(status, 409)
+        self.assertIn("turned off", body["error"])
+
+    def test_the_route_needs_a_token(self):
+        status, _body, _ = self.call("POST", "/api/replacements/import",
+                                     {"path": "/media/TV/x.mkv"}, token=None)
+        self.assertEqual(status, 401)
+
+
 if __name__ == "__main__":
     unittest.main()

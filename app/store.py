@@ -183,6 +183,20 @@ SPECS: list[Spec] = [
          "does that same pick by itself whenever a source is blocklisted, which starts downloads with "
          "nobody watching - it is the only setting here that spends bandwidth on its own judgement.",
          "Rules", choices=("manual", "best", "auto")),
+    Spec("replacement_import", "REPLACEMENT_IMPORT", "choice", "manual", "When the arr will not import it",
+         "A replacement can download perfectly and still never land. The arr judges an import by quality, "
+         "and the file being replaced is usually the same quality - it is unreadable, not low resolution - "
+         "so the arr refuses with 'Not an upgrade for existing episode file(s)' and parks the download. It "
+         "is not wrong; it cannot tell the file is unplayable. Forcing the import is the arr's own Manual "
+         "Import, and it is the only thing that overrules that. OFF leaves it parked and says so. MANUAL "
+         "adds a Force import button to the row once the download really is stuck. AUTO does it "
+         "unprompted, 10 minutes after the arr gives up, so the rest of a batch lands without anyone "
+         "watching. Only ever for a file this worker is already waiting on a replacement for, and never "
+         "when the arr's reason is about the DOWNLOAD rather than about the file you already have - a "
+         "sample or an unreadable download is refused for a good reason and stays refused. Note that the "
+         "arr replaces the old file as part of importing, and with no Recycle Bin configured it deletes "
+         "it rather than keeping a copy.",
+         "Rules", choices=("off", "manual", "auto")),
     Spec("trash_keep_days", "TRASH_KEEP_DAYS", "int", 7, "Keep replaced sources (days)",
          "Replaced originals are moved to trash, never deleted outright. This is how long they survive. "
          "Raise it before a large batch - a source pruned mid-run is one you cannot get back. Lowering it "

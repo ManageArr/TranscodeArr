@@ -121,7 +121,7 @@ def cfg() -> dict:
 # A constant compiled into the image cannot be overridden from outside it. Bump
 # it with the image tag: the release workflow refuses a tag that disagrees with
 # it, and a test refuses a Dockerfile that does.
-VERSION = "1.6.2"
+VERSION = "1.7.0"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -1646,6 +1646,109 @@ def auto_grab(client: arr_client.ArrClient, path: str, found: dict) -> str:
         return f"automatic search failed: {e}"
 
 
+# How long the arr gets to import a finished download before this worker offers
+# to, or does it. Sonarr retries its own import well inside this, so anything
+# still parked after it is parked on a decision rather than on a timer.
+IMPORT_GRACE_SECONDS = 600
+
+
+def import_blocker(status: dict | None) -> tuple[bool, str]:
+    """Is this download stuck on something we are entitled to overrule?
+
+    (forceable, why). The rule is the same one the release list uses: a reason
+    about the file we ALREADY HAVE is ours to override - it is the whole point,
+    the arr is protecting a file we know is unreadable - and a reason about the
+    download itself is not. A sample, an unparseable file or a missing episode
+    is refused for a good reason and must stay refused.
+    """
+    if not status or not status.get("awaiting_import") or not status.get("download_id"):
+        return False, ""
+    messages = status.get("messages") or []
+    if not core.overridable_only(messages):
+        return False, "; ".join(messages)
+    return True, "; ".join(messages) or "the arr has not said why"
+
+
+def force_replacement_import(conn: sqlite3.Connection, path: str) -> tuple[bool, str]:
+    """Make the arr import the replacement it is refusing to import.
+
+    Only for a path with a replacements row: this worker asked for that file to
+    be replaced, and this is the last step of that same request. Never a way to
+    import something nobody asked about.
+    """
+    row = conn.execute(
+        "SELECT arr_id, arr_name, item_id, episode_id FROM replacements WHERE path=?", (path,)).fetchone()
+    if row is None:
+        return False, "nothing is waiting on a replacement for that file"
+    arr = store.get_arr(conn, row["arr_id"])
+    if not arr or not arr["enabled"]:
+        return False, f"{row['arr_name']} is no longer a connection here"
+    client = _client_for(arr)
+    status = client.queue_status(row["item_id"], row["episode_id"])
+    forceable, why = import_blocker(status)
+    if not forceable:
+        if status and status.get("awaiting_import"):
+            # The one refusal that must never be overridden from here, said in
+            # full: this is the arr objecting to the DOWNLOAD, not to the file
+            # being replaced, and forcing it would import something broken.
+            return False, f"the arr is refusing this download itself, not the file it would replace: {why}"
+        return False, "that download is not sitting waiting to be imported"
+    candidates, error = client.import_candidates(status["download_id"])
+    if error:
+        return False, f"{arr['name']}: {error}"
+    # The episode this row is about, not merely the biggest file: a season pack
+    # offers a dozen candidates and importing the wrong one replaces somebody
+    # else's episode with a file nobody asked about.
+    wanted = [c for c in candidates
+              if (row["episode_id"] in (c.get("episode_ids") or [])
+                  if row["episode_id"] is not None else c.get("item_id") == row["item_id"])]
+    if not wanted:
+        return False, f"{arr['name']}: none of the downloaded files are for this episode"
+    blocked = [c for c in wanted if not core.overridable_only(c.get("rejections") or [])]
+    if blocked:
+        return False, (f"{arr['name']}: refused for a reason about the download itself - "
+                       + "; ".join(blocked[0]["rejections"]))
+    pick = max(wanted, key=lambda c: c.get("size") or 0)
+    ok, error = client.force_import(pick, status["download_id"])
+    if not ok:
+        return False, f"{arr['name']}: {error}"
+    log.info("forced the import of %s for %s", os.path.basename(pick["path"]), path)
+    return True, (f"{arr['name']}: told it to import {os.path.basename(pick['path'])} - "
+                  "it replaces the file, and the next scan converts what lands")
+
+
+def settle_replacements() -> int:
+    """Force any replacement the arr has finished downloading and will not take.
+
+    Runs on the watcher's own pass rather than on a timer of its own: this is
+    the same loop that would notice the new file afterwards, and one background
+    thread is easier to reason about than two.
+
+    Failures are logged and never raised - the watcher's next job is scanning a
+    library, and an arr being unreachable must not cost that.
+    """
+    if cfg()["replacement_import"] != "auto":
+        return 0
+    conn = db()
+    forced = 0
+    cutoff = time.time() - IMPORT_GRACE_SECONDS
+    for row in conn.execute("SELECT path, at FROM replacements").fetchall():
+        # The grace is measured from the ASK, which is the earliest a download
+        # for it could exist. A row younger than that has not had time to fail.
+        if row["at"] > cutoff:
+            continue
+        try:
+            ok, detail = force_replacement_import(conn, row["path"])
+        except Exception:  # noqa: BLE001 - an arr must never take the watcher down
+            log.exception("could not settle the replacement for %s", row["path"])
+            continue
+        if ok:
+            forced += 1
+            conn.execute("UPDATE replacements SET note=? WHERE path=?", (detail, row["path"]))
+            conn.commit()
+    return forced
+
+
 def replacement_target(conn: sqlite3.Connection, path: str) -> tuple[dict | None, str]:
     """Which arr owns this file and what a search for it needs, or (None, why).
 
@@ -2539,6 +2642,10 @@ def watch_loop() -> None:
             with _scan_lock:
                 scan_once()
             prune_trash()
+            # After the scan, not before: if forcing an import lands a file,
+            # the NEXT pass is the one that should find it, once stable_seconds
+            # has had a chance to prove it finished being written.
+            settle_replacements()
         except Exception:  # noqa: BLE001
             log.exception("scan failed")
             # The watcher is the other thread that outlives every job, and
@@ -2798,6 +2905,10 @@ def replacements_view() -> list[dict]:
             "release": row["release"],
             "asked_at": row["at"],
             "note": row["note"],
+            # So the page can offer Force import on exactly the rows where it
+            # would do something, instead of on every row that is merely slow.
+            "stuck": bool(status and status.get("awaiting_import")),
+            "forceable": import_blocker(status)[0],
             # None means the arr is not downloading anything for this yet, which
             # is a real state and not an error: searching, nothing found, or
             # already imported and waiting for the next scan to pick it up.
@@ -3568,6 +3679,20 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as e:
                 return self._send(400, {"error": str(e)})
             return self._send(201, {"arr": {**row, "api_key": "********"}})
+        if route == "/api/replacements/import":
+            ok, resolved = _resolve_job_path(str(body.get("path", "")))
+            if not ok:
+                return self._send(400, {"error": resolved})
+            if cfg()["replacement_import"] == "off":
+                return self._send(409, {"error": "forcing an import is turned off - see 'When the arr "
+                                                 "will not import it' under Rules"})
+            conn = db()
+            done, detail = force_replacement_import(conn, resolved)
+            if done:
+                conn.execute("UPDATE replacements SET note=? WHERE path=?", (detail, resolved))
+                conn.commit()
+                _forget_replacements()
+            return self._send(200 if done else 409, {"ok": done, "detail": detail})
         if route in ("/api/replacements/search", "/api/replacements/grab"):
             # Same containment guard the queue route uses. The path arrives from
             # a caller, and neither of these should be a way to ask an arr about

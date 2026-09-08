@@ -773,6 +773,8 @@ function renderAwaiting(list){
    const d=r.download;
    let state;
    if(!d) state='<span class="tag">searching</span>';
+   else if(r.stuck) state='<span class="tag">downloaded, not imported</span> '+
+     `<code>${esc((d.messages||[]).join('; ')||'the arr has not said why')}</code>`;
    else if(d.error) state=`<span class="tag">${esc(d.status||'error')}</span> <code>${esc(d.error)}</code>`;
    else state=`<span class="tag">${esc(d.status||'downloading')}</span> `+
      (d.percent==null?'':`${d.percent}% `)+`<code>${esc((d.title||'').slice(0,58))}</code>`;
@@ -783,7 +785,9 @@ function renderAwaiting(list){
     (r.note?`<div><code>${esc(r.note)}</code></div>`:'')+`</td>`+
     `<td>${esc(r.arr||'')}</td><td><code>${esc(r.release||'')}</code></td>`+
     `<td>${esc(ago(r.asked_at))}</td><td>${state}</td>`+
-    `<td class="actions"><button class="ghost" data-find="${esc(r.path)}">Find a replacement</button>`+
+    `<td class="actions">`+
+    (r.forceable?`<button class="ghost" data-forceimport="${esc(r.path)}">Force import</button>`:'')+
+    `<button class="ghost" data-find="${esc(r.path)}">Find a replacement</button>`+
     `<button class="ghost" data-dismiss="${esc(r.path)}">Dismiss</button></td></tr>`;
   }).join('');
 }
@@ -791,6 +795,28 @@ function renderAwaiting(list){
 // converts, or the row stops being resolvable at all. Neither can see media
 // that moved to a library this worker was never told about, and until this
 // button existed such a row said "searching" forever with nothing to press.
+// The arr has the download and will not take it, because it judges an import by
+// quality and the file being replaced is the same quality - unreadable is not a
+// quality. This is its own Manual Import, which is the only thing that overrules
+// that, and it REPLACES the file rather than adding one.
+async function forceImport(path,btn){
+ if(!confirm('Tell the arr to import this download anyway?
+
+'+path+
+   '
+
+It refused because the file already there looks just as good to it. Importing replaces '+
+   'that file, and with no Recycle Bin set the arr deletes it rather than keeping a copy.
+
+'+
+   'The file being replaced is the one that failed to convert.'))return;
+ try{
+  const r=await busy(btn,'Importing...',()=>api('/api/replacements/import',
+    {method:'POST',body:JSON.stringify({path})}));
+  alert(r.detail||'Told the arr to import it.');
+  await refreshQueue();
+ }catch(e){alert(e.message);}
+}
 async function dismissReplacement(path){
  if(!confirm('Stop waiting on a replacement for:\n\n'+path+
    '\n\nNothing on the arr changes. The release stays blocklisted, and a download it has '+
@@ -948,6 +974,7 @@ document.addEventListener('click',e=>{
  if(d.cancel) cancelJob(d.cancel);
  if(d.dismiss) dismissReplacement(d.dismiss);
  if(d.find) findReplacement(d.find,e.target);
+ if(d.forceimport) forceImport(d.forceimport,e.target);
  if(d.grab!==undefined) grabRelease(Number(d.grab),e.target);
  if(d.grabbest) grabBest(e.target);
  if(d.searchclose) closeSearch();

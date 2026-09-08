@@ -17,9 +17,62 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.6.2` is the release to run. Everything in the sections below is in it and is
+`1.7.0` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.7.0] - 2026-09-07
+
+### Added
+
+- **Force the import when the arr will not do it.** A replacement can download
+  perfectly and still never land. The arr decides an import by QUALITY, and the
+  file being replaced is almost always the same quality - it is unreadable, not
+  low resolution - so the arr refuses with "Not an upgrade for existing episode
+  file(s)" and parks the finished download indefinitely. It is not wrong. It
+  cannot tell that the file it is protecting will not play.
+
+  That is the same blind spot that made 1.6.0 necessary, one step later in the
+  chain: 1.6.0 was needed because blocklisting never triggers a search, and this
+  is needed because winning the search still does not finish the job.
+
+  One new setting under Rules, **When the arr will not import it**
+  (`REPLACEMENT_IMPORT`):
+
+  | Mode | What it may do |
+  | --- | --- |
+  | `off` | Leaves it parked, and says on the row that it is parked. |
+  | `manual` (default) | Adds a Force import button once the download really is stuck. |
+  | `auto` | Does it unprompted, 10 minutes after the arr gives up. |
+
+  The grace period exists so the arr always gets first refusal: it retries its
+  own import well inside ten minutes, so anything still parked after that is
+  parked on a decision rather than on a timer.
+
+  **The gate is the rejection reason, and it is the same distinction the release
+  list already makes.** A refusal about the file we ALREADY HAVE - "not an
+  upgrade", "existing file meets cutoff" - is ours to overrule, because that
+  file is the whole problem. A refusal about the DOWNLOAD - a sample, a file the
+  arr cannot parse, an episode it cannot match - is refused for a good reason
+  and stays refused. Both arrive through the same field, and forcing the second
+  kind would import something broken over something merely unplayable. A mixed
+  set of reasons is treated as the serious half.
+
+  Two more things it will not do: it only ever acts on a path this worker is
+  already waiting on a replacement for, so it is not a way to import something
+  nobody asked about; and inside a season pack it imports only the file matching
+  the episode the row is about, because importing the wrong one replaces an
+  episode nobody was talking about.
+
+  It runs on the watcher's existing pass rather than a timer of its own - the
+  same loop that notices the new file afterwards - and after the scan, so the
+  next pass is the one that finds what landed, once the stability window has had
+  a chance to prove the file finished being written.
+
+  **This is the one action in the chain that destroys a file.** The arr replaces
+  the existing file as part of importing, and with no Recycle Bin configured it
+  deletes it rather than keeping a copy. That is why the default is a button and
+  not automatic, and why the confirmation says so in as many words.
 
 ## [1.6.2] - 2026-09-07
 

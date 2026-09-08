@@ -36,6 +36,11 @@ TIMEOUT = 20
 # releases beats an error about a limit this worker invented.
 SEARCH_TIMEOUT = 180
 
+# trackedDownloadState values that mean "finished downloading, and the arr has
+# not taken it". Deliberately not "importing", which is the arr getting on with
+# it, and not "imported", which is the happy ending.
+AWAITING_IMPORT = frozenset({"importPending", "importBlocked", "importFailed"})
+
 # urllib announces itself as "Python-urllib/3.x", which Cloudflare and several
 # reverse proxies answer with a flat 403 before the request ever reaches the
 # arr. Found against a real proxied Sonarr, where a correct API key looked
@@ -397,8 +402,23 @@ class ArrClient:
             if not same:
                 continue
             size, left = record.get("size") or 0, record.get("sizeleft") or 0
+            state = record.get("trackedDownloadState") or ""
+            # Every reason the arr gave for not finishing, flattened. Sonarr
+            # nests them as {title, messages[]} and the title alone is usually
+            # the release name, so the messages are the part worth reading.
+            messages = []
+            for m in record.get("statusMessages") or []:
+                messages.extend(str(x) for x in (m.get("messages") or []))
+                if not (m.get("messages") or []):
+                    messages.append(str(m.get("title") or ""))
             return {
                 "title": record.get("title") or "",
+                # The download is done and the arr has not taken it. That is the
+                # state this worker can actually do something about, and it is
+                # NOT the same as "importing" - one is stuck, the other is busy.
+                "awaiting_import": state in AWAITING_IMPORT,
+                "download_id": record.get("downloadId") or "",
+                "messages": [m for m in messages if m],
                 # trackedDownloadState is the honest one: "downloading" in
                 # status can still mean stalled, waiting for an import, or
                 # failed and about to be retried.
@@ -409,6 +429,67 @@ class ArrClient:
                 "error": record.get("errorMessage") or "",
             }
         return None
+
+    def import_candidates(self, download_id: str) -> tuple[list[dict], str | None]:
+        """What the arr would import from a finished download, and why it will not.
+
+        The same list its own Manual Import screen shows. Each entry carries the
+        arr's rejections, which is the whole basis for deciding whether forcing
+        it is an override or a mistake - "not an upgrade" is the file we already
+        have talking, "invalid video file" is this download talking, and only
+        one of those is ours to overrule.
+        """
+        res, error = _request(
+            "GET", f"{self.base_url}/api/v3/manualimport?downloadId={download_id}&filterExistingFiles=false",
+            self.api_key, timeout=SEARCH_TIMEOUT)
+        if error:
+            return [], error
+        out = []
+        for f in res or []:
+            episodes = [e.get("id") for e in (f.get("episodes") or []) if e.get("id")]
+            out.append({
+                "id": f.get("id"),
+                "path": f.get("path") or "",
+                "folder_name": f.get("folderName") or "",
+                "item_id": ((f.get("series") or f.get("movie")) or {}).get("id"),
+                "episode_ids": episodes,
+                "quality": f.get("quality"),
+                "languages": f.get("languages") or [],
+                "release_group": f.get("releaseGroup") or "",
+                "indexer_flags": f.get("indexerFlags") or 0,
+                "size": f.get("size") or 0,
+                # {reason, type} in newer arrs, a bare string in older ones.
+                "rejections": [str(r.get("reason") if isinstance(r, dict) else r)
+                               for r in (f.get("rejections") or [])],
+            })
+        return out, None
+
+    def force_import(self, candidate: dict, download_id: str) -> tuple[bool, str]:
+        """Import one file the arr has declined to import on its own.
+
+        This is the arr's own Manual Import, which is the only thing that
+        overrules an import rejection - and it is a real override: the arr
+        REPLACES the existing file, and with no recycle bin configured it
+        deletes it rather than keeping a copy. Never called on a rejection that
+        is about this download; see core.overridable_only.
+        """
+        payload = {
+            "path": candidate["path"],
+            "folderName": candidate.get("folder_name") or "",
+            "downloadId": download_id,
+            "quality": candidate.get("quality"),
+            "languages": candidate.get("languages") or [],
+            "releaseGroup": candidate.get("release_group") or "",
+            "indexerFlags": candidate.get("indexer_flags") or 0,
+        }
+        if self.kind == "sonarr":
+            payload["seriesId"] = candidate.get("item_id")
+            payload["episodeIds"] = candidate.get("episode_ids") or []
+        else:
+            payload["movieId"] = candidate.get("item_id")
+        _, error = _request("POST", f"{self.base_url}/api/v3/command", self.api_key,
+                            {"name": "ManualImport", "importMode": "move", "files": [payload]})
+        return (False, error) if error else (True, "")
 
     def find_target(self, worker_file: str) -> tuple[dict | None, str]:
         """What a replacement search needs for this file: item, episode, title.
