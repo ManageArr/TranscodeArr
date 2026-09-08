@@ -9,7 +9,10 @@ until somebody clicks the thing and gets a blank panel with no error.
 
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
@@ -138,6 +141,7 @@ class SettingsCoverage(unittest.TestCase):
         # the stars to the room while making them look like a real value.
         self.assertIn("spec.secret", web.PAGE)
 
+
 class TopChrome(unittest.TestCase):
     """The header and tabs stay put, and the two things that quietly break that."""
 
@@ -183,6 +187,7 @@ class TopChrome(unittest.TestCase):
         for key in sorted(set(re.findall(r"\bd\.([a-z]+)", handler))):
             self.assertIn(f"data-{key}", web.PAGE,
                           f"the click handler reads d.{key} and nothing writes data-{key}")
+
 
 class TheReplacementModal(unittest.TestCase):
     def zindex(self, selector):
@@ -242,6 +247,46 @@ class SearchTimeouts(unittest.TestCase):
         search = re.search(r"def search_releases\(.*?(?=\n    def )", source, re.S).group(0)
         self.assertIn("timeout=SEARCH_TIMEOUT", search,
                       "search_releases fell back to the ordinary 20s call timeout")
+
+
+class TheScriptParses(unittest.TestCase):
+    """The page is one file of hand-written JavaScript that nothing compiles.
+
+    A syntax error in it does not fail a build, does not log anything and does
+    not show an error on screen: the boot script simply never runs, so the
+    header sits on "connecting..." forever and every tab is empty. That is
+    exactly what shipped in 1.7.0, from a confirm() whose "\\n" escapes were
+    written into the source as real newlines - which is an unterminated string
+    literal, and which every other check in this file was blind to.
+
+    Uses a real parser rather than a regex that approximates one, and skips
+    where there is no node to borrow. CI has one.
+    """
+
+    def script_blocks(self):
+        return re.findall(r"<script>([\s\S]*?)</script>", web.PAGE)
+
+    def test_there_is_a_script_to_check(self):
+        blocks = self.script_blocks()
+        self.assertTrue(blocks, "no <script> found - this test would pass on an empty page")
+        self.assertGreater(max(len(b.splitlines()) for b in blocks), 500,
+                           "the main script block is missing, so this checks nothing")
+
+    @unittest.skipUnless(shutil.which("node"), "no node available to parse the page")
+    def test_every_script_block_is_valid_javascript(self):
+        for i, block in enumerate(self.script_blocks()):
+            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as f:
+                # --check parses without running: the page calls fetch() and
+                # touches document at load, and neither exists in node.
+                f.write(block)
+                path = f.name
+            try:
+                done = subprocess.run([shutil.which("node"), "--check", path],
+                                      capture_output=True, text=True, timeout=60)
+            finally:
+                os.unlink(path)
+            self.assertEqual(done.returncode, 0,
+                             f"script block {i} is not valid JavaScript:\n{done.stderr}")
 
 
 if __name__ == "__main__":

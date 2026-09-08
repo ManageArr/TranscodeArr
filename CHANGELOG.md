@@ -17,9 +17,35 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.7.0` is the release to run. Everything in the sections below is in it and is
+`1.7.1` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.7.1] - 2026-09-07
+
+### Fixed
+
+- **1.7.0 served a page whose script would not parse, so nothing on it
+  rendered.** The header sat on "connecting..." and every tab was empty. The
+  cause was one `confirm()` in the new Force import button whose `\n` escapes
+  were written into the source as REAL newlines, which is an unterminated
+  string literal.
+
+  There is no worse failure mode available to this page. A syntax error in it
+  does not fail a build, does not log anything, and does not put an error on
+  screen - the boot script simply never runs, so a working container with
+  healthy endpoints looks completely dead to the only interface most people
+  ever use. `/healthz`, `/api/settings` and every route answered correctly
+  throughout.
+
+  **Nothing checked that the page was valid JavaScript**, which is why this
+  shipped. The page is a thousand lines of hand-written script inside a Python
+  string, compiled by nothing, and every existing check on it - the ids, the
+  routes, the entities, the dashes - reads it as text. It is now parsed with a
+  real parser rather than a regex approximating one, borrowing `node --check`
+  where there is a node to borrow and skipping where there is not. CI has one.
+  Verified against this exact defect: reintroduce it and the test fails with
+  the browser's own error.
 
 ## [1.7.0] - 2026-09-07
 

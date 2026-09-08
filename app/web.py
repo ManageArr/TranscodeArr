@@ -800,15 +800,9 @@ function renderAwaiting(list){
 // quality. This is its own Manual Import, which is the only thing that overrules
 // that, and it REPLACES the file rather than adding one.
 async function forceImport(path,btn){
- if(!confirm('Tell the arr to import this download anyway?
-
-'+path+
-   '
-
-It refused because the file already there looks just as good to it. Importing replaces '+
-   'that file, and with no Recycle Bin set the arr deletes it rather than keeping a copy.
-
-'+
+ if(!confirm('Tell the arr to import this download anyway?\n\n'+path+
+   '\n\nIt refused because the file already there looks just as good to it. Importing replaces '+
+   'that file, and with no Recycle Bin set the arr deletes it rather than keeping a copy.\n\n'+
    'The file being replaced is the one that failed to convert.'))return;
  try{
   const r=await busy(btn,'Importing...',()=>api('/api/replacements/import',

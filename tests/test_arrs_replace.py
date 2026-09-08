@@ -80,6 +80,7 @@ class BlocklistScope(unittest.TestCase):
         self.assertEqual(posted, [])
         self.assertTrue(message)
 
+
 class FindingWhatToSearchFor(unittest.TestCase):
     """Resolving item and episode from the PATH, not from the grab history.
 
