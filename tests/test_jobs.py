@@ -1375,6 +1375,60 @@ class AFileWaitingOnAReplacement(JobCase):
             main.db().execute("SELECT bad_identity FROM replacements WHERE path=?", (source,)).fetchone()[0],
             main.identity_mark(main.file_identity(source)))
 
+
+    def test_an_arrived_replacement_does_not_serve_out_its_predecessors_cooldown(self):
+        """Live on 2026-09-08, Malcolm in the Middle S07E05.
+
+        The bad file failed at 18:52. Sonarr imported the replacement at 00:10,
+        TranscodeArr saw it at 00:17 and logged "the replacement arrived,
+        converting it" - and then declined to queue it, because the path was
+        32 minutes short of the six-hour retry cooldown the OLD file had earned.
+        A replacement inherits the path of the file it replaces; it has never
+        failed at anything.
+        """
+        source = self.write(".Bad.mkv", "unreadable")
+        self.waiting_on(source)
+        # A job for this path that failed moments ago: cooldown fully in force.
+        conn = main.db()
+        conn.execute(
+            "INSERT INTO jobs (id, path, state, kind, created, finished, error) VALUES (?,?,?,?,?,?,?)",
+            ("older", source, "failed", "transcode", time.time() - 60, time.time() - 60,
+             "output failed verification: duration mismatch"))
+        conn.commit()
+
+        # Still the bad file: refused, and the cooldown is not even reached.
+        self.assertIsNone(main.enqueue(source, "transcode"))
+
+        # The replacement lands at the same path.
+        os.unlink(source)
+        source = self.write(".Bad.mkv", "a completely different download")
+        job = main.enqueue(source, "transcode")
+        self.assertIsNotNone(job, "the replacement was held by the cooldown its predecessor earned")
+        self.assertEqual(job["state"], "queued")
+
+    def test_a_file_that_merely_failed_still_serves_its_cooldown(self):
+        # The other half: without a replacement having arrived, the cooldown is
+        # exactly what stops the watcher re-running a permanently failing file.
+        source = self.write(".JustBad.mkv", "unreadable")
+        conn = main.db()
+        conn.execute(
+            "INSERT INTO jobs (id, path, state, kind, created, finished, error) VALUES (?,?,?,?,?,?,?)",
+            ("recent", source, "failed", "transcode", time.time() - 60, time.time() - 60, "boom"))
+        conn.commit()
+        self.assertIsNone(main.enqueue(source, "transcode"),
+                          "the retry cooldown stopped working")
+
+    def test_the_state_is_reported_as_arrived_exactly_once(self):
+        # It deletes the row on the way past, so the second look is "none" - and
+        # "none" must not re-open the cooldown for a job already queued.
+        source = self.write(".Once.mkv", "unreadable")
+        self.waiting_on(source)
+        os.unlink(source)
+        source = self.write(".Once.mkv", "the replacement")
+        conn = main.db()
+        self.assertEqual(main.replacement_state(conn, source), "arrived")
+        self.assertEqual(main.replacement_state(conn, source), "none")
+
     def test_a_file_nobody_is_waiting_on_is_untouched(self):
         source = self.write(".Fine.mkv", "convert me")
         self.assertIsNotNone(main.enqueue(source, "transcode"))

@@ -121,7 +121,7 @@ def cfg() -> dict:
 # A constant compiled into the image cannot be overridden from outside it. Bump
 # it with the image tag: the release workflow refuses a tag that disagrees with
 # it, and a test refuses a Dockerfile that does.
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -334,9 +334,15 @@ def enqueue(path: str, kind: str, force: bool = False) -> dict | None:
     # pressing Check for files is entitled to override timing; this is about a
     # file already known to be unreadable, which no amount of asking again
     # changes. Dismiss is the door out, and it is already on the Queue page.
-    if awaiting_replacement(conn, path):
+    state = replacement_state(conn, path)
+    if state == "waiting":
         return None
-    if not force:
+    # A replacement takes the PATH of the file it replaced, and the cooldown is
+    # keyed on the path - so without this the new file sits out the six hours
+    # earned by the unreadable one, having never failed at anything. Seen live:
+    # a replacement landed 32 minutes inside its predecessor's cooldown and was
+    # refused, while the log said it was being converted.
+    if not force and state != "arrived":
         last = conn.execute(
             "SELECT state, finished, error FROM jobs WHERE path=? ORDER BY created DESC LIMIT 1", (path,)
         ).fetchone()
@@ -1577,8 +1583,8 @@ def identity_mark(identity: tuple | None) -> str | None:
     return None if identity is None else "%d:%d:%d" % identity
 
 
-def awaiting_replacement(conn: sqlite3.Connection, path: str) -> bool:
-    """Is the file at `path` still the unreadable one we asked an arr to replace?
+def replacement_state(conn: sqlite3.Connection, path: str) -> str:
+    """"waiting", "arrived", or "none" for the file at `path`.
 
     The reason this exists: asking for a replacement did not stop the file being
     eligible, so the watcher re-queued the same unreadable source every time the
@@ -1592,28 +1598,43 @@ def awaiting_replacement(conn: sqlite3.Connection, path: str) -> bool:
     filesystem can answer here. When a different file does turn up at that path
     the replacement has landed, and this stops waiting and lets it convert -
     which is the whole point of having asked.
+
+    "arrived" is a separate answer from "none" because the caller has to treat
+    it differently: the retry cooldown is keyed on the PATH, and a replacement
+    inherits the path of the file it replaced. Answering merely "not waiting"
+    left a brand new file serving out the six-hour cooldown earned by the
+    unreadable one it had just replaced - and the log line above it cheerfully
+    said it was converting it.
     """
     row = conn.execute("SELECT bad_identity FROM replacements WHERE path=?", (path,)).fetchone()
     if row is None:
-        return False
+        return "none"
     now = identity_mark(file_identity(path))
     if now is None:
         # Nothing there to convert either way. _clear_unresolvable owns retiring
         # this row; guessing at it from here would race that.
-        return False
+        return "none"
     if row["bad_identity"] is None:
         # Written before bad_identity existed. Nothing has converted this file
         # since the ask - that is exactly why the row is still here - so what is
         # on disk now IS the file we complained about.
         conn.execute("UPDATE replacements SET bad_identity=? WHERE path=?", (now, path))
         conn.commit()
-        return True
+        return "waiting"
     if row["bad_identity"] == now:
-        return True
+        return "waiting"
     conn.execute("DELETE FROM replacements WHERE path=?", (path,))
     conn.commit()
-    log.info("a different file is now at %s - the replacement arrived, converting it", path)
-    return False
+    # Says what happened and nothing about what happens next. It used to promise
+    # "converting it" and then hand back to a caller that silently declined.
+    log.info("a different file is now at %s - the replacement arrived", path)
+    return "arrived"
+
+
+def awaiting_replacement(conn: sqlite3.Connection, path: str) -> bool:
+    """Still waiting on the replacement for this path? The plain question, for
+    the callers that only need to know whether to leave the file alone."""
+    return replacement_state(conn, path) == "waiting"
 
 
 def auto_grab(client: arr_client.ArrClient, path: str, found: dict) -> str:

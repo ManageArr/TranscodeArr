@@ -17,9 +17,35 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.7.2` is the release to run. Everything in the sections below is in it and is
+`1.7.3` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.7.3] - 2026-09-08
+
+### Fixed
+
+- **A replacement served out the retry cooldown earned by the file it
+  replaced.** The cooldown is keyed on the PATH, and a replacement inherits the
+  path of the file it replaces - so a brand new download that has never failed
+  at anything sat waiting for the six hours the unreadable one had earned.
+
+  Seen live on Malcolm in the Middle S07E05. The bad file failed verification
+  at 18:52. Sonarr imported the replacement at 00:10, this worker saw it at
+  00:17, cleared the wait, logged **"the replacement arrived, converting it"** -
+  and then declined to queue it, 32 minutes short of the old file's cooldown.
+  Nothing was broken enough to notice: the row vanished off the Queue page as
+  it should, and the file simply did not convert for another half hour.
+
+  The state a path can be in is now three answers rather than two - `waiting`,
+  `arrived`, `none` - because the caller has to treat "the replacement is here"
+  differently from "nobody is waiting on this". Only `arrived` skips the
+  cooldown, so a file that merely failed still serves it, which is the whole
+  reason the cooldown exists.
+
+  The log line no longer promises anything either. It says a different file has
+  arrived and stops there; announcing "converting it" and then handing back to a
+  caller that silently declined is how this hid for a day.
 
 ## [1.7.2] - 2026-09-08
 
