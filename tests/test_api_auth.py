@@ -802,16 +802,60 @@ class ForcingAnImportTheArrRefused(ApiCase):
         with mock.patch.object(main, "force_replacement_import", lambda conn, path: (True, "done")):
             self.assertEqual(main.settle_replacements(), 1)
 
-    def test_the_watcher_gives_the_arr_its_grace_period_first(self):
-        self.waiting()
+    def test_a_silent_import_pending_gets_the_grace_before_anything_steps_in(self):
+        """importPending is what a REFUSAL and a PAUSE both look like.
+
+        The live case that produced this rule: a download completed, sat at
+        importPending with no messages at all, and Sonarr imported it by itself
+        about four minutes later. Forcing on sight would have raced that.
+        """
+        path = self.waiting()
+        main._STUCK_SINCE.pop(path, None)
+        self.addCleanup(main._STUCK_SINCE.pop, path, None)
+        silent = self.client(messages=()).queue_status.return_value
+
+        forceable, why = main.import_blocker(silent, path)
+        self.assertFalse(forceable, "forced while the arr was still working on it")
+        self.assertIn("not finished with it yet", why)
+
+        # ...and once the grace really has passed, it is fair game.
+        main._STUCK_SINCE[path] = time.time() - main.IMPORT_GRACE_SECONDS - 1
+        self.assertTrue(main.import_blocker(silent, path)[0],
+                        "still refusing long after the arr gave up")
+
+    def test_an_explicit_refusal_needs_no_grace_at_all(self):
+        # The arr has said why. That is a decision, not a pause, and waiting ten
+        # minutes to act on a sentence it already wrote adds nothing.
+        path = self.waiting()
+        main._STUCK_SINCE.pop(path, None)
+        self.addCleanup(main._STUCK_SINCE.pop, path, None)
+        refused = self.client(messages=(self.NOT_UPGRADE,)).queue_status.return_value
+        self.assertTrue(main.import_blocker(refused, path)[0])
+
+    def test_the_grace_runs_from_first_seen_stuck_not_from_the_ask(self):
+        """The bug this replaced: the clock started when the REPLACEMENT was
+        asked for. Those rows are days old on a real box, so every download
+        would have been forced on the first pass after it completed, with no
+        grace whatsoever."""
+        path = self.waiting()
+        main._STUCK_SINCE.pop(path, None)
+        self.addCleanup(main._STUCK_SINCE.pop, path, None)
         conn = main.db()
-        conn.execute("UPDATE replacements SET at=?", (time.time(),))   # asked just now
+        conn.execute("UPDATE replacements SET at=?", (time.time() - 5 * 86400,))  # asked five days ago
         conn.commit()
-        store.save_settings(conn, {"replacement_import": "auto"})
-        self.addCleanup(store.save_settings, conn, {"replacement_import": "manual"})
-        with mock.patch.object(main, "force_replacement_import",
-                               mock.Mock(side_effect=AssertionError("forced inside the grace period"))):
-            self.assertEqual(main.settle_replacements(), 0)
+        silent = self.client(messages=()).queue_status.return_value
+        self.assertFalse(main.import_blocker(silent, path)[0],
+                         "an old replacements row skipped the grace entirely")
+
+    def test_a_download_that_is_no_longer_stuck_forgets_its_clock(self):
+        # Otherwise a download that goes stuck, recovers, and goes stuck again
+        # inherits the first spell and is forced immediately.
+        path = self.waiting()
+        self.addCleanup(main._STUCK_SINCE.pop, path, None)
+        main._STUCK_SINCE[path] = time.time() - 9999
+        main.stuck_seconds(path, {"awaiting_import": False, "download_id": "abc"})
+        self.assertNotIn(path, main._STUCK_SINCE)
+        self.assertLess(main.stuck_seconds(path, {"awaiting_import": True, "download_id": "abc"}), 5)
 
     def test_the_route_is_refused_when_the_setting_is_off(self):
         path = self.waiting()

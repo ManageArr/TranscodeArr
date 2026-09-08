@@ -121,7 +121,7 @@ def cfg() -> dict:
 # A constant compiled into the image cannot be overridden from outside it. Bump
 # it with the image tag: the release workflow refuses a tag that disagrees with
 # it, and a test refuses a Dockerfile that does.
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -1652,7 +1652,28 @@ def auto_grab(client: arr_client.ArrClient, path: str, found: dict) -> str:
 IMPORT_GRACE_SECONDS = 600
 
 
-def import_blocker(status: dict | None) -> tuple[bool, str]:
+# path -> when its download was FIRST seen finished and not imported. Held in
+# memory rather than on the row: losing it to a restart only restarts the grace,
+# and the alternative is a column that has to be cleared correctly on every exit.
+_STUCK_SINCE: dict[str, float] = {}
+
+
+def stuck_seconds(path: str, status: dict | None) -> float:
+    """How long this download has sat finished and not imported. 0 if it has not.
+
+    Measured from the first time it was SEEN stuck, which is the only honest
+    clock for it. The replacements row's own timestamp is when a replacement was
+    asked for, and those rows are days old on a real box - measuring the grace
+    from there gives the arr no grace at all and races the import it was about
+    to do by itself.
+    """
+    if not status or not status.get("awaiting_import"):
+        _STUCK_SINCE.pop(path, None)
+        return 0.0
+    return time.time() - _STUCK_SINCE.setdefault(path, time.time())
+
+
+def import_blocker(status: dict | None, path: str = "") -> tuple[bool, str]:
     """Is this download stuck on something we are entitled to overrule?
 
     (forceable, why). The rule is the same one the release list uses: a reason
@@ -1660,13 +1681,22 @@ def import_blocker(status: dict | None) -> tuple[bool, str]:
     the arr is protecting a file we know is unreadable - and a reason about the
     download itself is not. A sample, an unparseable file or a missing episode
     is refused for a good reason and must stay refused.
+
+    A REFUSAL and a PAUSE are not the same thing, and importPending is what both
+    look like. When the arr has said why, it has decided, and waiting adds
+    nothing. When it has said nothing it is usually still working - a real
+    import on this library landed on its own about four minutes after the
+    download completed - so silence gets the grace period before anything here
+    steps in front of it.
     """
     if not status or not status.get("awaiting_import") or not status.get("download_id"):
         return False, ""
     messages = status.get("messages") or []
     if not core.overridable_only(messages):
         return False, "; ".join(messages)
-    return True, "; ".join(messages) or "the arr has not said why"
+    if not messages and stuck_seconds(path, status) < IMPORT_GRACE_SECONDS:
+        return False, "the arr has not finished with it yet"
+    return True, "; ".join(messages) or "the arr never said why"
 
 
 def force_replacement_import(conn: sqlite3.Connection, path: str) -> tuple[bool, str]:
@@ -1685,7 +1715,7 @@ def force_replacement_import(conn: sqlite3.Connection, path: str) -> tuple[bool,
         return False, f"{row['arr_name']} is no longer a connection here"
     client = _client_for(arr)
     status = client.queue_status(row["item_id"], row["episode_id"])
-    forceable, why = import_blocker(status)
+    forceable, why = import_blocker(status, path)
     if not forceable:
         if status and status.get("awaiting_import"):
             # The one refusal that must never be overridden from here, said in
@@ -1731,12 +1761,10 @@ def settle_replacements() -> int:
         return 0
     conn = db()
     forced = 0
-    cutoff = time.time() - IMPORT_GRACE_SECONDS
-    for row in conn.execute("SELECT path, at FROM replacements").fetchall():
-        # The grace is measured from the ASK, which is the earliest a download
-        # for it could exist. A row younger than that has not had time to fail.
-        if row["at"] > cutoff:
-            continue
+    for row in conn.execute("SELECT path FROM replacements").fetchall():
+        # No timing check here on purpose: import_blocker owns it, so the button
+        # and the watcher can never disagree about whether a download has been
+        # given its grace.
         try:
             ok, detail = force_replacement_import(conn, row["path"])
         except Exception:  # noqa: BLE001 - an arr must never take the watcher down
@@ -2908,7 +2936,7 @@ def replacements_view() -> list[dict]:
             # So the page can offer Force import on exactly the rows where it
             # would do something, instead of on every row that is merely slow.
             "stuck": bool(status and status.get("awaiting_import")),
-            "forceable": import_blocker(status)[0],
+            "forceable": import_blocker(status, row["path"])[0],
             # None means the arr is not downloading anything for this yet, which
             # is a real state and not an error: searching, nothing found, or
             # already imported and waiting for the next scan to pick it up.

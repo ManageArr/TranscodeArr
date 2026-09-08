@@ -17,9 +17,44 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.7.1` is the release to run. Everything in the sections below is in it and is
+`1.7.2` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.7.2] - 2026-09-08
+
+### Fixed
+
+- **The import grace period was measured from the wrong event, so in `auto`
+  mode there was effectively no grace at all.** It ran from the moment the
+  REPLACEMENT WAS ASKED FOR. Those rows are days old on a real library - the
+  ones this was built for had been waiting up to five days - so the ten minutes
+  had always long since elapsed, and the first watcher pass after a download
+  completed would have forced the import immediately.
+
+  Caught on the live box the first time a replacement actually landed. Sonarr
+  imported it **by itself**, about four minutes after the download completed,
+  with no rejection and nothing wrong. In `auto` mode this worker would have
+  raced that with a forced import of the same file. `manual` being the default
+  is the only reason it did not.
+
+  The grace now runs from the first moment a download is SEEN finished and not
+  imported, which is the only honest clock for it. Held in memory rather than
+  on the row: losing it to a restart merely restarts the grace, and the
+  alternative is a column that has to be cleared correctly on every exit.
+
+- **A refusal and a pause are no longer treated as the same thing.**
+  `importPending` is what both look like. When the arr has said WHY, it has
+  decided, and waiting ten minutes to act on a sentence it already wrote adds
+  nothing - so an explicit rejection is actionable at once. When it has said
+  nothing it is usually still working, which is exactly what happened live, so
+  silence gets the grace before anything here steps in front of it.
+
+  One consequence worth knowing: the Force import button no longer appears the
+  instant a download completes. It waits for the arr to either explain itself
+  or run out of time, which is the same rule the automatic path follows - the
+  button and the watcher can no longer disagree about whether a download has
+  had its grace, because only one function decides.
 
 ## [1.7.1] - 2026-09-07
 
