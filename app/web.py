@@ -777,7 +777,11 @@ function renderAwaiting(list){
      `<code>${esc((d.messages||[]).join('; ')||'the arr has not said why')}</code>`;
    else if(d.error) state=`<span class="tag">${esc(d.status||'error')}</span> <code>${esc(d.error)}</code>`;
    else state=`<span class="tag">${esc(d.status||'downloading')}</span> `+
-     (d.percent==null?'':`${d.percent}% `)+`<code>${esc((d.title||'').slice(0,58))}</code>`;
+     (d.percent==null?'':`${d.percent}% `)+`<code>${esc((d.title||'').slice(0,58))}</code>`+
+     // Not stuck - waiting its turn. Says so, because a percentage that has not
+     // moved in a day looks identical to a dead download until you know that.
+     (d.status==='queued'?`<div><code>waiting for a free slot in `+
+      `${esc(d.client||'the download client')}</code></div>`:'');
    // The folder, the arr's own sentence and the whole release name, not a
    // truncated one: this card is where somebody goes to find the item in
    // Sonarr or Radarr, and the note is where the series or film title is.

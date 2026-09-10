@@ -17,9 +17,57 @@ not the running build - the exact failure the version field exists to prevent.
 Entries are grouped by what they mean for someone running this, not by which
 file moved.
 
-`1.7.4` is the release to run. Everything in the sections below is in it and is
+`1.7.5` is the release to run. Everything in the sections below is in it and is
 still true; those sections are kept because the reasoning behind each rule is
 the point of this file, and the patch releases changed little of it.
+
+## [1.7.5] - 2026-09-10
+
+Everything here comes from one change made outside this worker: the download
+client was given a download queue. Sonarr and Radarr now hold a queue row per
+GRAB rather than per active download, so a queue that used to be dozens of rows
+is thousands, and a grab can wait days for a slot before a byte moves. Three
+things in here quietly assumed neither of those.
+
+### Fixed
+
+- **A replacement that is downloading no longer says "searching".** The queue
+  was read as a fixed first page of 200 rows of the WHOLE queue. Sonarr's is
+  1,916 rows long, and two replacements the operator had just chosen by hand
+  sat at rows 872 and 949 - so nothing was found for either and the page called
+  them searching while both were downloading normally. It now asks for the one
+  series or film by id, which is not paged, and returns two rows instead of two
+  hundred.
+
+- **A download waiting for a free slot is no longer called "downloading".**
+  `trackedDownloadState` describes what the ARR is doing and reads
+  "downloading" for a torrent the client has not started; with a queue turned
+  on that was 1,489 of 1,890 rows. The client's own word now wins when it is
+  the one holding things up, and the row says it is waiting for a slot. A
+  percentage that has not moved since yesterday looks exactly like a dead
+  download until you know that is why.
+
+- **A replacement is no longer forgotten while its download is still coming.**
+  The give-up clock runs from when the replacement was asked for, and at 14
+  days that was comfortably longer than any grab took to start. Behind a client
+  queue it is not: the row would be deleted with the download still queued, and
+  nothing would be waiting when it landed. Rows are now only given up on when
+  the arr has actually answered and has no download for them.
+
+- **An unreachable arr no longer reads as an empty queue.** Reading the queue
+  returned the same "no download" answer whether the arr said there was none or
+  could not be reached at all - which, with the change above, would have been a
+  reason to delete the row. It raises now, and the two callers say which
+  happened. Forcing an import against an offline arr used to report "that
+  download is not sitting waiting to be imported", which was not true.
+
+### Unchanged, and worth knowing
+
+A replacement swapped for a different release is already followed: the waiting
+row is keyed on the episode or film and the path, never on the release it
+blocklisted. So when an arr retires a stalled download and grabs something
+else, the row tracks the new one without being told, and still clears the same
+way - when a different file appears at that path and converts.
 
 ## [1.7.4] - 2026-09-08
 

@@ -41,6 +41,12 @@ SEARCH_TIMEOUT = 180
 # it, and not "imported", which is the happy ending.
 AWAITING_IMPORT = frozenset({"importPending", "importBlocked", "importFailed"})
 
+# Queue states that mean the DOWNLOAD CLIENT has not started this yet, as
+# opposed to anything the arr is or is not doing. Worth telling apart because
+# the two look identical in trackedDownloadState and the answer to them is
+# opposite: one is waiting its turn and needs nothing, the other is stuck.
+CLIENT_WAITING = frozenset({"queued", "paused"})
+
 # urllib announces itself as "Python-urllib/3.x", which Cloudflare and several
 # reverse proxies answer with a flat 403 before the request ever reaches the
 # arr. Found against a real proxied Sonarr, where a correct API key looked
@@ -389,14 +395,23 @@ class ArrClient:
         None covers three different situations that look identical from here -
         the search found nothing yet, the grab has not happened, or it finished
         and was imported - so the caller says "waiting" rather than inventing a
-        reason it cannot know.
+        reason it cannot know. An arr that could not be READ is not one of them,
+        and raises: "there is no download" and "I got no answer" must not come
+        out as the same sentence.
+
+        Scoped to the one series or film instead of paging the whole queue. The
+        paged form read the first 200 rows, which was fine until the download
+        client was given a queue of its own - the arr then holds a row per
+        grab rather than per active download, and the live queue is 1,916 rows
+        long. Two of the three replacements being waited on sat at rows 872 and
+        949, so this returned None for both and the page called them
+        "searching" while they were downloading perfectly well.
         """
-        path = ("/api/v3/queue?pageSize=200&includeEpisode=true"
-                if self.kind == "sonarr" else "/api/v3/queue?pageSize=200&includeMovie=true")
-        res, error = _request("GET", f"{self.base_url}{path}", self.api_key)
+        q = f"seriesId={item_id}" if self.kind == "sonarr" else f"movieId={item_id}"
+        res, error = _request("GET", f"{self.base_url}/api/v3/queue/details?{q}", self.api_key)
         if error:
-            return None
-        for record in (res or {}).get("records") or []:
+            raise RuntimeError(f"could not read {self.name}'s queue: {error}")
+        for record in res or []:
             same = (record.get("episodeId") == episode_id if episode_id is not None
                     else record.get("movieId") == item_id)
             if not same:
@@ -421,10 +436,16 @@ class ArrClient:
                 "awaiting_import": state in AWAITING_IMPORT,
                 "download_id": record.get("downloadId") or "",
                 "messages": [m for m in messages if m],
-                # trackedDownloadState is the honest one: "downloading" in
-                # status can still mean stalled, waiting for an import, or
-                # failed and about to be retried.
-                "status": record.get("trackedDownloadState") or record.get("status") or "",
+                # trackedDownloadState is the honest one for what the ARR is
+                # doing: "downloading" in status can still mean stalled,
+                # waiting for an import, or failed and about to be retried.
+                # It is not honest about the CLIENT, though - it says
+                # "downloading" for a torrent the client has queued and not
+                # started, and with a download queue turned on that is most of
+                # them: 1,489 of 1,890 rows the day this was written. So the
+                # client's own word wins when it is the one holding things up.
+                "status": (record.get("status") if record.get("status") in CLIENT_WAITING
+                           else state or record.get("status") or ""),
                 "percent": round((size - left) / size * 100) if size else None,
                 "size": size,
                 "client": record.get("downloadClient") or "",

@@ -175,3 +175,85 @@ class GrabbingOne(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QueueStatus(unittest.TestCase):
+    """Reading the download for a replacement out of the arr's queue.
+
+    Written from the live failure: two replacements the operator had just
+    chosen sat on the Queue page saying "searching" while Sonarr was
+    downloading both. Nothing was wrong with the search, the grab or the
+    download - the queue was 1,916 rows long and this asked for the first 200.
+    """
+
+    ROW = {
+        "id": 1, "episodeId": 18979, "movieId": 700,
+        "title": "Emergency.S03E01.1080p.HEVC.x265-MeGusta",
+        "status": "queued", "trackedDownloadState": "downloading",
+        "downloadId": "ABC", "size": 1000, "sizeleft": 60,
+        "downloadClient": "Transmission", "statusMessages": [],
+    }
+
+    def client(self, kind="sonarr"):
+        return arrs.ArrClient({"id": "a", "name": "Sonarr", "kind": kind,
+                               "base_url": "http://s", "api_key": "k",
+                               "arr_path": "/tv", "worker_path": "/media/TV"})
+
+    def ask(self, rows, kind="sonarr", error=None, episode_id=18979):
+        asked = []
+        def stub(method, url, key, **kw):  # noqa: ANN001
+            asked.append(url)
+            return (None, error) if error else (rows, None)
+        with mock.patch.object(arrs, "_request", stub):
+            status = self.client(kind).queue_status(226, episode_id)
+        return status, asked[0]
+
+    def test_it_asks_only_for_this_series_so_a_long_queue_cannot_hide_it(self):
+        # The defect: a fixed first page of the WHOLE queue. Sonarr's was 1,916
+        # rows and the two downloads being waited on sat at 872 and 949, so no
+        # page size short of all of it would have found them. Asserted on the
+        # URL and tolerant of what the call then does with the body, so it
+        # reports the request that was wrong rather than a parse that followed.
+        asked = []
+        def stub(method, url, key, **kw):  # noqa: ANN001
+            asked.append(url)
+            return ([self.ROW], None)
+        with mock.patch.object(arrs, "_request", stub):
+            try:
+                self.client().queue_status(226, 18979)
+            except Exception:  # noqa: BLE001, S110 - the URL is what is under test
+                pass
+        self.assertIn("/api/v3/queue/details?seriesId=226", asked[0])
+        self.assertNotIn("pageSize", asked[0])
+
+    def test_a_film_is_scoped_by_movie(self):
+        _, url = self.ask([self.ROW], kind="radarr", episode_id=None)
+        self.assertIn("/api/v3/queue/details?movieId=226", url)
+
+    def test_a_download_the_client_has_not_started_says_queued(self):
+        # trackedDownloadState calls this "downloading". It is not: the client
+        # has it waiting for a slot, which is why the percentage does not move.
+        status, _ = self.ask([self.ROW])
+        self.assertEqual(status["status"], "queued")
+        self.assertEqual(status["percent"], 94)
+        self.assertEqual(status["client"], "Transmission")
+
+    def test_the_arr_still_wins_once_the_client_is_actually_running_it(self):
+        row = {**self.ROW, "status": "downloading", "trackedDownloadState": "importPending"}
+        status, _ = self.ask([row])
+        self.assertEqual(status["status"], "importPending")
+        self.assertTrue(status["awaiting_import"])
+
+    def test_another_episode_of_the_same_series_is_not_this_one(self):
+        status, _ = self.ask([{**self.ROW, "episodeId": 18980}])
+        self.assertIsNone(status)
+
+    def test_an_arr_that_could_not_be_read_is_not_an_empty_queue(self):
+        # The whole point of raising: None means "no download", and a row with
+        # no download for long enough gets given up on and deleted.
+        with self.assertRaises(RuntimeError):
+            self.ask([], error="connection refused")
+
+    def test_no_download_for_this_episode_is_plain_None(self):
+        status, _ = self.ask([])
+        self.assertIsNone(status)

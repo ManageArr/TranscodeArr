@@ -121,7 +121,7 @@ def cfg() -> dict:
 # A constant compiled into the image cannot be overridden from outside it. Bump
 # it with the image tag: the release workflow refuses a tag that disagrees with
 # it, and a test refuses a Dockerfile that does.
-VERSION = "1.7.4"
+VERSION = "1.7.5"
 STARTED = time.time()
 
 # ---------------------------------------------------------------------------
@@ -1740,7 +1740,10 @@ def force_replacement_import(conn: sqlite3.Connection, path: str) -> tuple[bool,
     if not arr or not arr["enabled"]:
         return False, f"{row['arr_name']} is no longer a connection here"
     client = _client_for(arr)
-    status = client.queue_status(row["item_id"], row["episode_id"])
+    try:
+        status = client.queue_status(row["item_id"], row["episode_id"])
+    except Exception as e:  # noqa: BLE001 - a button press reports, it does not crash
+        return False, str(e)
     forceable, why = import_blocker(status, path)
     if not forceable:
         if status and status.get("awaiting_import"):
@@ -2938,8 +2941,6 @@ def replacements_view() -> list[dict]:
     if time.time() - fresh < REPLACEMENT_POLL_SECONDS:
         return cached
     conn = db()
-    conn.execute("DELETE FROM replacements WHERE at < ?",
-                 (time.time() - REPLACEMENT_GIVE_UP_DAYS * 86400,))
     # A conversion that succeeded after the request is the replacement landing.
     conn.execute("DELETE FROM replacements WHERE path IN ("
                  "SELECT r.path FROM replacements r JOIN jobs j ON j.path = r.path "
@@ -2947,15 +2948,28 @@ def replacements_view() -> list[dict]:
     conn.commit()
     _clear_unresolvable(conn)
     out = []
+    expired = []
     arrs = {a["id"]: a for a in store.list_arrs(conn, redact=False)}
     for row in conn.execute("SELECT * FROM replacements ORDER BY at DESC").fetchall():
         arr = arrs.get(row["arr_id"])
-        status = None
+        status, read_arr = None, False
         if arr:
             try:
                 status = _client_for(arr).queue_status(row["item_id"], row["episode_id"])
+                read_arr = True
             except Exception:  # noqa: BLE001 - the queue view must not fail on an unreachable arr
                 log.debug("could not read %s's queue", row["arr_name"], exc_info=True)
+        # The give-up clock runs from when the replacement was ASKED for, which
+        # stopped meaning anything once the download client got a queue: a grab
+        # can sit queued behind a thousand others for longer than this window,
+        # and dropping the row then forgets the very download it is waiting on.
+        # So it only expires a row with nothing in flight - and only when the
+        # arr actually answered, because an arr that is merely unreachable has
+        # not told us there is no download.
+        if (read_arr and status is None
+                and row["at"] < time.time() - REPLACEMENT_GIVE_UP_DAYS * 86400):
+            expired.append(row["path"])
+            continue
         out.append({
             "path": row["path"],
             "name": os.path.basename(row["path"]),
@@ -2972,6 +2986,11 @@ def replacements_view() -> list[dict]:
             # already imported and waiting for the next scan to pick it up.
             "download": status,
         })
+    if expired:
+        conn.executemany("DELETE FROM replacements WHERE path=?", [(p,) for p in expired])
+        conn.commit()
+        log.info("gave up waiting on %d replacement(s) with no download after %d days",
+                 len(expired), REPLACEMENT_GIVE_UP_DAYS)
     _REPLACEMENTS = (time.time(), out)
     return out
 

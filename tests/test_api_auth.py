@@ -874,5 +874,78 @@ class ForcingAnImportTheArrRefused(ApiCase):
         self.assertEqual(status, 401)
 
 
+
+class GivingUpOnAReplacement(ApiCase):
+    """When a waiting row is old enough to forget - and when it is not.
+
+    The clock runs from when the replacement was ASKED for, which meant
+    something while a grab started downloading immediately. Once the download
+    client was given a queue of its own it stopped meaning anything: 1,489 of
+    Sonarr's 1,890 queue rows were sitting client-queued, and a grab can wait
+    behind those for longer than this window. Expiring one then throws away the
+    row that is tracking the download still on its way.
+    """
+
+    PATH = "/media/TV/Emergency!/Season 03/.Emergency! - S03E01.mkv"
+
+    def row(self, age_days):
+        conn = main.db()
+        conn.execute("DELETE FROM replacements")
+        conn.execute("DELETE FROM jobs")
+        conn.execute(
+            "INSERT INTO replacements (path, arr_id, arr_name, kind, item_id, episode_id, release, at, note) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (self.PATH, "a1", "Sonarr", "sonarr", 226, 18979, "Emergency.S03E01-OLD",
+             time.time() - age_days * 86400, "note"))
+        conn.commit()
+        main._REPLACEMENTS = (0.0, [])
+        self.addCleanup(setattr, main, "_REPLACEMENTS", (0.0, []))
+
+    def old_row(self):
+        self.row(main.REPLACEMENT_GIVE_UP_DAYS + 1)
+
+    def count(self):
+        return main.db().execute("SELECT COUNT(*) FROM replacements").fetchone()[0]
+
+    def view_unreachable(self):
+        """The card with the arr enrolled but not answering."""
+        rows = [{"id": "a1", "name": "Sonarr", "enabled": 1}]
+        with mock.patch.object(main.store, "list_arrs", lambda conn, redact=True: rows),              mock.patch.object(main, "_client_for", mock.Mock(side_effect=RuntimeError("offline"))):
+            return main.replacements_view()
+
+    def view_answering(self, status):
+        """The card with the arr reachable and answering with `status`."""
+        rows = [{"id": "a1", "name": "Sonarr", "enabled": 1}]
+        client = mock.Mock()
+        client.queue_status.return_value = status
+        with mock.patch.object(main.store, "list_arrs", lambda conn, redact=True: rows),              mock.patch.object(main, "_client_for", lambda arr: client):
+            return main.replacements_view()
+
+    def test_an_old_row_whose_download_is_still_queued_is_kept(self):
+        self.old_row()
+        view = self.view_answering({"status": "queued", "percent": 3, "title": "x",
+                                    "awaiting_import": False, "download_id": "d",
+                                    "messages": [], "size": 1, "client": "Transmission", "error": ""})
+        self.assertEqual(len(view), 1)
+        self.assertEqual(self.count(), 1)
+
+    def test_an_old_row_with_no_download_anywhere_is_given_up_on(self):
+        self.old_row()
+        self.assertEqual(self.view_answering(None), [])
+        self.assertEqual(self.count(), 0)
+
+    def test_an_arr_that_could_not_be_read_never_expires_a_row(self):
+        # An unreachable arr has not said there is no download. Treating its
+        # silence as an answer deletes the row that would have tracked one.
+        self.old_row()
+        self.assertEqual(len(self.view_unreachable()), 1)
+        self.assertEqual(self.count(), 1)
+
+    def test_a_recent_row_with_no_download_stays_put(self):
+        self.row(1)
+        self.assertEqual(len(self.view_answering(None)), 1)
+        self.assertEqual(self.count(), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
